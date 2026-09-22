@@ -185,6 +185,51 @@ class TripStore:
             ).fetchone()
             return bool(row)
 
+    def update_trip(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        """Update an owned trip's fields (status, metadata, etc.)."""
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        now = datetime.now(timezone.utc)
+
+        allowed = {"title", "destination", "origin", "status", "metadata"}
+        filtered = {k: v for k, v in fields.items() if k in allowed}
+        if not filtered:
+            return self.get_trip(trip_id, user_id)
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            t = self._memory_trips.get(tid_str)
+            if not t or str(t["user_id"]) != uid_str:
+                return None
+            t.update(filtered)
+            t["updated_at"] = now
+            return dict(t)
+
+        sets = []
+        vals = []
+        for k, v in filtered.items():
+            if k == "metadata":
+                sets.append(f"{k} = %s::jsonb")
+                vals.append(json.dumps(v))
+            else:
+                sets.append(f"{k} = %s")
+                vals.append(v)
+        sets.append("updated_at = %s")
+        vals.append(now)
+        vals.extend([tid_str, uid_str])
+
+        with self._connect() as conn:
+            row = conn.execute(
+                f"UPDATE trips SET {', '.join(sets)} WHERE id = %s AND user_id = %s RETURNING *",
+                vals,
+            ).fetchone()
+            return dict(row) if row else None
+
+
     def create_thread(
         self,
         user_id: str | uuid.UUID,

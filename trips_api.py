@@ -6,13 +6,16 @@ Endpoints require get_current_user dependency; tenant enumeration is blocked.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from fastapi.responses import Response
 
 from dependencies.auth import get_current_user
 from domain.user import UserResponse
+from domain.change_set import compute_change_set, calculate_replanning_plan
 from services.transaction_store import TransactionStore
 from services.flight_service import FlightService
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
@@ -21,8 +24,10 @@ from services.ticket_service import build_booking_pdf
 from services.hotel_transaction_store import HotelTransactionStore
 from services.hotel_booking_pdf import build_hotel_booking_pdf
 from services.trip_store import TripStore
+from services.search_session_store import SearchSessionStore
 
 router = APIRouter(prefix="/api/trips", tags=["trips"])
+
 
 
 class TripCreateRequest(BaseModel):
@@ -416,3 +421,128 @@ async def cancellation_confirm(
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except FlightProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+class OfferSelectionRequest(BaseModel):
+    offer_type: str = Field(pattern="^(flight|hotel)$")
+    snapshot_id: UUID
+
+
+class TripRevisionRequest(BaseModel):
+    feedback: str = ""
+    updated_constraints: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/{trip_id}/select-offer")
+async def select_trip_offer(
+    trip_id: str,
+    req: OfferSelectionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Bind an explicit flight or hotel offer to the trip.
+
+    Validates tenant ownership of both trip and snapshot.
+    Does NOT increment trip revision and does NOT invalidate other plan evidence.
+    """
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    snap_store = SearchSessionStore()
+    snapshot = snap_store.get_snapshot(req.snapshot_id, current_user.id)
+    if not snapshot:
+        raise HTTPException(status_code=403, detail="Offer snapshot not found or does not belong to you.")
+
+    if snapshot.offer_type != req.offer_type:
+        raise HTTPException(status_code=400, detail=f"Snapshot is a {snapshot.offer_type} offer, not a {req.offer_type} offer.")
+
+    meta = trip.get("metadata") or {}
+    key = f"selected_{req.offer_type}_snapshot_id"
+    meta[key] = str(req.snapshot_id)
+    updated_trip = trip_store.update_trip(trip_id, current_user.id, metadata=meta)
+
+    return {
+        "success": True,
+        "trip_id": trip_id,
+        "offer_type": req.offer_type,
+        "snapshot_id": str(req.snapshot_id),
+        "trip": updated_trip,
+    }
+
+
+@router.post("/{trip_id}/revisions")
+async def create_trip_revision(
+    trip_id: str,
+    req: TripRevisionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Submit human feedback causing a TripChangeSet, advancing revision, and updating status to awaiting_approval."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    meta = trip.get("metadata") or {}
+    current_constraints = meta.get("constraints") or {}
+    current_revision = int(meta.get("revision", 0))
+
+    change_set = compute_change_set(current_constraints, req.updated_constraints, req.feedback)
+    plan = calculate_replanning_plan(change_set)
+
+    new_revision = current_revision + 1
+    meta["revision"] = new_revision
+    meta["constraints"] = {**current_constraints, **req.updated_constraints}
+    meta["last_feedback"] = req.feedback
+
+    # Clear stale offer selections when dependency replanning requires fresh search
+    if plan.requires_flight_search:
+        meta.pop("selected_flight_snapshot_id", None)
+    if plan.requires_hotel_search:
+        meta.pop("selected_hotel_snapshot_id", None)
+
+    updated_trip = trip_store.update_trip(
+        trip_id,
+        current_user.id,
+        status="awaiting_approval",
+        metadata=meta,
+    )
+
+    return {
+        "success": True,
+        "trip_id": trip_id,
+        "revision": new_revision,
+        "status": "awaiting_approval",
+        "change_set": change_set.model_dump(),
+        "affected_agents": plan.affected_agents,
+        "trip": updated_trip,
+    }
+
+
+@router.post("/{trip_id}/approve")
+async def approve_trip(
+    trip_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Explicitly approve a planned trip."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    meta = trip.get("metadata") or {}
+    meta["approved_at"] = datetime.now(timezone.utc).isoformat()
+
+    updated_trip = trip_store.update_trip(
+        trip_id,
+        current_user.id,
+        status="approved",
+        metadata=meta,
+    )
+
+    return {
+        "success": True,
+        "trip_id": trip_id,
+        "status": "approved",
+        "trip": updated_trip,
+    }

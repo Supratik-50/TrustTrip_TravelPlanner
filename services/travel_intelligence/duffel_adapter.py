@@ -55,6 +55,87 @@ def json_clean(data: Any) -> Any:
     return json.loads(json.dumps(data, default=str))
 
 
+import ipaddress
+from urllib.parse import urlparse
+
+# Registered verified carrier domains allowlist (IATA code -> trusted domain bases)
+CARRIER_DOMAIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "AI": ("airindia.com", "airindia.in"),
+    "EK": ("emirates.com",),
+    "BA": ("ba.com", "britishairways.com"),
+    "LH": ("lh.com", "lufthansa.com"),
+    "AF": ("airfrance.com", "airfrance.fr"),
+    "KL": ("klm.com",),
+    "QR": ("qatarairways.com",),
+    "SQ": ("singaporeair.com",),
+    "UA": ("united.com",),
+    "DL": ("delta.com",),
+    "AA": ("aa.com",),
+    "6E": ("goindigo.in", "goindigo.com"),
+    "UK": ("airvistara.com",),
+    "SG": ("spicejet.com",),
+    "QP": ("akasaair.com",),
+    "EY": ("etihad.com",),
+    "TK": ("turkishairlines.com",),
+    "VS": ("virginatlantic.com",),
+    "QF": ("qantas.com", "qantas.com.au"),
+    "CX": ("cathaypacific.com",),
+    "WN": ("southwest.com",),
+    "B6": ("jetblue.com",),
+    "AS": ("alaskaair.com",),
+}
+
+
+def _validate_and_normalize_url(url: str | None) -> tuple[bool, str]:
+    """Validate scheme, userinfo, IP literals, localhost, and return normalized hostname."""
+    if not url or not isinstance(url, str):
+        return False, ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, ""
+
+    if parsed.scheme != "https":
+        return False, ""
+
+    if parsed.username or parsed.password:
+        return False, ""
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, ""
+
+    hostname = hostname.lower().rstrip(".")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return False, ""
+
+    try:
+        ipaddress.ip_address(hostname)
+        return False, ""  # Reject IP literals (both IPv4 and IPv6)
+    except ValueError:
+        pass
+
+    return True, hostname
+
+
+def _is_approved_duffel_host(hostname: str) -> bool:
+    """Allow only exact approved Duffel domains/subdomains. No substring matching."""
+    approved_bases = ("duffel.com", "duffel.link")
+    for base in approved_bases:
+        if hostname == base or hostname.endswith("." + base):
+            return True
+    return False
+
+
+def _is_approved_carrier_host(carrier_iata: str, hostname: str) -> bool:
+    """Check hostname against the registered server-side carrier domain allowlist."""
+    allowed_bases = CARRIER_DOMAIN_ALLOWLIST.get(carrier_iata.upper(), ())
+    for base in allowed_bases:
+        if hostname == base or hostname.endswith("." + base):
+            return True
+    return False
+
+
 class DuffelFlightAdapter(FlightSearchProviderPort):
     """Adapter wrapping DuffelProvider conforming to FlightSearchProviderPort."""
 
@@ -275,4 +356,72 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
             provider_offer_id,
             expected_price,
             expected_currency,
+        )
+
+    def resolve_booking_destination(
+        self,
+        snapshot_id: uuid4 | UUID,
+        offer: FlightOffer,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> Any:
+        from domain.booking import FlightBookingDestination, FlightDestinationType
+
+        raw = raw_payload or {}
+        first_segment = offer.segments[0] if offer.segments else None
+        airline_name = first_segment.marketing_carrier_name if first_segment else "Airline"
+        carrier_iata = first_segment.marketing_carrier_iata if first_segment else ""
+        flight_number = f"{carrier_iata}{first_segment.flight_number}" if first_segment else "Flight"
+
+        # 1. Check for genuine, verified direct airline booking URL
+        direct_url = raw.get("direct_airline_booking_url") or raw.get("airline_checkout_url")
+        if direct_url and isinstance(direct_url, str):
+            is_valid, hostname = _validate_and_normalize_url(direct_url)
+            if is_valid and _is_approved_carrier_host(carrier_iata, hostname):
+                return FlightBookingDestination(
+                    snapshot_id=snapshot_id,
+                    destination_type=FlightDestinationType.DIRECT_AIRLINE_BOOKING,
+                    redirect_url=direct_url,
+                    airline_name=airline_name,
+                    flight_number=flight_number,
+                    price_total=offer.price.total_amount,
+                    currency=offer.price.currency,
+                    expires_at=offer.expires_at,
+                    provider_label=f"Official Airline Website ({airline_name})",
+                    instructions=f"You are being redirected directly to {airline_name} to complete your flight booking.",
+                )
+
+        # 2. Check for official Duffel Link hosted checkout URL
+        duffel_url = (
+            raw.get("duffel_link")
+            or raw.get("duffel_links_url")
+            or (raw.get("links") or {}).get("checkout")
+        )
+        if duffel_url and isinstance(duffel_url, str):
+            is_valid, hostname = _validate_and_normalize_url(duffel_url)
+            if is_valid and _is_approved_duffel_host(hostname):
+                return FlightBookingDestination(
+                    snapshot_id=snapshot_id,
+                    destination_type=FlightDestinationType.DUFFEL_LINK,
+                    redirect_url=duffel_url,
+                    airline_name=airline_name,
+                    flight_number=flight_number,
+                    price_total=offer.price.total_amount,
+                    currency=offer.price.currency,
+                    expires_at=offer.expires_at,
+                    provider_label="Duffel Travel Checkout",
+                    instructions="You are being redirected to TrustTrip's flight partner, Duffel, to complete your secure ticket booking. This checkout is hosted by Duffel.",
+                )
+
+        # 3. Fallback: UNAVAILABLE (Zero URL fabrication)
+        return FlightBookingDestination(
+            snapshot_id=snapshot_id,
+            destination_type=FlightDestinationType.UNAVAILABLE,
+            redirect_url=None,
+            airline_name=airline_name,
+            flight_number=flight_number,
+            price_total=offer.price.total_amount,
+            currency=offer.price.currency,
+            expires_at=offer.expires_at,
+            provider_label="Manual Booking Required",
+            instructions=f"Direct online checkout link is unavailable for this carrier fare. Please book flight {flight_number} directly via {airline_name} or your travel agent using the details above.",
         )

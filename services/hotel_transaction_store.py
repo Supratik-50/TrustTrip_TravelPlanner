@@ -40,6 +40,20 @@ class HotelTransactionStore:
             return bool(row)
     def get(self, txid):
         with self.connect() as c: return c.execute("SELECT * FROM trust_trip_hotel_transactions WHERE id=%s",(txid,)).fetchone()
+    def claim_booking(self, txid: str, razorpay_payment_id: str | None = None) -> bool:
+        """Atomically transition booking_status to 'booking_in_progress' via compare-and-set."""
+        with self.connect() as c:
+            row = c.execute("""
+                UPDATE trust_trip_hotel_transactions
+                   SET booking_status='booking_in_progress',
+                       payment_status='captured',
+                       razorpay_payment_id=COALESCE(%s, razorpay_payment_id),
+                       updated_at=now()
+                 WHERE id=%s
+                   AND booking_status IN ('created', 'awaiting_payment', 'pending', 'payment_captured')
+                RETURNING id
+            """, (razorpay_payment_id, txid)).fetchone()
+            return bool(row)
     def update(self, txid, **d):
         allowed={'razorpay_payment_id','payment_status','booking_status','booking_json','error','razorpay_order_id','pdf_generated_at'}
         d={k:v for k,v in d.items() if k in allowed}

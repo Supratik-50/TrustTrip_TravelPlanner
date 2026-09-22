@@ -10,13 +10,58 @@ from typing import Any
 import asyncio
 import os
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator
 
+from dependencies.auth import get_current_user
+from domain.booking import FlightHandoffRequest, FlightBookingDestination
+from domain.user import UserResponse
 from services.flight_service import FlightService
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
+from services.flight_booking_service import FlightBookingService, FareChangedException, OfferWithdrawnException
 
 router = APIRouter(prefix="/api/flights", tags=["flights"])
+
+
+@router.post("/select-booking", response_model=FlightBookingDestination)
+async def select_flight_booking(
+    req: FlightHandoffRequest,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Select a flight offer and obtain its legitimate external booking destination.
+
+    Does not require whole-trip APPROVED status.
+    Client submits only snapshot_id.
+    Server enforces tenant ownership, revalidation, and returns server-minted destination.
+    """
+    service = FlightBookingService()
+    try:
+        dest = await service.select_and_handoff_flight(
+            snapshot_id=req.snapshot_id,
+            authenticated_user_id=current_user.id,
+        )
+        return dest
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except FareChangedException as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Fare has changed",
+                "original_snapshot_id": str(exc.original_snapshot_id),
+                "subsequent_snapshot_id": str(exc.subsequent_snapshot_id),
+                "new_price": str(exc.new_price),
+                "currency": exc.currency,
+                "details": exc.details,
+            },
+        )
+    except OfferWithdrawnException as exc:
+        raise HTTPException(status_code=410, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Flight selection handoff failed: {exc}")
+
 
 
 class FlightSlice(BaseModel):

@@ -608,34 +608,24 @@ def human_approval_agent(state: TravelState):
     current = state.get("trip_constraints") or {}
     updated = parse_trip_request(feedback, current) if feedback else current
 
-    # A revision that changes route/date/passenger count is a provider-level
-    # change, not merely a wording change. Re-run the provider agents so the
-    # flight offer and budget match the new request. Ordinary itinerary edits
-    # keep the existing live offers and consume no extra flight search.
-    structural_keys = ("origin", "destination", "departure_date", "adults", "children", "infants")
-    flight_words = (
-        "flight", "flights", "fly", "airline", "nonstop", "non-stop",
-        "direct flight", "morning flight", "afternoon flight", "evening flight",
-        "night flight", "cheaper fare", "cheaper flight", "cheapest flight",
-    )
-    flight_request_change = any(word in feedback.lower() for word in flight_words)
-    hotel_words = ("hotel", "hotels", "room", "rooms", "accommodation", "resort", "stay", "cheaper hotel", "breakfast", "free cancellation")
-    hotel_request_change = any(word in feedback.lower() for word in hotel_words)
+    # Phase 5: Dependency-aware replanning via TripChangeSet
+    from domain.change_set import compute_change_set, calculate_replanning_plan
+    change_set = compute_change_set(current, updated, feedback)
+    replanning_plan = calculate_replanning_plan(change_set)
+
     provider_replan = (
-        not approved and bool(feedback) and (
-            any(updated.get(key) != current.get(key) for key in structural_keys)
-            or flight_request_change
-            or hotel_request_change
-            or updated.get("flight_preference") != current.get("flight_preference")
-            or updated.get("cheaper_mode") != current.get("cheaper_mode")
-        )
+        not approved
+        and bool(feedback)
+        and (replanning_plan.requires_flight_search or replanning_plan.requires_hotel_search)
     )
+    selected_agents = replanning_plan.affected_agents if (not approved and bool(feedback)) else (state.get("selected_agents") or AGENT_ORDER.copy())
+
     return {
         "approved": approved,
         "human_feedback": feedback,
         "trip_constraints": updated,
         "provider_replan_required": provider_replan,
-        "selected_agents": AGENT_ORDER.copy() if provider_replan else state.get("selected_agents", AGENT_ORDER.copy()),
+        "selected_agents": selected_agents,
         "revision_count": int(state.get("revision_count", 0)) + (0 if approved else 1),
         "messages": [AIMessage(content="Human review completed." + (" Provider data will be refreshed for the changed travel requirements." if provider_replan else ""))],
     }
@@ -644,11 +634,14 @@ def human_approval_agent(state: TravelState):
 def route_after_human(state: TravelState) -> str:
     if state.get("approved"):
         return "final_agent"
-    max_revisions = int(os.getenv("MAX_PLAN_REVISIONS", "5"))
-    if int(state.get("revision_count", 0)) >= max_revisions:
-        return "final_agent"
-    if state.get("provider_replan_required"):
-        return "flight_agent"
+
+    # Phase 5: Unlimited HITL - no MAX_PLAN_REVISIONS cutoff.
+    # Route to the first affected agent in the pipeline order.
+    selected = state.get("selected_agents") or []
+    for agent in AGENT_ORDER:
+        if agent in selected:
+            return agent
+
     return "itinerary_agent"
 
 
@@ -662,8 +655,6 @@ def final_agent(state: TravelState):
     plan = state.get("plan_json") or {}
     if not draft:
         draft = "Your travel plan is ready."
-    if int(state.get("revision_count", 0)) >= int(os.getenv("MAX_PLAN_REVISIONS", "5")) and not state.get("approved"):
-        draft += "\n\n**Review limit reached:** this draft is shown without further automatic revisions."
     draft += (
         "\n\n**Booking note:** Flight booking remains separate. The selected fare must be rechecked and you must explicitly confirm before any booking request is submitted."
     )
