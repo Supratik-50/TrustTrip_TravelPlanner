@@ -21,10 +21,12 @@ from services.flight_service import FlightService
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
 from services.razorpay_service import RazorpayService, RazorpayError
 from services.ticket_service import build_booking_pdf
-from services.hotel_transaction_store import HotelTransactionStore
 from services.hotel_booking_pdf import build_hotel_booking_pdf
+from services.hotel_transaction_store import HotelTransactionStore
 from services.trip_store import TripStore
 from services.search_session_store import SearchSessionStore
+from services.evidence_store import EvidenceRevisionStore
+from domain.evidence import UsageState
 
 router = APIRouter(prefix="/api/trips", tags=["trips"])
 
@@ -431,6 +433,7 @@ class OfferSelectionRequest(BaseModel):
 class TripRevisionRequest(BaseModel):
     feedback: str = ""
     updated_constraints: dict[str, Any] = Field(default_factory=dict)
+    expected_base_revision: int | None = None
 
 
 @router.post("/{trip_id}/select-offer")
@@ -485,14 +488,21 @@ async def create_trip_revision(
 
     meta = trip.get("metadata") or {}
     current_constraints = meta.get("constraints") or {}
-    current_revision = int(meta.get("revision", 0))
+    current_revision = int(trip.get("current_revision_number") or meta.get("revision", 0))
+
+    if req.expected_base_revision is not None and current_revision != req.expected_base_revision:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Expected base revision {req.expected_base_revision} but current is {current_revision}.",
+        )
 
     change_set = compute_change_set(current_constraints, req.updated_constraints, req.feedback)
     plan = calculate_replanning_plan(change_set)
 
     new_revision = current_revision + 1
+    new_constraints = {**current_constraints, **req.updated_constraints}
     meta["revision"] = new_revision
-    meta["constraints"] = {**current_constraints, **req.updated_constraints}
+    meta["constraints"] = new_constraints
     meta["last_feedback"] = req.feedback
 
     # Clear stale offer selections when dependency replanning requires fresh search
@@ -501,10 +511,28 @@ async def create_trip_revision(
     if plan.requires_hotel_search:
         meta.pop("selected_hotel_snapshot_id", None)
 
+    # Publish revision via EvidenceRevisionStore under parent trip lock
+    ev_store = EvidenceRevisionStore()
+    plan_snapshot = {
+        "title": trip.get("title"),
+        "destination": trip.get("destination"),
+        "origin": trip.get("origin"),
+        "constraints": new_constraints,
+        "metadata": meta,
+    }
+
+    published_rev = ev_store.publish_revision_transaction(
+        trip_id=trip_id,
+        user_id=current_user.id,
+        expected_base_revision=req.expected_base_revision,
+        change_set=change_set.model_dump(),
+        plan_snapshot=plan_snapshot,
+    )
+
+    # Sync metadata and fetch updated trip
     updated_trip = trip_store.update_trip(
         trip_id,
         current_user.id,
-        status="awaiting_approval",
         metadata=meta,
     )
 
@@ -512,6 +540,7 @@ async def create_trip_revision(
         "success": True,
         "trip_id": trip_id,
         "revision": new_revision,
+        "revision_id": str(published_rev.revision_id),
         "status": "awaiting_approval",
         "change_set": change_set.model_dump(),
         "affected_agents": plan.affected_agents,
@@ -525,24 +554,102 @@ async def approve_trip(
     current_user: UserResponse = Depends(get_current_user),
     trip_store: TripStore = Depends(_trip_store),
 ):
-    """Explicitly approve a planned trip."""
+    """Explicitly approve a planned trip, establishing PlanApproval record."""
     trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
 
+    ev_store = EvidenceRevisionStore()
+    current_rev_id = trip.get("current_revision_id")
+
+    # If current_revision_id is not set, publish baseline revision 1 first
+    if not current_rev_id:
+        meta = trip.get("metadata") or {}
+        plan_snapshot = {
+            "title": trip.get("title"),
+            "destination": trip.get("destination"),
+            "origin": trip.get("origin"),
+            "constraints": meta.get("constraints") or {},
+            "metadata": meta,
+        }
+        published_rev = ev_store.publish_revision_transaction(
+            trip_id=trip_id,
+            user_id=current_user.id,
+            expected_base_revision=0,
+            change_set={"initial": True},
+            plan_snapshot=plan_snapshot,
+        )
+        current_rev_id = str(published_rev.revision_id)
+
     meta = trip.get("metadata") or {}
-    meta["approved_at"] = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    meta["approved_at"] = now_iso
+
+    # Execute approval transaction under parent trip lock
+    approval = ev_store.approve_revision_transaction(
+        trip_id=trip_id,
+        user_id=current_user.id,
+        revision_id=current_rev_id,
+        metadata={"approved_at": now_iso},
+    )
 
     updated_trip = trip_store.update_trip(
         trip_id,
         current_user.id,
-        status="approved",
         metadata=meta,
     )
 
     return {
         "success": True,
         "trip_id": trip_id,
+        "revision_id": str(current_rev_id),
         "status": "approved",
+        "approval_id": str(approval.approval_id),
         "trip": updated_trip,
+    }
+
+
+@router.post("/{trip_id}/revoke-approval")
+async def revoke_trip_approval(
+    trip_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Explicitly revoke approval for the trip, demoting status to awaiting_approval."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    ev_store = EvidenceRevisionStore()
+    revoked = ev_store.revoke_approval_transaction(trip_id=trip_id, user_id=current_user.id)
+
+    updated_trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    return {
+        "success": True,
+        "trip_id": trip_id,
+        "revoked": revoked,
+        "status": (updated_trip or {}).get("status", "awaiting_approval"),
+        "trip": updated_trip,
+    }
+
+
+@router.get("/{trip_id}/revisions")
+async def list_trip_revisions(
+    trip_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """List all immutable plan revisions for an owned trip."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    ev_store = EvidenceRevisionStore()
+    revisions = ev_store.list_revisions_for_trip(trip_id=trip_id, user_id=current_user.id)
+    return {
+        "success": True,
+        "trip_id": trip_id,
+        "current_revision_id": str(trip.get("current_revision_id") or ""),
+        "current_revision_number": int(trip.get("current_revision_number") or 0),
+        "revisions": [r.model_dump() for r in revisions],
     }

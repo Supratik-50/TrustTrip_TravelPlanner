@@ -111,6 +111,8 @@ class TripStore:
                 "origin": origin,
                 "status": status,
                 "metadata": meta,
+                "current_revision_id": None,
+                "current_revision_number": 0,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -122,7 +124,7 @@ class TripStore:
                 """
                 INSERT INTO trips (id, user_id, title, destination, origin, status, metadata, created_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-                RETURNING id, user_id, title, destination, origin, status, metadata, created_at, updated_at
+                RETURNING *
                 """,
                 (trip_id, uid_str, title, destination, origin, status, json.dumps(meta), now, now),
             ).fetchone()
@@ -191,12 +193,20 @@ class TripStore:
         user_id: str | uuid.UUID,
         **fields: Any,
     ) -> dict[str, Any] | None:
-        """Update an owned trip's fields (status, metadata, etc.)."""
+        """Update an owned trip's fields (status, metadata, revision pointer, etc.)."""
         tid_str = str(trip_id)
         uid_str = str(user_id)
         now = datetime.now(timezone.utc)
 
-        allowed = {"title", "destination", "origin", "status", "metadata"}
+        allowed = {
+            "title",
+            "destination",
+            "origin",
+            "status",
+            "metadata",
+            "current_revision_id",
+            "current_revision_number",
+        }
         filtered = {k: v for k, v in fields.items() if k in allowed}
         if not filtered:
             return self.get_trip(trip_id, user_id)
@@ -215,6 +225,12 @@ class TripStore:
             if k == "metadata":
                 sets.append(f"{k} = %s::jsonb")
                 vals.append(json.dumps(v))
+            elif k == "current_revision_id":
+                sets.append(f"{k} = %s")
+                vals.append(str(v) if v is not None else None)
+            elif k == "current_revision_number":
+                sets.append(f"{k} = %s")
+                vals.append(int(v) if v is not None else 0)
             else:
                 sets.append(f"{k} = %s")
                 vals.append(v)
