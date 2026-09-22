@@ -18,6 +18,10 @@ from domain.trip import TripRequest
 from services.intent_router import IntentDecision, IntentRouter
 from services.travel_planner import parse_trip_request
 from services.trip_store import TripStore
+from services.search_session_store import SearchSessionStore
+from services.travel_intelligence.duffel_adapter import DuffelFlightAdapter
+from services.travel_intelligence.liteapi_adapter import LiteAPIHotelAdapter
+from domain.live_offer import RevalidationResult, RevalidationStatus
 
 logger = logging.getLogger("trusttrip.planner")
 
@@ -263,11 +267,85 @@ class PlannerService:
 
         result = travel_graph.invoke(initial_state, config=config)
 
-        # 9. Serialize result including intent metadata
+        # 9. Serialize result including intent metadata and client views
         serialized = _serialize_result(result, thread_id)
         if not serialized.get("final_response") and serialized.get("answer"):
             serialized["final_response"] = serialized["answer"]
         serialized["intent"] = decision.intent.value
         serialized["intent_decision"] = decision.model_dump(mode="json")
         serialized["trip_request"] = canonical_trip.model_dump(mode="json")
+
+        # Project client views strictly shielding internal provider_offer_id
+        if "live_flight_offers" in serialized:
+            serialized["live_flight_offers"] = [
+                (o.to_client_view().model_dump(mode="json") if hasattr(o, "to_client_view")
+                 else (o.model_dump(mode="json") if hasattr(o, "model_dump") else o))
+                for o in serialized["live_flight_offers"]
+            ]
+        if "live_hotel_offers" in serialized:
+            serialized["live_hotel_offers"] = [
+                (o.to_client_view().model_dump(mode="json") if hasattr(o, "to_client_view")
+                 else (o.model_dump(mode="json") if hasattr(o, "model_dump") else o))
+                for o in serialized["live_hotel_offers"]
+            ]
+
         return serialized
+
+    async def revalidate_offer(
+        self,
+        snapshot_id: uuid.UUID | str,
+        authenticated_user_id: uuid.UUID | str,
+    ) -> RevalidationResult:
+        """Secure server-side revalidation of an offer snapshot.
+
+        Enforces tenant authorization, resolves the immutable OfferSnapshot,
+        calls the decoupled provider adapter using the internal provider_offer_id,
+        records the RevalidationResult, and creates a successor snapshot if the fare changed.
+        """
+        store = SearchSessionStore()
+        snapshot = store.get_snapshot(snapshot_id, authenticated_user_id)
+        if not snapshot:
+            raise PermissionError(
+                f"Access denied: Snapshot '{snapshot_id}' does not exist or does not belong to the user."
+            )
+
+        if snapshot.offer_type == "flight":
+            adapter = DuffelFlightAdapter()
+            result = await adapter.revalidate_flight(
+                provider_offer_id=snapshot.provider_offer_id,
+                expected_price=float(snapshot.price_total),
+                expected_currency=snapshot.currency,
+            )
+        else:
+            adapter = LiteAPIHotelAdapter()
+            result = await adapter.revalidate_hotel(
+                provider_offer_id=snapshot.provider_offer_id,
+                expected_price=float(snapshot.price_total),
+                expected_currency=snapshot.currency,
+            )
+
+        # Set original snapshot ID on the result
+        result = result.model_copy(update={"original_snapshot_id": snapshot.snapshot_id})
+
+        successor = None
+        if result.price_changed or result.schedule_changed:
+            # Create a successor snapshot linking to the predecessor
+            new_id = uuid.uuid4()
+            updated_offer = snapshot.normalized_offer.model_copy(
+                update={
+                    "snapshot_id": new_id,
+                    "price": snapshot.normalized_offer.price.model_copy(
+                        update={"total_amount": result.current_price}
+                    ),
+                }
+            )
+            successor = store.save_snapshot(
+                session_id=snapshot.session_id,
+                offer=updated_offer,
+                raw_payload={"revalidated_at": result.verified_at.isoformat(), "details": result.details},
+                predecessor_snapshot_id=snapshot.snapshot_id,
+            )
+            result = result.model_copy(update={"subsequent_snapshot_id": successor.snapshot_id})
+
+        store.record_revalidation(snapshot.snapshot_id, result, successor_snapshot=successor)
+        return result
