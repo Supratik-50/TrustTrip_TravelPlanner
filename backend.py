@@ -29,6 +29,8 @@ from services.flight_service import FlightService
 from services.hotel.hotel_service import HotelService
 from services.travel_planner import parse_trip_request, candidate_dates, budget_from_live_data, _provider_text, _resolve_place
 from services.chat_planner import generate_travel_plan, plan_to_markdown
+from domain.compat import build_trip_request
+from domain.trip import TripRequest
 
 from mcp_client import (
     tavily_mcp_search,
@@ -69,6 +71,7 @@ class TravelState(TypedDict, total=False):
     guardrail_reason: str
     selected_agents: list[str]
     trip_constraints: dict[str, Any]
+    trip_request: TripRequest | None
     supervisor_reasoning: str
 
     # Original specialist results
@@ -183,6 +186,11 @@ def supervisor_agent(state: TravelState):
 
     previous_constraints = state.get("trip_constraints") or {}
     constraints = parse_trip_request(query, previous_constraints)
+    trip_request = build_trip_request(
+        constraints,
+        thread_id=state.get("thread_id"),
+        original_query=query,
+    )
     selected = AGENT_ORDER.copy()
     mode = "cheaper" if constraints.get("cheaper_mode") else "initial"
     if constraints.get("cheaper_mode"):
@@ -194,6 +202,7 @@ def supervisor_agent(state: TravelState):
         "guardrail_reason": "Travel request accepted.",
         "selected_agents": selected,
         "trip_constraints": constraints,
+        "trip_request": trip_request,
         "replanning_mode": mode,
         "supervisor_reasoning": reasoning,
         "live_flight_offers": [],
@@ -844,6 +853,7 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
             "guardrail_reason": "",
             "selected_agents": [],
             "trip_constraints": previous.get("trip_constraints") or _empty_constraints(),
+            "trip_request": previous.get("trip_request"),
             "supervisor_reasoning": "",
             "flight_results": "",
             "hotel_results": "",
