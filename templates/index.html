@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trust Trip MAS — AI Travel & Flight Booking</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="page-bg">
+    <div class="gradient-circle circle-1"></div>
+    <div class="gradient-circle circle-2"></div>
+    <div class="gradient-circle circle-3"></div>
+  </div>
+
+  <main class="app-container">
+    <section class="hero-section">
+      <div class="badge">
+        ✈️ Trust Trip MAS — Your Ultimate AI Trip Planner
+      </div>
+      <h1>Plan Your Perfect Trip with AI</h1>
+      <p>
+        Search flights and hotels, check weather, assess your budget,
+        and review the AI-generated draft before the final itinerary is created.
+      </p>
+    </section>
+
+    <section class="planner-card">
+      <div class="card-header">
+        <div>
+          <h2>Where do you want to go?</h2>
+          <p>
+            Example: Plan a complete 7 days Japan trip from India under 2 lakhs.
+          </p>
+        </div>
+        <div class="status-pill">
+          <span class="status-dot"></span>
+          Online
+        </div>
+      </div>
+
+      <div class="input-area">
+        <textarea
+          id="userInput"
+          placeholder="Plan a complete 7 days Japan trip including flights, hotels and sightseeing under 2 lakhs..."
+        ></textarea>
+        <button id="sendBtn" onclick="sendMessage()">
+          <span id="btnText">Generate Draft</span>
+          <span id="btnLoader" class="loader hidden"></span>
+        </button>
+      </div>
+
+      <div class="quick-prompts">
+        <button onclick="setPrompt('Plan a complete 7 days Japan trip for 1 traveller, including hotels, sightseeing, budget guidance and a live flight recommendation if a departure city/airport is supplied. Do not reuse any previous route.')">
+          Japan Trip
+        </button>
+        <button onclick="setPrompt('Plan a 5 days Dubai trip for 1 traveller with flights, hotels and sightseeing. Use a live flight recommendation when a departure city/airport is supplied. Do not reuse any previous route.')">
+          Dubai Trip
+        </button>
+        <button onclick="setPrompt('Plan a 7 days Thailand trip for 1 traveller with budget hotels, sightseeing and a live flight recommendation when a departure city/airport is supplied. Do not reuse any previous route.')">
+          Thailand Trip
+        </button>
+        <button onclick="setPrompt('Give me global flight information: major hubs, route planning, connections, baggage, international travel checks and live-fare requirements.')">
+          Global Flights
+        </button>
+      </div>
+    </section>
+
+    <section id="chatFlightSection" class="chat-flight-section hidden">
+      <div class="chat-flight-header">
+        <div>
+          <span class="eyebrow">Automatic Flight Recommendation</span>
+          <h2>✈️ Flights matching your trip</h2>
+          <p id="chatFlightSubtitle">Live provider offers based on your chat request.</p>
+        </div>
+        <button type="button" class="manual-flight-btn" onclick="openManualFlightSearch()">🔍 Search manually</button>
+      </div>
+      <div class="chat-flight-results" id="chatFlightResults"></div>
+      <div class="chat-flight-footer">
+        <span>Prices and availability come from the configured flight provider. Test mode uses test offers; Live mode uses live provider results.</span>
+        <button type="button" class="text-action" onclick="openManualFlightSearch()">Not satisfied? Compare more flights →</button>
+      </div>
+    </section>
+
+    <section id="chatHotelSection" class="chat-hotel-section hidden">
+      <div class="chat-flight-header">
+        <div>
+          <span class="eyebrow">Automatic Hotel Recommendation</span>
+          <h2>🏨 Hotels matching your trip</h2>
+          <p id="chatHotelSubtitle">Live offers from two hotel providers, normalized and ranked for your budget.</p>
+        </div>
+        <button type="button" class="manual-flight-btn" onclick="openManualHotelSearch()">🔍 Search manually</button>
+      </div>
+      <div class="chat-hotel-results" id="chatHotelResults"></div>
+      <div class="chat-flight-footer">
+        <span>Hotel prices retain the provider currency and show a reference INR conversion. Final price/availability is rechecked before payment.</span>
+        <button type="button" class="text-action" onclick="openManualHotelSearch()">Not satisfied? Compare more hotels →</button>
+      </div>
+    </section>
+
+    <section class="hotel-booking-card" id="hotelSearchCard">
+      <div class="card-header">
+        <div>
+          <span class="eyebrow">Hotel Booking Agent</span>
+          <h2>Search & compare live hotel offers</h2>
+          <p>Hotelbeds + LiteAPI offers are normalized and ranked. Booking requires a fresh provider check and your final confirmation.</p>
+        </div>
+        <div class="status-pill"><span class="status-dot"></span> Hotel Engine</div>
+      </div>
+      <div class="flight-search-grid">
+        <label>Destination<input id="hotelDestination" placeholder="Goa" value="Goa"></label>
+        <label>Check-in<input id="hotelCheckin" type="date"></label>
+        <label>Check-out<input id="hotelCheckout" type="date"></label>
+        <label>Adults<input id="hotelAdults" type="number" min="1" max="12" value="2"></label>
+        <label>Children<input id="hotelChildren" type="number" min="0" max="12" value="0"></label>
+        <label>Rooms<input id="hotelRooms" type="number" min="1" max="8" value="1"></label>
+        <label>Budget (INR)<input id="hotelBudget" type="number" min="1" placeholder="20000"></label>
+        <label>Hotelbeds destination code (optional)<input id="hotelbedsDestinationCode" maxlength="8" placeholder="GOI"></label>
+        <button id="hotelSearchBtn" class="flight-search-btn" onclick="searchHotels()">Search Hotels</button>
+      </div>
+      <div id="hotelError" class="error-box hidden"></div>
+      <div id="hotelResults" class="flight-results hidden"></div>
+    </section>
+
+    <section id="hotelBookingSection" class="approval-section hidden">
+      <div class="approval-icon">🏨</div>
+      <div class="approval-content">
+        <span class="eyebrow">Hotel Booking + Razorpay</span>
+        <h2>Final hotel confirmation</h2>
+        <p id="hotelBookingSummary">Review the final hotel quote before payment. Trust Trip MAS will verify Razorpay before attempting the supplier booking.</p>
+        <div id="hotelGuestForm" class="passenger-form"></div>
+        <div class="approval-actions">
+          <button id="hotelPayBtn" class="approve-btn" onclick="confirmHotelBooking()">Review & Pay with Razorpay</button>
+          <button class="revise-btn" onclick="cancelHotelBooking()">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="flight-booking-card">
+      <div class="card-header">
+        <div>
+          <span class="eyebrow">Flight Booking Agent</span>
+          <h2>Search &amp; compare live flight offers</h2>
+          <p>Sandbox-ready flight shopping with AI-style ranking. Booking always requires your final confirmation.</p>
+        </div>
+        <div class="status-pill"><span class="status-dot"></span> Flight Engine</div>
+      </div>
+
+      <div class="flight-search-grid">
+        <label>From (IATA)<input id="flightOrigin" maxlength="3" placeholder="CCU" value="CCU"></label>
+        <label>To (IATA)<input id="flightDestination" maxlength="3" placeholder="DEL" value="DEL"></label>
+        <label>Departure<input id="flightDeparture" type="date"></label>
+        <label>Return (optional)<input id="flightReturn" type="date"></label>
+        <label>Adults<input id="flightAdults" type="number" min="1" max="9" value="1"></label>
+        <label>Children<input id="flightChildren" type="number" min="0" max="9" value="0"></label>
+        <label>Infants<input id="flightInfants" type="number" min="0" max="9" value="0"></label>
+        <label>Cabin<select id="flightCabin"><option value="economy">Economy</option><option value="premium_economy">Premium Economy</option><option value="business">Business</option><option value="first">First</option></select></label>
+        <label>Max stops<select id="flightStops"><option value="0">Direct only</option><option value="1">Up to 1 stop</option><option value="2" selected>Up to 2 stops</option></select></label>
+        <button id="flightSearchBtn" class="flight-search-btn" onclick="searchFlights()">Search Flights</button>
+      </div>
+
+      <div id="flightError" class="error-box hidden"></div>
+      <div id="flightResults" class="flight-results hidden"></div>
+    </section>
+
+    <section id="workflowSection" class="workflow-section hidden">
+      <div class="workflow-header">
+        <div>
+          <span class="eyebrow">Supervisor Agent</span>
+          <h2>Execution Plan</h2>
+        </div>
+        <span id="guardrailBadge" class="guardrail-badge">Guardrail passed</span>
+      </div>
+      <p id="supervisorReasoning" class="supervisor-reasoning"></p>
+      <div id="agentChips" class="agent-chips"></div>
+    </section>
+
+    <section id="livePlanningSection" class="workflow-section hidden">
+      <div class="workflow-header">
+        <div>
+          <span class="eyebrow">Live Planning Engine</span>
+          <h2>Provider-backed trip intelligence</h2>
+        </div>
+        <span id="planningModeBadge" class="guardrail-badge">Live refresh</span>
+      </div>
+      <div id="livePlanningGrid" class="live-planning-grid"></div>
+    </section>
+
+    <section id="resultSection" class="result-section hidden">
+      <div class="result-header">
+        <div>
+          <h2 id="resultTitle">Your AI Travel Plan</h2>
+          <p id="threadInfo">Thread ID: -</p>
+        </div>
+        <div class="result-actions">
+          <button class="copy-btn" onclick="copyResult()">Copy</button>
+          <button class="download-btn" onclick="downloadPDF()">Download PDF</button>
+        </div>
+      </div>
+
+      <div id="pdfContent" class="pdf-content">
+        <h1 class="pdf-title">AI Travel Plan</h1>
+        <div id="resultBox" class="result-box"></div>
+      </div>
+    </section>
+
+    <section id="flightBookingSection" class="approval-section hidden">
+      <div class="approval-icon">✈️</div>
+      <div class="approval-content">
+        <span class="eyebrow">Human-in-the-Loop Booking</span>
+        <h2>Final flight confirmation</h2>
+        <p id="flightBookingSummary">Review the refreshed live fare and passenger details. Trust Trip MAS will never charge or book without your final confirmation.</p>
+        <div id="passengerForm" class="passenger-form"></div>
+        <div id="paymentChoice" class="payment-choice hidden">
+          <label>Payment / booking method
+            <select id="flightPaymentMode">
+              <option value="sandbox_balance">Pay now — Duffel Sandbox Balance (demo, no real money)</option>
+              <option value="hold">Hold now — pay later (sandbox)</option>
+            </select>
+          </label>
+          <small>Razorpay Checkout handles the customer payment securely. Raw card/UPI credentials never reach Trust Trip MAS. The server verifies the Razorpay payment before attempting airline fulfilment.</small>
+        </div>
+        <div class="approval-actions">
+          <button id="finalBookBtn" class="approve-btn" onclick="confirmFlightBooking()">Review & Pay / Book</button>
+          <button class="revise-btn" onclick="cancelFlightBooking()">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="tripsSection" class="workflow-section trips-shell">
+      <div class="workflow-header trips-header">
+        <div><span class="eyebrow">Transaction Center</span><h2>My Trips</h2></div>
+        <button type="button" class="trips-menu-btn" id="tripsMenuBtn" onclick="toggleTrips()" aria-expanded="false" aria-controls="tripsDropdown" title="Open My Trips">⋮</button>
+      </div>
+      <div id="tripsDropdown" class="trips-dropdown hidden">
+        <div class="trips-dropdown-toolbar">
+          <span>Tickets &amp; booking records</span>
+          <button type="button" class="copy-btn" onclick="loadTrips()">Refresh</button>
+        </div>
+        <div id="tripsList" class="trips-list"></div>
+      </div>
+    </section>
+
+    <section id="bookedHotelsSection" class="workflow-section trips-shell booked-hotels-shell">
+      <div class="workflow-header trips-header">
+        <div><span class="eyebrow">Hotel Bookings</span><h2>Booked Hotels</h2></div>
+        <button type="button" class="trips-menu-btn" id="bookedHotelsMenuBtn" onclick="toggleBookedHotels()" aria-expanded="false" aria-controls="bookedHotelsDropdown" title="Open Booked Hotels">⋮</button>
+      </div>
+      <div id="bookedHotelsDropdown" class="trips-dropdown hidden">
+        <div class="trips-dropdown-toolbar">
+          <span>Hotel booking confirmations</span>
+          <button type="button" class="copy-btn" onclick="loadBookedHotels()">Refresh</button>
+        </div>
+        <div id="bookedHotelsList" class="trips-list"></div>
+      </div>
+    </section>
+
+    <section id="approvalSection" class="approval-section hidden">
+      <div class="approval-icon">👤</div>
+      <div class="approval-content">
+        <span class="eyebrow">Human-in-the-Loop</span>
+        <h2>Review the draft itinerary</h2>
+        <p id="approvalRequest">
+          Approve the draft or provide feedback before the final plan is generated.
+        </p>
+
+        <textarea
+          id="approvalFeedback"
+          class="feedback-input"
+          placeholder="Add revision feedback, for example: reduce the hotel cost and add one free day..."
+        ></textarea>
+
+        <div class="approval-actions">
+          <button id="approveBtn" class="approve-btn" onclick="submitApproval(true)">
+            Approve & Generate Final
+          </button>
+          <button id="reviseBtn" class="revise-btn" onclick="submitApproval(false)">
+            Revise Using Feedback
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section id="errorBox" class="error-box hidden"></section>
+  </main>
+
+  <footer>
+    Trust Trip MAS · Built with FastAPI, LangGraph, Groq/Gemini, PostgreSQL, MCP, Duffel Flights, Hotelbeds, LiteAPI and Razorpay
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <script src="/static/script.js"></script>
+</body>
+</html>
