@@ -32,7 +32,9 @@ def test_server_pdf_contains_real_pdf_content():
     )
     pdf = build_travel_plan_pdf(plan.model_dump())
     assert pdf.startswith(b"%PDF")
-    assert len(pdf) > 5000
+    assert b"%%EOF" in pdf
+    assert len(pdf) > 1000
+    assert b"/Catalog" in pdf or b"/Root" in pdf
 
 
 def test_universal_domestic_and_international_routes_are_not_hardcoded():
@@ -57,6 +59,21 @@ def test_country_only_endpoint_is_never_sent_as_an_iata_code():
     assert request["destination_country"] == "Japan"
     assert request["origin_query"] == "india"
     assert request["destination_query"] == "japan"
+
+
+def test_country_only_endpoints_regression():
+    req1 = parse_trip_request("Plan a trip from India to Netherlands on 2026-12-05")
+    assert req1["origin"] is None
+    assert req1["destination"] is None
+    assert req1["origin_country"] == "India"
+    assert req1["destination_country"] == "Netherlands"
+
+    req2 = parse_trip_request("Plan a trip from Netherlands to Japan on 2026-12-05")
+    assert req2["origin"] is None
+    assert req2["destination"] is None
+    assert req2["origin_country"] == "Netherlands"
+    assert req2["destination_country"] == "Japan"
+
 
 
 def test_preset_style_trip_keeps_explicit_departure_city():

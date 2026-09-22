@@ -128,6 +128,46 @@ def _airport_record(code: str) -> dict[str, Any]:
     return _airport_catalog().get(code.upper(), {})
 
 
+def _country_name(code_or_name: str | None) -> str:
+    """Normalize 2-letter ISO codes or common country text to canonical country name."""
+    if not code_or_name:
+        return ""
+    val = str(code_or_name).strip()
+    if len(val) == 2:
+        try:
+            import pycountry
+            c = pycountry.countries.get(alpha_2=val.upper())
+            if c:
+                return c.name
+        except Exception:
+            pass
+    common = {
+        "in": "India", "us": "United States", "gb": "United Kingdom", "uk": "United Kingdom",
+        "ae": "United Arab Emirates", "jp": "Japan", "th": "Thailand", "sg": "Singapore",
+        "ca": "Canada", "au": "Australia", "fr": "France", "de": "Germany", "nl": "Netherlands",
+        "it": "Italy", "es": "Spain", "ch": "Switzerland", "my": "Malaysia", "id": "Indonesia",
+        "qa": "Qatar", "sa": "Saudi Arabia", "tr": "Turkey", "kr": "South Korea",
+    }
+    if val.lower() in common:
+        return common[val.lower()]
+    return val
+
+
+def _city_from_airport(code: str, record: dict[str, Any], default: str = "") -> str:
+    """Extract clean city name without leaking airport suffix."""
+    city = str(record.get("city") or "").strip()
+    if city:
+        return city
+    if code in CITY_TO_NAME:
+        return CITY_TO_NAME[code]
+    name = str(record.get("name") or "").strip()
+    for suffix in (" International Airport", " Airport", " Aerodrome", " Air Base", " Station"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+            break
+    return name or default or code
+
+
 def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     """Resolve arbitrary city/airport/IATA text to (IATA, city, country).
 
@@ -138,12 +178,19 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     """
     raw = _clean(value)
     value = raw.lower()
+    STOP_WORDS = {"a", "an", "the", "my", "our", "this", "that", "trip", "tour", "plan", "days", "day", "night", "nights"}
+    if not value or value in STOP_WORDS:
+        return None, None, None
+
     airports = _airport_catalog()
 
     if len(raw) == 3 and raw.upper() in airports:
         code = raw.upper()
         a = airports[code]
-        return code, a.get("city") or a.get("name") or code, a.get("country")
+        city = _city_from_airport(code, a, raw.title())
+        country = _country_name(a.get("country"))
+        return code, city, country
+
     if len(raw) == 3 and raw.upper() in CITY_TO_NAME:
         code = raw.upper()
         return code, CITY_TO_NAME[code], ("India" if code in {
@@ -153,10 +200,12 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     if value in CITY_TO_IATA:
         code = CITY_TO_IATA[value]
         a = _airport_record(code)
+        city = _city_from_airport(code, a, raw.title())
         fallback_country = {"DXB": "United Arab Emirates", "BKK": "Thailand", "SIN": "Singapore", "HND": "Japan", "NRT": "Japan", "LHR": "United Kingdom", "CDG": "France", "JFK": "United States", "EWR": "United States", "LAX": "United States", "SFO": "United States", "YYZ": "Canada", "YVR": "Canada", "SYD": "Australia", "MEL": "Australia", "FRA": "Germany", "AMS": "Netherlands", "DOH": "Qatar", "RUH": "Saudi Arabia", "JED": "Saudi Arabia", "IST": "Turkey", "HKG": "Hong Kong", "ICN": "South Korea", "PEK": "China", "DAC": "Bangladesh", "KTM": "Nepal"}
-        return code, a.get("city") or CITY_TO_NAME.get(code, raw.title()), a.get("country") or fallback_country.get(code) or ("India" if code in {
+        country = _country_name(a.get("country")) or fallback_country.get(code) or ("India" if code in {
             "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR"
         } else None)
+        return code, city, country
 
     country_aliases = {
         "india":"India", "japan":"Japan", "thailand":"Thailand", "uae":"United Arab Emirates",
@@ -164,9 +213,20 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
         "usa":"United States", "america":"United States", "canada":"Canada", "france":"France",
         "germany":"Germany", "italy":"Italy", "spain":"Spain", "singapore":"Singapore",
         "australia":"Australia", "malaysia":"Malaysia", "indonesia":"Indonesia",
+        "netherlands":"Netherlands", "holland":"Netherlands", "china":"China",
+        "bangladesh":"Bangladesh", "nepal":"Nepal", "qatar":"Qatar", "saudi arabia":"Saudi Arabia",
+        "turkey":"Turkey", "south korea":"South Korea", "korea":"South Korea",
     }
     if value in country_aliases:
-        return None, raw.title(), country_aliases[value]
+        return None, None, country_aliases[value]
+
+    try:
+        import pycountry
+        c_obj = pycountry.countries.get(name=raw.title()) or pycountry.countries.get(common_name=raw.title())
+        if c_obj:
+            return None, None, c_obj.name
+    except Exception:
+        pass
 
     if not airports:
         return None, None, None
@@ -187,14 +247,19 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     if candidates:
         candidates.sort(key=lambda item: (0 if item[0] in preferred_codes else 1, item[0]))
         code, a = candidates[0]
-        return code, a.get("city") or a.get("name") or code, a.get("country")
+        city = _city_from_airport(code, a, raw.title())
+        country = _country_name(a.get("country"))
+        return code, city, country
 
     # Never interpret a country name as one arbitrary airport.
-    country_matches = [a for a in airports.values() if str(a.get("country") or "").strip().lower() == value]
+    country_matches = [a for a in airports.values() if str(a.get("country") or "").strip().lower() == value or _country_name(a.get("country")).lower() == value]
     if country_matches:
-        return None, None, country_matches[0].get("country")
+        return None, None, _country_name(country_matches[0].get("country"))
 
-    # Conservative substring/fuzzy city resolution.
+    # Conservative substring/fuzzy city resolution requires at least 3 characters.
+    if len(value) < 3:
+        return None, None, None
+
     candidates = []
     for code, a in airports.items():
         city = str(a.get("city") or "").lower()
@@ -204,13 +269,17 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     if candidates:
         candidates.sort(key=lambda item: (0 if item[0] in preferred_codes else 1, item[0]))
         code, a = candidates[0]
-        return code, a.get("city") or a.get("name") or code, a.get("country")
+        city = _city_from_airport(code, a, raw.title())
+        country = _country_name(a.get("country"))
+        return code, city, country
 
     names = {str(a.get("city") or "").lower(): (code, a) for code, a in airports.items() if a.get("city")}
     match = get_close_matches(value, list(names), n=1, cutoff=0.82)
     if match:
         code, a = names[match[0]]
-        return code, a.get("city") or a.get("name") or code, a.get("country")
+        city = _city_from_airport(code, a, raw.title())
+        country = _country_name(a.get("country"))
+        return code, city, country
     return None, None, None
 
 
@@ -298,26 +367,28 @@ def _find_trip_destination(text: str) -> tuple[str | None, str | None, str | Non
         r"\b(?:trip|tour|holiday|vacation)\s+(?:to|in)\s+([A-Za-z][A-Za-z .'-]+?)(?=\s+(?:from|for|under|with|including|on|$))",
         r"\b(?:to|in)\s+([A-Za-z][A-Za-z .'-]+?)\s+(?:trip|tour|holiday|vacation)\b",
     ]
+    STOP_WORDS = {"a", "an", "the", "my", "our", "this", "that", "trip", "tour", "plan", "complete", "new"}
     for pattern in patterns:
         m = re.search(pattern, low)
         if m:
             value = m.group(1).strip(" .,;:-")
             # Remove leading planner phrases accidentally captured by the first pattern.
             value = re.sub(r"^(?:plan|a|complete|\d+\s*(?:day|days|night|nights))\s+", "", value).strip()
+            if not value or value.lower() in STOP_WORDS or len(value) < 3:
+                continue
             code, city, country = _resolve_place(value)
             if code or country:
-                return code, city or value.title(), country
-            # Common country names remain useful even if the optional airport
-            # catalog is unavailable in a local development environment.
+                return code, city, country
             country_aliases = {
                 "japan":"Japan", "thailand":"Thailand", "dubai":"United Arab Emirates", "uae":"United Arab Emirates",
                 "india":"India", "uk":"United Kingdom", "england":"United Kingdom", "france":"France",
                 "italy":"Italy", "singapore":"Singapore", "australia":"Australia", "usa":"United States",
                 "america":"United States", "canada":"Canada", "germany":"Germany", "spain":"Spain",
                 "switzerland":"Switzerland", "malaysia":"Malaysia", "indonesia":"Indonesia",
+                "netherlands":"Netherlands", "holland":"Netherlands", "china":"China",
             }
-            if value in country_aliases:
-                return None, value.title(), country_aliases[value]
+            if value.lower() in country_aliases:
+                return None, None, country_aliases[value.lower()]
     return None, None, None
 
 
@@ -385,10 +456,13 @@ def _is_follow_up_request(text: str) -> bool:
         return False
     explicit = (
         "same trip", "same route", "same plan", "continue", "change it",
-        "change the", "make it", "make this", "keep the", "instead",
+        "change the", "change destination", "change origin", "change budget",
+        "change dates", "change duration", "change passengers", "change to",
+        "make it", "make this", "keep the", "instead",
         "add a", "add an", "remove the", "remove", "replace the",
-        "cheaper", "more affordable", "increase my budget", "reduce the cost",
-        "change my budget", "for the same", "revise", "modify the",
+        "cheaper", "more affordable", "increase my budget", "increase budget",
+        "reduce the cost", "lower the cost", "change my budget", "for the same",
+        "revise", "modify the", "modify",
     )
     if any(x in low for x in explicit):
         return True
@@ -396,9 +470,20 @@ def _is_follow_up_request(text: str) -> bool:
     return False
 
 
-def parse_trip_request(query: str, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+def parse_trip_request(
+    query: str,
+    previous: dict[str, Any] | Any | None = None,
+) -> dict[str, Any]:
     text = _clean(query)
-    previous = (previous or {}) if _is_follow_up_request(text) else {}
+    if hasattr(previous, "model_dump") and hasattr(previous, "origin"):
+        from domain.compat import trip_request_to_legacy
+        previous_dict = trip_request_to_legacy(previous)
+    elif isinstance(previous, dict):
+        previous_dict = previous
+    else:
+        previous_dict = {}
+
+    previous = previous_dict if _is_follow_up_request(text) else {}
     origin, destination = _find_route(text)
     raw_origin, raw_destination = _find_route_queries(text)
     route_origin_info = _resolve_place(raw_origin) if raw_origin else (None, None, None)
@@ -441,15 +526,20 @@ def parse_trip_request(query: str, previous: dict[str, Any] | None = None) -> di
     origin_iata, origin_city, origin_country = _resolve_place(origin) if origin else (None, None, None)
     if not origin_country:
         origin_country = route_origin_info[2] or trip_origin_country or previous.get("origin_country") or ""
-    origin_city = origin_city or route_origin_info[1] or trip_origin_city or previous.get("origin_city") or (origin or raw_origin or "")
+    origin_country = _country_name(origin_country)
+    origin_city = origin_city or route_origin_info[1] or trip_origin_city or previous.get("origin_city")
+    if origin_city and origin_country and origin_city.lower() == origin_country.lower():
+        origin_city = None
+
     destination_iata, destination_city, destination_country = _resolve_place(destination) if destination else (None, None, None)
-    # Provider-facing route fields contain ONLY valid IATA codes. Country-only
-    # requests remain useful planning constraints but must never be sent to Duffel
-    # as if a country name were an airport code.
     origin = origin_iata
     destination = destination_iata
-    destination_city = destination_city or route_destination_info[1] or trip_destination_city or previous.get("destination_city") or (destination or raw_destination or "")
-    destination_country = destination_country or route_destination_info[2] or trip_destination_country or previous.get("destination_country") or ""
+    if not destination_country:
+        destination_country = route_destination_info[2] or trip_destination_country or previous.get("destination_country") or ""
+    destination_country = _country_name(destination_country)
+    destination_city = destination_city or route_destination_info[1] or trip_destination_city or previous.get("destination_city")
+    if destination_city and destination_country and destination_city.lower() == destination_country.lower():
+        destination_city = None
 
     # Country-only quick-trip requests need a concrete city for hotel/activity
     # planning. These are transparent gateway defaults for the three built-in
@@ -461,7 +551,8 @@ def parse_trip_request(query: str, previous: dict[str, Any] | None = None) -> di
             "united arab emirates": ("DXB", "Dubai"),
         }
         key = str(destination_country or "").strip().lower()
-        if key in gateway_defaults and re.search(r"\b(?:trip|tour|holiday|vacation)\b", text, re.I):
+        is_explicit_route = bool(raw_origin and raw_destination)
+        if key in gateway_defaults and not is_explicit_route and re.search(r"\b(?:trip|tour|holiday|vacation)\b", text, re.I):
             destination, destination_city = gateway_defaults[key]
 
     lower = text.lower()
