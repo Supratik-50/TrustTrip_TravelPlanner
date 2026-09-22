@@ -1,8 +1,11 @@
 from __future__ import annotations
 import json, os, uuid
 from typing import Any
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
+from dependencies.auth import get_optional_current_user
+from domain.user import UserResponse
 from services.hotel.hotel_service import HotelService
 from services.hotel.hotel_provider import HotelProviderError
 from services.razorpay_service import RazorpayService, RazorpayError
@@ -35,7 +38,10 @@ class HotelVerifyBook(BaseModel):
 
 
 @router.post("/create-order")
-async def create_order(req: HotelPaymentOrder):
+async def create_order(
+    req: HotelPaymentOrder,
+    current_user: UserResponse | None = Depends(get_optional_current_user),
+):
     if not req.final_confirmation:
         raise HTTPException(status_code=409, detail="Final user confirmation is required before hotel payment.")
     offer=req.offer; pre=req.prebook
@@ -55,19 +61,32 @@ async def create_order(req: HotelPaymentOrder):
         order=rz.create_order(float(amount_inr), f"hotel_{tx_id[:32]}", {"transaction_id":tx_id,"provider":str(offer.get("provider")),"hotel":str(offer.get("hotel_name","Hotel"))[:120]})
     except RazorpayError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    HotelTransactionStore().create(id=tx_id, customer_ref=req.customer_ref, provider=str(offer.get("provider")), hotel_name=str(offer.get("hotel_name") or "Hotel"), offer=offer, prebook=pre, holder=req.holder, guests=req.guests, amount_inr=round(float(amount_inr),2), razorpay_order_id=order.get("id"))
+    if not current_user and req.customer_ref:
+        from services.auth_store import UserStore
+        if UserStore().get_by_id(req.customer_ref):
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot assign hotel payment order to a registered user account without authenticating.",
+            )
+    effective_customer_ref = str(current_user.id) if current_user else req.customer_ref
+    HotelTransactionStore().create(id=tx_id, customer_ref=effective_customer_ref, provider=str(offer.get("provider")), hotel_name=str(offer.get("hotel_name") or "Hotel"), offer=offer, prebook=pre, holder=req.holder, guests=req.guests, amount_inr=round(float(amount_inr),2), razorpay_order_id=order.get("id"))
     return {"success":True,"transaction_id":tx_id,"razorpay_order_id":order.get("id"),"amount_inr":round(float(amount_inr),2),"currency":"INR","key_id":rz.key_id,"provider":offer.get("provider"),"hotel_name":offer.get("hotel_name")}
 
 @router.post("/verify-and-book")
-async def verify_and_book(req: HotelVerifyBook):
+async def verify_and_book(
+    req: HotelVerifyBook,
+    current_user: UserResponse | None = Depends(get_optional_current_user),
+):
     if not req.final_confirmation:
         raise HTTPException(status_code=409, detail="Final user confirmation is required before hotel booking.")
     store = HotelTransactionStore()
     pending = store.get(req.transaction_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Hotel payment transaction not found. Start checkout again.")
-    if req.customer_ref and pending.get("customer_ref") and req.customer_ref != pending.get("customer_ref"):
-        raise HTTPException(status_code=403, detail="This hotel transaction does not belong to the current customer.")
+    effective_customer_ref = str(current_user.id) if current_user else req.customer_ref
+    if pending.get("customer_ref"):
+        if not effective_customer_ref or effective_customer_ref != pending.get("customer_ref"):
+            raise HTTPException(status_code=403, detail="This hotel transaction does not belong to the current customer.")
     if pending.get("razorpay_order_id") != req.razorpay_order_id:
         raise HTTPException(status_code=409, detail="Razorpay order does not match the hotel transaction.")
 

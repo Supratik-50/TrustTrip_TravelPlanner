@@ -1,20 +1,24 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 import traceback
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from backend import run_travel_agent, resume_travel_agent
+from auth_api import router as auth_router
 from flight_api import router as flight_router
 from payment_api import router as payment_router
 from trips_api import router as trips_router
 from hotel_api import router as hotel_router
 from hotel_payment_api import router as hotel_payment_router
 from services.travel_plan_pdf import build_travel_plan_pdf
+from dependencies.auth import get_current_user
+from domain.user import UserResponse
 
 # This is kept from the original project to allow the existing synchronous
 # agent functions to call async MCP helpers inside FastAPI.
@@ -24,6 +28,16 @@ nest_asyncio.apply()
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from services.auth_store import init_auth_tables
+    from services.trip_store import init_trip_tables
+    init_auth_tables()
+    init_trip_tables()
+    yield
+
+
 app = FastAPI(
     title="Trust Trip MAS",
     description=(
@@ -31,8 +45,10 @@ app = FastAPI(
         "Human-in-the-Loop, and FastAPI Frontend"
     ),
     version="2.0.0",
+    lifespan=lifespan,
 )
 
+app.include_router(auth_router)
 app.include_router(flight_router)
 app.include_router(payment_router)
 app.include_router(trips_router)
@@ -73,7 +89,10 @@ async def home(request: Request):
 
 
 @app.post("/api/travel")
-async def travel_planner(request_data: TravelRequest):
+async def travel_planner(
+    request_data: TravelRequest,
+    current_user: UserResponse = Depends(get_current_user),
+):
     try:
         user_message = request_data.message.strip()
 
@@ -89,6 +108,7 @@ async def travel_planner(request_data: TravelRequest):
         result = run_travel_agent(
             user_input=user_message,
             thread_id=request_data.thread_id,
+            authenticated_user_id=str(current_user.id),
         )
 
         return JSONResponse(
@@ -98,6 +118,8 @@ async def travel_planner(request_data: TravelRequest):
             }
         )
 
+    except PermissionError as p_exc:
+        raise HTTPException(status_code=403, detail=str(p_exc))
     except Exception as exc:
         print("ERROR:", exc)
         traceback.print_exc()
@@ -126,7 +148,10 @@ async def download_travel_plan_pdf(request_data: TravelPlanPDFRequest):
 
 
 @app.post("/api/travel/approve")
-async def approve_travel_plan(request_data: ApprovalRequest):
+async def approve_travel_plan(
+    request_data: ApprovalRequest,
+    current_user: UserResponse = Depends(get_current_user),
+):
     try:
         if not request_data.approved and not request_data.feedback.strip():
             return JSONResponse(
@@ -141,6 +166,7 @@ async def approve_travel_plan(request_data: ApprovalRequest):
             thread_id=request_data.thread_id,
             approved=request_data.approved,
             feedback=request_data.feedback,
+            authenticated_user_id=str(current_user.id),
         )
 
         return JSONResponse(
@@ -150,6 +176,8 @@ async def approve_travel_plan(request_data: ApprovalRequest):
             }
         )
 
+    except PermissionError as p_exc:
+        raise HTTPException(status_code=403, detail=str(p_exc))
     except Exception as exc:
         print("APPROVAL ERROR:", exc)
         traceback.print_exc()

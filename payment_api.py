@@ -12,9 +12,11 @@ import json
 import os
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from dependencies.auth import get_current_user, get_optional_current_user
+from domain.user import UserResponse
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
 from services.currency_converter import CurrencyConversionError, CurrencyConverter
 from services.flight_service import FlightService
@@ -190,7 +192,10 @@ async def payment_config():
 
 
 @router.post("/create-order")
-async def create_payment_order(request: PaymentOrderRequest):
+async def create_payment_order(
+    request: PaymentOrderRequest,
+    current_user: UserResponse | None = Depends(get_optional_current_user),
+):
     if not request.final_confirmation:
         return {"success": False, "requires_final_confirmation": True, "error": "Final user confirmation is required before payment."}
 
@@ -230,8 +235,16 @@ async def create_payment_order(request: PaymentOrderRequest):
                 "provider_currency": conversion["provider_currency"],
             },
         )
+        if not current_user and request.customer_ref:
+            from services.auth_store import UserStore
+            if UserStore().get_by_id(request.customer_ref):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot assign payment order to a registered user account without authenticating.",
+                )
+        effective_customer_ref = str(current_user.id) if current_user else request.customer_ref
         tx_id = _store().create(
-            customer_ref=request.customer_ref,
+            customer_ref=effective_customer_ref,
             offer_id=request.offer_id,
             razorpay_order_id=razor_order["id"],
             amount=amount,
@@ -279,7 +292,10 @@ async def create_payment_order(request: PaymentOrderRequest):
 
 
 @router.post("/presentation-book")
-async def presentation_book(request: PresentationBookRequest):
+async def presentation_book(
+    request: PresentationBookRequest,
+    current_user: UserResponse | None = Depends(get_optional_current_user),
+):
     """Verify Razorpay TEST payment and immediately fulfil the flight booking.
 
     This keeps the existing presentation endpoint/logging contract while using
@@ -299,6 +315,12 @@ async def presentation_book(request: PresentationBookRequest):
     tx = store.get(request.transaction_id)
     if not tx:
         raise HTTPException(status_code=404, detail="Payment transaction not found.")
+    if tx.get("customer_ref"):
+        from services.auth_store import UserStore
+        is_user_tx = bool(UserStore().get_by_id(tx["customer_ref"]))
+        if is_user_tx or current_user:
+            if not current_user or str(current_user.id) != tx["customer_ref"]:
+                raise HTTPException(status_code=403, detail="This payment transaction does not belong to you.")
     if tx.get("razorpay_order_id") != request.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Payment order does not match this transaction.")
     if tx.get("booking_status") == "booked":
@@ -465,7 +487,10 @@ async def _fulfil_paid_transaction(transaction_id: str) -> dict:
 
 
 @router.post("/verify-and-book")
-async def verify_and_book(request: PaymentVerifyRequest):
+async def verify_and_book(
+    request: PaymentVerifyRequest,
+    current_user: UserResponse | None = Depends(get_optional_current_user),
+):
     if not request.final_confirmation:
         return {"success": False, "requires_final_confirmation": True, "error": "Final user confirmation is required."}
 
@@ -474,6 +499,12 @@ async def verify_and_book(request: PaymentVerifyRequest):
     tx = store.get(request.transaction_id)
     if not tx:
         raise HTTPException(status_code=404, detail="Payment transaction not found.")
+    if tx.get("customer_ref"):
+        from services.auth_store import UserStore
+        is_user_tx = bool(UserStore().get_by_id(tx["customer_ref"]))
+        if is_user_tx or current_user:
+            if not current_user or str(current_user.id) != tx["customer_ref"]:
+                raise HTTPException(status_code=403, detail="This payment transaction does not belong to you.")
     if tx.get("razorpay_order_id") != request.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Payment order does not match this transaction.")
 
@@ -512,13 +543,19 @@ async def verify_and_book(request: PaymentVerifyRequest):
 
 
 @router.post("/refund")
-async def refund_payment(transaction_id: str, final_confirmation: bool = False):
+async def refund_payment(
+    transaction_id: str,
+    final_confirmation: bool = False,
+    current_user: UserResponse = Depends(get_current_user),
+):
     if not final_confirmation:
         return {"success": False, "requires_final_confirmation": True, "error": "Final refund confirmation is required."}
     store = _store()
     tx = store.get(transaction_id)
     if not tx or not tx.get("razorpay_payment_id"):
         raise HTTPException(status_code=404, detail="Captured payment not found for this transaction.")
+    if tx.get("customer_ref") != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Captured payment transaction does not belong to you.")
     if tx.get("refund_status") in {"processed", "processed_partial"}:
         return {"success": True, "already_refunded": True, "transaction_id": transaction_id}
     try:

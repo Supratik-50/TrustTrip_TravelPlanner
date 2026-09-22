@@ -831,10 +831,35 @@ def _serialize_result(
     }
 
 
-def run_travel_agent(user_input: str, thread_id: str | None = None):
-    """Start a new travel-planning run and pause at human approval."""
-    if not thread_id:
-        thread_id = f"user_{uuid.uuid4().hex}"
+def run_travel_agent(
+    user_input: str,
+    thread_id: str | None = None,
+    authenticated_user_id: str | None = None,
+    trip_id: str | None = None,
+):
+    """Start a new travel-planning run and pause at human approval.
+
+    If authenticated_user_id is provided, thread ownership is strictly verified
+    or a new server-owned thread is created before any LangGraph state access.
+    """
+    from services.trip_store import TripStore
+
+    trip_store = TripStore()
+    if authenticated_user_id:
+        if thread_id:
+            if not trip_store.verify_thread_ownership(thread_id, authenticated_user_id):
+                raise PermissionError(
+                    f"Access denied: Thread '{thread_id}' does not belong to the authenticated user."
+                )
+        else:
+            created = trip_store.create_thread(
+                user_id=authenticated_user_id,
+                trip_id=trip_id,
+            )
+            thread_id = str(created["id"])
+    else:
+        if not thread_id:
+            thread_id = f"user_{uuid.uuid4().hex}"
 
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -885,10 +910,22 @@ def resume_travel_agent(
     thread_id: str,
     approved: bool,
     feedback: str = "",
+    authenticated_user_id: str | None = None,
 ):
-    """Resume the paused LangGraph thread after human review."""
+    """Resume the paused LangGraph thread after human review.
+
+    If authenticated_user_id is provided, thread ownership is strictly verified
+    before resuming the LangGraph execution.
+    """
     if not thread_id:
         raise ValueError("thread_id is required to resume a travel plan.")
+
+    if authenticated_user_id:
+        from services.trip_store import TripStore
+        if not TripStore().verify_thread_ownership(thread_id, authenticated_user_id):
+            raise PermissionError(
+                f"Access denied: Thread '{thread_id}' does not belong to the authenticated user."
+            )
 
     config = {"configurable": {"thread_id": thread_id}}
     result = travel_graph.invoke(
