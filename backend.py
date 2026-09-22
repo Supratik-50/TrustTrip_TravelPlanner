@@ -29,7 +29,7 @@ from services.flight_service import FlightService
 from services.hotel.hotel_service import HotelService
 from services.travel_planner import parse_trip_request, candidate_dates, budget_from_live_data, _provider_text, _resolve_place
 from services.chat_planner import generate_travel_plan, plan_to_markdown
-from domain.compat import build_trip_request
+from domain.compat import build_trip_request, trip_request_to_legacy
 from domain.trip import TripRequest
 
 from mcp_client import (
@@ -184,13 +184,21 @@ def supervisor_agent(state: TravelState):
             "llm_calls": state.get("llm_calls", 0),
         }
 
-    previous_constraints = state.get("trip_constraints") or {}
-    constraints = parse_trip_request(query, previous_constraints)
-    trip_request = build_trip_request(
-        constraints,
-        thread_id=state.get("thread_id"),
-        original_query=query,
-    )
+    if state.get("trip_request"):
+        raw_tr = state["trip_request"]
+        if isinstance(raw_tr, dict):
+            trip_request = TripRequest.model_validate(raw_tr)
+        else:
+            trip_request = raw_tr
+        constraints = state.get("trip_constraints") or trip_request_to_legacy(trip_request)
+    else:
+        previous_constraints = state.get("trip_constraints") or {}
+        constraints = parse_trip_request(query, previous_constraints)
+        trip_request = build_trip_request(
+            constraints,
+            thread_id=state.get("thread_id"),
+            original_query=query,
+        )
     selected = AGENT_ORDER.copy()
     mode = "cheaper" if constraints.get("cheaper_mode") else "initial"
     if constraints.get("cheaper_mode"):
@@ -839,71 +847,18 @@ def run_travel_agent(
 ):
     """Start a new travel-planning run and pause at human approval.
 
-    If authenticated_user_id is provided, thread ownership is strictly verified
-    or a new server-owned thread is created before any LangGraph state access.
+    Delegates to PlannerService to ensure intent routing, state management,
+    and server-side thread ownership are applied consistently.
     """
-    from services.trip_store import TripStore
+    from services.planner_service import PlannerService
 
-    trip_store = TripStore()
-    if authenticated_user_id:
-        if thread_id:
-            if not trip_store.verify_thread_ownership(thread_id, authenticated_user_id):
-                raise PermissionError(
-                    f"Access denied: Thread '{thread_id}' does not belong to the authenticated user."
-                )
-        else:
-            created = trip_store.create_thread(
-                user_id=authenticated_user_id,
-                trip_id=trip_id,
-            )
-            thread_id = str(created["id"])
-    else:
-        if not thread_id:
-            thread_id = f"user_{uuid.uuid4().hex}"
-
-    config = {"configurable": {"thread_id": thread_id}}
-
-    previous = {}
-    if request_thread := thread_id:
-        try:
-            previous = dict(travel_graph.get_state({"configurable": {"thread_id": request_thread}}).values or {})
-        except Exception:
-            previous = {}
-
-    result = travel_graph.invoke(
-        {
-            "messages": [HumanMessage(content=user_input)],
-            "user_query": user_input,
-            "guardrail_allowed": True,
-            "guardrail_reason": "",
-            "selected_agents": [],
-            "trip_constraints": previous.get("trip_constraints") or _empty_constraints(),
-            "trip_request": previous.get("trip_request"),
-            "supervisor_reasoning": "",
-            "flight_results": "",
-            "hotel_results": "",
-            "weather_results": "",
-            "budget_results": "",
-            "itinerary": "",
-            "approval_request": "",
-            "approved": False,
-            "human_feedback": "",
-            "final_response": "",
-            "live_flight_offers": [],
-            "live_plan": {},
-            "replanning_mode": "initial",
-            "llm_calls": 0,
-            "plan_json": {},
-            "llm_provider": "",
-            "revision_count": 0,
-            "planning_blocked": False,
-            "planning_feedback": [],
-            "provider_replan_required": False,
-        },
-        config=config,
+    return PlannerService().plan_travel(
+        user_input=user_input,
+        thread_id=thread_id,
+        authenticated_user_id=authenticated_user_id,
+        trip_id=trip_id,
     )
 
-    return _serialize_result(result, thread_id)
 
 
 def resume_travel_agent(

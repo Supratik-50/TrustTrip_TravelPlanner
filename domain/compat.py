@@ -134,5 +134,10 @@ def trip_request_to_legacy(trip: TripRequest) -> dict[str, Any]:
         "travel_style": trip.travel_preferences.style or "",
         "query": trip.original_query,
         "intent": trip.intent.value,
+        "journey_scope": (
+            "domestic"
+            if trip.origin and trip.destination and trip.origin.country and trip.destination.country and trip.origin.country.lower() == trip.destination.country.lower()
+            else ("international" if trip.origin and trip.destination and trip.origin.country and trip.destination.country else "unknown")
+        ),
     }
     return result
