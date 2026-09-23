@@ -305,21 +305,21 @@ class TripStore:
             return self.get_trip(trip_id, user_id)
 
         # Synchronize authoritative column with metadata mirror
-        if "current_revision_number" in filtered:
+        has_rev_num = "current_revision_number" in filtered
+        if has_rev_num:
             rev_num = int(filtered["current_revision_number"])
             if "metadata" in filtered and isinstance(filtered["metadata"], dict):
                 filtered["metadata"]["revision"] = rev_num
                 filtered["metadata"]["trip_revision"] = rev_num
-        elif "metadata" in filtered and isinstance(filtered["metadata"], dict):
-            if "trip_revision" in filtered["metadata"] and filtered["metadata"]["trip_revision"] is not None:
-                filtered["current_revision_number"] = int(filtered["metadata"]["trip_revision"])
-            elif "revision" in filtered["metadata"] and filtered["metadata"]["revision"] is not None:
-                filtered["current_revision_number"] = int(filtered["metadata"]["revision"])
 
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             t = self._memory_trips.get(tid_str)
             if not t or str(t["user_id"]) != uid_str:
                 return None
+            if not has_rev_num and "metadata" in filtered and isinstance(filtered["metadata"], dict):
+                cur_r = t.get("current_revision_number", 0)
+                filtered["metadata"]["revision"] = cur_r
+                filtered["metadata"]["trip_revision"] = cur_r
             t.update(filtered)
             t["updated_at"] = now
             return dict(t)
@@ -328,7 +328,10 @@ class TripStore:
         vals = []
         for k, v in filtered.items():
             if k == "metadata":
-                sets.append(f"{k} = %s::jsonb")
+                if has_rev_num:
+                    sets.append(f"{k} = %s::jsonb")
+                else:
+                    sets.append(f"{k} = (%s::jsonb || jsonb_build_object('revision', current_revision_number, 'trip_revision', current_revision_number))")
                 vals.append(json.dumps(v))
             elif k == "current_revision_id":
                 sets.append(f"{k} = %s")

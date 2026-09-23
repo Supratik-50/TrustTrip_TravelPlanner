@@ -28,7 +28,7 @@ from langchain_core.messages import (
 from services.flight_service import FlightService
 from services.hotel.hotel_service import HotelService
 from services.travel_planner import parse_trip_request, candidate_dates, budget_from_live_data, _provider_text, _resolve_place
-from services.chat_planner import generate_travel_plan, plan_to_markdown
+from services.chat_planner import generate_travel_plan, plan_to_markdown, PlannerOutageError
 from domain.compat import build_trip_request, trip_request_to_legacy
 from domain.trip import TripRequest
 
@@ -100,6 +100,14 @@ class TravelState(TypedDict, total=False):
     planning_feedback: list[str]
     provider_replan_required: bool
 
+    # Phase 8 Research state
+    research_session_id: str | None
+    research_query_id: str | None
+    evidence_ids: list[str]
+    source_ids: list[str]
+    research_summary: str
+    research_advisory: dict[str, Any] | None
+
 
 # =========================
 # Shared helpers
@@ -110,16 +118,17 @@ KNOWN_AGENTS = {
     "budget_agent",
     "hotel_agent",
     "weather_agent",
+    "research_agent",
 }
 
-# Exactly five specialist agents are coordinated by the Supervisor.
-# The execution order is dependency-aware: flight/hotel/weather evidence is
-# collected first, Budget aggregates those costs, and Itinerary produces the
-# final evidence-grounded plan.
+# Specialist agents coordinated by the Supervisor.
+# Execution order: flight/hotel/weather/research evidence is collected first,
+# Budget aggregates costs, and Itinerary produces the final grounded plan.
 AGENT_ORDER = [
     "flight_agent",
     "hotel_agent",
     "weather_agent",
+    "research_agent",
     "budget_agent",
     "itinerary_agent",
 ]
@@ -199,7 +208,17 @@ def supervisor_agent(state: TravelState):
             thread_id=state.get("thread_id"),
             original_query=query,
         )
-    selected = AGENT_ORDER.copy()
+    # Phase 8: Route to research_agent only when research intent is triggered or explicitly requested
+    from services.research.intent_router import ResearchIntentRouter, ResearchIntent
+    _research_router = ResearchIntentRouter()
+    _decision = _research_router.classify(query)
+    is_research_intent = _decision.intent not in (ResearchIntent.LIVE_FLIGHT_SEARCH, ResearchIntent.AMBIGUOUS_RESEARCH)
+    has_research_keyword = any(k in q for k in ("research", "visa", "advisory", "baggage", "luggage", "policy", "terminal", "layover rule"))
+    if is_research_intent or has_research_keyword:
+        selected = AGENT_ORDER.copy()
+    else:
+        selected = [a for a in AGENT_ORDER if a != "research_agent"]
+
     mode = "cheaper" if constraints.get("cheaper_mode") else "initial"
     if constraints.get("cheaper_mode"):
         reasoning = "Adaptive re-planning requested: live flight and accommodation searches will be repeated with cost-first ranking."
@@ -496,6 +515,150 @@ Forecast:
 
 
 # =========================
+# Research Agent - Phase 8 Specialist
+# =========================
+def _run_async(coro):
+    """Run an async coroutine synchronously, handling already-running event loops."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro)).result()
+
+
+def research_agent(state: TravelState):
+    """Grounded Research Specialist.
+
+    Performs verified Web/RAG research and produces structured advisory context.
+    CANNOT mutate canonical TripRequest fields (dates, origin, destination,
+    passengers, budget, flight selection, or hotel selection).
+    """
+    query = state.get("user_query", "")
+    constraints = state.get("trip_constraints") or {}
+    trip_req = state.get("trip_request")
+    user_id_raw = getattr(trip_req, "user_id", None) or state.get("user_id")
+    trip_id_raw = getattr(trip_req, "trip_id", None) or state.get("trip_id")
+
+    from uuid import UUID
+    from services.research.orchestrator import ResearchOrchestrator
+    from domain.research import ResearchQuery, ResearchMode, ResearchAdvisoryContext, ResearchAdvisoryProjection
+
+    # Fail closed on missing authenticated user context - NO random UUID fallback (Blocker 2)
+    if not user_id_raw:
+        advisory_empty = ResearchAdvisoryProjection(
+            allowed_facts=[],
+            evidence_ids=[],
+            citation_ids=[],
+            limitations=["No authenticated user provided."],
+            conflicts_as_structured_records=[],
+            is_untrusted=True,
+        )
+        return {
+            "research_session_id": None,
+            "research_query_id": None,
+            "evidence_ids": [],
+            "source_ids": [],
+            "research_summary": "Research unavailable: missing authenticated user context.",
+            "research_advisory": advisory_empty.model_dump(),
+            "messages": [AIMessage(content="Research unavailable: missing authenticated user context.")],
+        }
+
+    try:
+        u_id = UUID(str(user_id_raw))
+    except Exception:
+        advisory_err = ResearchAdvisoryProjection(
+            allowed_facts=[],
+            evidence_ids=[],
+            citation_ids=[],
+            limitations=["Malformed user UUID."],
+            conflicts_as_structured_records=[],
+            is_untrusted=True,
+        )
+        return {
+            "research_session_id": None,
+            "research_query_id": None,
+            "evidence_ids": [],
+            "source_ids": [],
+            "research_summary": "Research unavailable: invalid user identifier.",
+            "research_advisory": advisory_err.model_dump(),
+            "messages": [AIMessage(content="Research unavailable: invalid user identifier.")],
+        }
+
+    t_id = None
+    if trip_id_raw:
+        try:
+            t_id = UUID(str(trip_id_raw))
+        except Exception:
+            t_id = None
+
+    rev_raw = getattr(trip_req, "revision_number", None) or state.get("revision_count", 0)
+    rev_num = int(rev_raw) if rev_raw is not None else 0
+
+    orch = ResearchOrchestrator()
+    rq = ResearchQuery(
+        user_id=u_id,
+        trip_id=t_id,
+        revision_number=rev_num,
+        query_text=query,
+        mode=ResearchMode.AUTO,
+    )
+
+    try:
+        result = _run_async(orch.research(rq))
+        summary = (result.answer or "")[:4000]
+        ev_ids = [c.evidence_id for c in result.citations]
+        cite_ids = [c.citation_id for c in result.citations]
+        source_ids = []
+        sess_id = str(result.research_session_id)
+        q_id = str(result.query_id)
+        conflicts_data = [
+            {
+                "topic": c.topic,
+                "claim_a": c.claim_a,
+                "claim_b": c.claim_b,
+                "resolved": c.resolved,
+                "resolution_summary": c.resolution_summary,
+            }
+            for c in result.conflicts
+        ]
+        advisory = ResearchAdvisoryProjection(
+            allowed_facts=[s.strip() for s in summary.split(". ") if s.strip()][:5],
+            evidence_ids=ev_ids,
+            citation_ids=cite_ids,
+            limitations=["Research output is informational advisory context only."],
+            conflicts_as_structured_records=conflicts_data,
+            is_untrusted=True,
+        )
+    except Exception:
+        # Redact internal exception text (Blocker 8)
+        summary = "Research context unavailable due to an upstream service error."
+        ev_ids = []
+        source_ids = []
+        sess_id = None
+        q_id = None
+        advisory = ResearchAdvisoryProjection(
+            allowed_facts=[],
+            evidence_ids=[],
+            citation_ids=[],
+            limitations=["Service outage."],
+            conflicts_as_structured_records=[],
+            is_untrusted=True,
+        )
+
+    return {
+        "research_session_id": sess_id,
+        "research_query_id": q_id,
+        "evidence_ids": [str(e) for e in ev_ids],
+        "source_ids": source_ids,
+        "research_summary": summary,
+        "research_advisory": advisory.model_dump(),
+        "messages": [AIMessage(content="Research advisory context compiled.")],
+    }
+
+
+# =========================
 # Budget Agent - new specialist
 # =========================
 def budget_agent(state: TravelState):
@@ -577,6 +740,11 @@ def itinerary_agent(state: TravelState):
     # Pass these facts as warnings to the bounded planner; it will preserve all
     # available provider evidence and clearly mark anything that needs verification.
     warning_feedback = "\n".join(planning_feedback)
+    effective_feedback = feedback
+    if warning_feedback:
+        effective_feedback += "\n\nSYSTEM WARNINGS:\n" + warning_feedback
+
+    advisory_data = state.get("research_advisory")
 
     try:
         plan, provider = generate_travel_plan(
@@ -588,11 +756,24 @@ def itinerary_agent(state: TravelState):
             hotel_results=state.get("hotel_results", ""),
             weather_results=state.get("weather_results", ""),
             budget=budget,
-            feedback=(feedback + ("\n\nSYSTEM WARNINGS:\n" + warning_feedback if warning_feedback else "")),
+            feedback=effective_feedback,
             revision_number=revision,
+            research_advisory=advisory_data,
         )
         plan_json = plan.model_dump()
         itinerary = plan_to_markdown(plan)
+        if getattr(plan, "planning_unavailable", False) or provider == "unavailable":
+            return {
+                "itinerary": itinerary,
+                "plan_json": plan_json,
+                "llm_provider": "unavailable",
+                "llm_calls": state.get("llm_calls", 0) + 1,
+                "planning_blocked": True,
+                "planning_feedback": plan.warnings,
+                "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
+                "messages": [AIMessage(content=itinerary)],
+            }
+
         return {
             "itinerary": itinerary,
             "plan_json": plan_json,
@@ -601,10 +782,28 @@ def itinerary_agent(state: TravelState):
             "approval_request": "Review this structured plan. Approve it, or tell Trust Trip exactly what you want changed.",
             "messages": [AIMessage(content=itinerary)],
         }
+    except PlannerOutageError as exc:
+        print(f"ITINERARY PLANNER OUTAGE: {exc}", flush=True)
+        fallback_plan = exc.plan
+        if fallback_plan:
+            plan_json = fallback_plan.model_dump()
+            itinerary = plan_to_markdown(fallback_plan)
+        else:
+            plan_json = {"status": "unavailable", "planning_unavailable": True, "warnings": exc.errors}
+            itinerary = "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified evidence has been preserved."
+        return {
+            "itinerary": itinerary,
+            "plan_json": plan_json,
+            "llm_provider": "unavailable",
+            "llm_calls": state.get("llm_calls", 0) + 1,
+            "planning_blocked": True,
+            "planning_feedback": exc.errors,
+            "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
+            "messages": [AIMessage(content=itinerary)],
+        }
     except Exception as exc:
         print(f"ITINERARY PLANNER ERROR: {type(exc).__name__}: {exc}", flush=True)
-        # generate_travel_plan already has a deterministic fallback. This guard
-        # only protects the graph from an unexpected coding/serialization error.
+        # Re-raise unexpected coding/system faults
         raise RuntimeError(f"Travel plan generation failed unexpectedly: {exc}") from exc
 
 
@@ -687,6 +886,7 @@ ROUTE_MAP = {
     "flight_agent": "flight_agent",
     "hotel_agent": "hotel_agent",
     "weather_agent": "weather_agent",
+    "research_agent": "research_agent",
     "budget_agent": "budget_agent",
     "itinerary_agent": "itinerary_agent",
 }
@@ -731,6 +931,7 @@ graph.add_node("guardrail_blocked", guardrail_blocked_agent)
 graph.add_node("flight_agent", flight_agent)
 graph.add_node("hotel_agent", hotel_agent)
 graph.add_node("weather_agent", weather_agent)
+graph.add_node("research_agent", research_agent)
 graph.add_node("budget_agent", budget_agent)
 graph.add_node("itinerary_agent", itinerary_agent)
 graph.add_node("human_approval", human_approval_agent)
@@ -749,6 +950,9 @@ graph.add_conditional_edges(
     "weather_agent", route_after_agent("weather_agent"), ROUTE_MAP
 )
 graph.add_conditional_edges(
+    "research_agent", route_after_agent("research_agent"), ROUTE_MAP
+)
+graph.add_conditional_edges(
     "budget_agent", route_after_agent("budget_agent"), ROUTE_MAP
 )
 
@@ -756,7 +960,19 @@ def route_after_itinerary(state: TravelState) -> str:
     return "final_agent" if state.get("planning_blocked") else "human_approval"
 
 graph.add_conditional_edges("itinerary_agent", route_after_itinerary, {"human_approval": "human_approval", "final_agent": "final_agent"})
-graph.add_conditional_edges("human_approval", route_after_human, {"flight_agent": "flight_agent", "itinerary_agent": "itinerary_agent", "final_agent": "final_agent"})
+graph.add_conditional_edges(
+    "human_approval",
+    route_after_human,
+    {
+        "flight_agent": "flight_agent",
+        "hotel_agent": "hotel_agent",
+        "weather_agent": "weather_agent",
+        "research_agent": "research_agent",
+        "budget_agent": "budget_agent",
+        "itinerary_agent": "itinerary_agent",
+        "final_agent": "final_agent",
+    },
+)
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
@@ -845,6 +1061,11 @@ def _serialize_result(
         "duffel_mode": os.getenv("DUFFEL_MODE", "test").strip().lower(),
         "hotel_search_status": result.get("hotel_search_status", "ok"),
         "provider_replan_required": result.get("provider_replan_required", False),
+        "research_session_id": result.get("research_session_id"),
+        "research_query_id": result.get("research_query_id"),
+        "evidence_ids": result.get("evidence_ids", []),
+        "source_ids": result.get("source_ids", []),
+        "research_summary": result.get("research_summary", ""),
     }
 
 

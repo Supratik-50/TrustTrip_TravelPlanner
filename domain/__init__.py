@@ -19,7 +19,7 @@ from .hotel import HotelPreferences
 from .passenger import PassengerComposition
 from .plan_approval import PlanApproval
 from .plan_revision import PlanRevision
-from .research import TripIntent
+from .research import TripIntent, ResearchAdvisoryContext, ResearchAdvisoryProjection
 from .travel import TravelPreferences
 from .trip import Location, TripRequest, TripStatus
 
@@ -39,6 +39,8 @@ __all__ = [
     "PlanApproval",
     "PlanRevision",
     "PlanRevisionEvidenceLink",
+    "ResearchAdvisoryContext",
+    "ResearchAdvisoryProjection",
     "TravelPreferences",
     "TripChangeSet",
     "TripIntent",

@@ -17,6 +17,7 @@ from trips_api import router as trips_router
 from hotel_api import router as hotel_router
 from hotel_payment_api import router as hotel_payment_router
 from offers_api import router as offers_router
+from research_api import router as research_router
 from services.travel_plan_pdf import build_travel_plan_pdf
 from dependencies.auth import get_current_user
 from domain.user import UserResponse
@@ -59,6 +60,7 @@ app.include_router(trips_router)
 app.include_router(hotel_router)
 app.include_router(hotel_payment_router)
 app.include_router(offers_router)
+app.include_router(research_router)
 
 app.mount(
     "/static",
