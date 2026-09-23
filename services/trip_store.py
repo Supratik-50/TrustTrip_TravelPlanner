@@ -7,11 +7,89 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 import psycopg
 from psycopg.rows import dict_row
+
+from domain.live_offer import AvailabilityStatus, FreshnessStatus
+
+
+class TripStoreError(Exception):
+    """Base error for trip store operations."""
+    pass
+
+
+class RevisionContextError(TripStoreError):
+    """Raised when trip revision context is missing or cannot be resolved."""
+    pass
+
+
+class OfferSelectionError(TripStoreError):
+    """Raised when offer selection fails validation, ownership, freshness, or revision match."""
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def resolve_current_revision(trip: dict[str, Any], fail_on_divergence: bool = True) -> int | None:
+    """Explicitly resolve the authoritative trip revision, failing closed if unavailable or inconsistent.
+
+    Authoritative source is trip['current_revision_number'].
+    Metadata may mirror revision information ('trip_revision' or 'revision'),
+    but MUST NOT override the database revision pointer.
+    If metadata contains a revision mirror and it diverges from the authoritative
+    current_revision_number, fails closed with RevisionContextError.
+    Revision 0 is explicitly supported as a valid initial revision.
+    """
+    if not isinstance(trip, dict):
+        return None
+
+    db_rev_raw = trip.get("current_revision_number")
+    db_rev: int | None = int(db_rev_raw) if db_rev_raw is not None else None
+
+    meta = trip.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+
+    meta_rev: int | None = None
+    if isinstance(meta, dict):
+        if "trip_revision" in meta and meta["trip_revision"] is not None:
+            meta_rev = int(meta["trip_revision"])
+        elif "revision" in meta and meta["revision"] is not None:
+            meta_rev = int(meta["revision"])
+
+    if db_rev is not None:
+        if meta_rev is not None and meta_rev != db_rev:
+            if fail_on_divergence:
+                raise RevisionContextError(
+                    f"Revision context divergence: database revision {db_rev} "
+                    f"but metadata revision mirror is {meta_rev}."
+                )
+        return db_rev
+
+    if meta_rev is not None:
+        return meta_rev
+
+    return None
+
+
+_MEMORY_TRIP_LOCKS: dict[str, threading.Lock] = {}
+_MEMORY_GLOBAL_LOCK = threading.Lock()
+
+
+def _get_memory_trip_lock(trip_id: str) -> threading.Lock:
+    with _MEMORY_GLOBAL_LOCK:
+        if trip_id not in _MEMORY_TRIP_LOCKS:
+            _MEMORY_TRIP_LOCKS[trip_id] = threading.Lock()
+        return _MEMORY_TRIP_LOCKS[trip_id]
+
 
 _TRIP_SCHEMA_INITIALIZED = False
 
@@ -84,8 +162,8 @@ class TripStore:
         if not self.use_in_memory and os.getenv("DATABASE_URL"):
             init_trip_tables()
 
-    def _connect(self):
-        return psycopg.connect(_dsn(), row_factory=dict_row, autocommit=True)
+    def _connect(self, autocommit: bool = True):
+        return psycopg.connect(_dsn(), row_factory=dict_row, autocommit=autocommit)
 
     def create_trip(
         self,
@@ -95,12 +173,27 @@ class TripStore:
         origin: str = "",
         status: str = "planning",
         metadata: dict[str, Any] | None = None,
+        current_revision_number: int | None = None,
+        current_revision_id: str | uuid.UUID | None = None,
     ) -> dict[str, Any]:
         """Create a trip owned by the authenticated user."""
         trip_id = uuid.uuid4()
         uid_str = str(user_id)
         now = datetime.now(timezone.utc)
-        meta = metadata or {}
+        meta = dict(metadata or {})
+
+        rev_num = current_revision_number
+        if rev_num is None:
+            if "trip_revision" in meta and meta["trip_revision"] is not None:
+                rev_num = int(meta["trip_revision"])
+            elif "revision" in meta and meta["revision"] is not None:
+                rev_num = int(meta["revision"])
+            else:
+                rev_num = 0
+
+        # Keep metadata mirror in lockstep with authoritative column
+        meta["revision"] = rev_num
+        meta["trip_revision"] = rev_num
 
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             record = {
@@ -111,8 +204,8 @@ class TripStore:
                 "origin": origin,
                 "status": status,
                 "metadata": meta,
-                "current_revision_id": None,
-                "current_revision_number": 0,
+                "current_revision_id": str(current_revision_id) if current_revision_id else None,
+                "current_revision_number": rev_num,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -122,11 +215,11 @@ class TripStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                INSERT INTO trips (id, user_id, title, destination, origin, status, metadata, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                INSERT INTO trips (id, user_id, title, destination, origin, status, metadata, current_revision_number, current_revision_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (trip_id, uid_str, title, destination, origin, status, json.dumps(meta), now, now),
+                (trip_id, uid_str, title, destination, origin, status, json.dumps(meta), rev_num, str(current_revision_id) if current_revision_id else None, now, now),
             ).fetchone()
             return dict(row)
 
@@ -211,6 +304,18 @@ class TripStore:
         if not filtered:
             return self.get_trip(trip_id, user_id)
 
+        # Synchronize authoritative column with metadata mirror
+        if "current_revision_number" in filtered:
+            rev_num = int(filtered["current_revision_number"])
+            if "metadata" in filtered and isinstance(filtered["metadata"], dict):
+                filtered["metadata"]["revision"] = rev_num
+                filtered["metadata"]["trip_revision"] = rev_num
+        elif "metadata" in filtered and isinstance(filtered["metadata"], dict):
+            if "trip_revision" in filtered["metadata"] and filtered["metadata"]["trip_revision"] is not None:
+                filtered["current_revision_number"] = int(filtered["metadata"]["trip_revision"])
+            elif "revision" in filtered["metadata"] and filtered["metadata"]["revision"] is not None:
+                filtered["current_revision_number"] = int(filtered["metadata"]["revision"])
+
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             t = self._memory_trips.get(tid_str)
             if not t or str(t["user_id"]) != uid_str:
@@ -244,6 +349,432 @@ class TripStore:
                 vals,
             ).fetchone()
             return dict(row) if row else None
+
+    def select_offer_atomic(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        req: Any,
+        snap_store: Any,
+    ) -> dict[str, Any]:
+        """Atomically validate and bind an explicit flight or hotel offer to the trip.
+
+        Guarantees:
+        1. Universal row lock (SELECT ... FOR UPDATE) inside a single transaction.
+        2. Strict revision match (fails closed if revision context missing; no 0 bypass).
+        3. Single connection for all selection reads and metadata mutation.
+        4. Strict unexpired check (snapshot.expires_at <= now is expired; no bypass).
+        5. Synchronizes candidate departure and return dates into constraints & canonical TripRequest.
+        """
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        now = datetime.now(timezone.utc)
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with _get_memory_trip_lock(tid_str):
+                t = self._memory_trips.get(tid_str)
+                if not t or str(t["user_id"]) != uid_str:
+                    raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+                trip = dict(t)
+
+                current_revision = resolve_current_revision(trip)
+                if current_revision is None:
+                    raise RevisionContextError("Trip revision context unavailable")
+
+                snapshot = snap_store.get_snapshot(req.snapshot_id, user_id)
+                if not snapshot:
+                    raise OfferSelectionError(403, "Offer snapshot not found or does not belong to you.")
+
+                session = snap_store.get_session(snapshot.session_id, user_id)
+                if not session or str(session.trip_id) != tid_str:
+                    raise OfferSelectionError(400, "Offer snapshot does not belong to the requested trip.")
+
+                if session.trip_revision != current_revision:
+                    raise OfferSelectionError(
+                        400,
+                        f"Offer snapshot was generated for outdated trip revision {session.trip_revision} (current trip revision is {current_revision}).",
+                    )
+
+                if snapshot.offer_type != req.offer_type:
+                    raise OfferSelectionError(400, f"Snapshot is a {snapshot.offer_type} offer, not a {req.offer_type} offer.")
+
+                if snapshot.availability != AvailabilityStatus.AVAILABLE:
+                    raise OfferSelectionError(409, "Selected offer is no longer available.")
+                if snapshot.freshness != FreshnessStatus.FRESH:
+                    raise OfferSelectionError(409, "Selected offer snapshot is stale.")
+                if snapshot.expires_at and snapshot.expires_at <= now:
+                    raise OfferSelectionError(409, "Selected offer has expired.")
+
+                norm_offer = snapshot.normalized_offer
+                if hasattr(norm_offer, "availability") and norm_offer.availability != AvailabilityStatus.AVAILABLE:
+                    raise OfferSelectionError(409, "Selected offer is no longer available.")
+                if hasattr(norm_offer, "freshness") and norm_offer.freshness != FreshnessStatus.FRESH:
+                    raise OfferSelectionError(409, "Selected offer snapshot is stale.")
+                if hasattr(norm_offer, "expires_at") and norm_offer.expires_at and norm_offer.expires_at <= now:
+                    raise OfferSelectionError(409, "Selected offer has expired.")
+
+                meta = trip.get("metadata") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                meta = dict(meta)
+
+                key = f"selected_{req.offer_type}_snapshot_id"
+                meta[key] = str(req.snapshot_id)
+
+                if req.offer_type == "flight":
+                    dep_date = None
+                    ret_date = None
+                    if hasattr(norm_offer, "candidate_departure_date") and norm_offer.candidate_departure_date:
+                        dep_date = norm_offer.candidate_departure_date.isoformat()
+                    elif getattr(norm_offer, "segments", None):
+                        dep_date = norm_offer.segments[0].departure_time.date().isoformat()
+
+                    if hasattr(norm_offer, "candidate_return_date") and norm_offer.candidate_return_date:
+                        ret_date = norm_offer.candidate_return_date.isoformat()
+                    elif getattr(norm_offer, "segments", None) and len(norm_offer.segments) > 1:
+                        first_orig = norm_offer.segments[0].origin_iata
+                        for seg in norm_offer.segments[1:]:
+                            if seg.destination_iata == first_orig:
+                                ret_date = seg.departure_time.date().isoformat()
+                                break
+
+                    constraints = meta.get("constraints") or {}
+                    if dep_date:
+                        constraints["departure_date"] = dep_date
+                        constraints["checkin_date"] = dep_date
+                    if ret_date:
+                        constraints["return_date"] = ret_date
+                        constraints["checkout_date"] = ret_date
+                    meta["constraints"] = constraints
+
+                    canonical_tr_dict = meta.get("canonical_trip_request")
+                    if canonical_tr_dict and isinstance(canonical_tr_dict, dict):
+                        slices = canonical_tr_dict.get("slices") or []
+                        if slices and dep_date:
+                            slices[0]["departure_date"] = dep_date
+                        if len(slices) > 1 and ret_date:
+                            slices[1]["departure_date"] = ret_date
+                        canonical_tr_dict["slices"] = slices
+                        meta["canonical_trip_request"] = canonical_tr_dict
+
+                t["metadata"] = meta
+                t["updated_at"] = now
+                return dict(t)
+
+        with self._connect(autocommit=False) as conn:
+            with conn.transaction():
+                # 1. Acquire parent trip row lock
+                row = conn.execute(
+                    "SELECT * FROM trips WHERE id = %s AND user_id = %s FOR UPDATE",
+                    (tid_str, uid_str),
+                ).fetchone()
+                if not row:
+                    raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+                trip = dict(row)
+
+                # 2. Strict revision resolution
+                current_revision = resolve_current_revision(trip)
+                if current_revision is None:
+                    raise RevisionContextError("Trip revision context unavailable")
+
+                # 3. Read snapshot using the SAME locked connection
+                snapshot = snap_store.get_snapshot(req.snapshot_id, user_id, conn=conn)
+                if not snapshot:
+                    raise OfferSelectionError(403, "Offer snapshot not found or does not belong to you.")
+
+                # 4. Read session using the SAME locked connection
+                session = snap_store.get_session(snapshot.session_id, user_id, conn=conn)
+                if not session or str(session.trip_id) != tid_str:
+                    raise OfferSelectionError(400, "Offer snapshot does not belong to the requested trip.")
+
+                # 5. Strict revision match (fail closed)
+                if session.trip_revision != current_revision:
+                    raise OfferSelectionError(
+                        400,
+                        f"Offer snapshot was generated for outdated trip revision {session.trip_revision} (current trip revision is {current_revision}).",
+                    )
+
+                if snapshot.offer_type != req.offer_type:
+                    raise OfferSelectionError(400, f"Snapshot is a {snapshot.offer_type} offer, not a {req.offer_type} offer.")
+
+                if snapshot.availability != AvailabilityStatus.AVAILABLE:
+                    raise OfferSelectionError(409, "Selected offer is no longer available.")
+                if snapshot.freshness != FreshnessStatus.FRESH:
+                    raise OfferSelectionError(409, "Selected offer snapshot is stale.")
+                if snapshot.expires_at and snapshot.expires_at <= now:
+                    raise OfferSelectionError(409, "Selected offer has expired.")
+
+                norm_offer = snapshot.normalized_offer
+                if hasattr(norm_offer, "availability") and norm_offer.availability != AvailabilityStatus.AVAILABLE:
+                    raise OfferSelectionError(409, "Selected offer is no longer available.")
+                if hasattr(norm_offer, "freshness") and norm_offer.freshness != FreshnessStatus.FRESH:
+                    raise OfferSelectionError(409, "Selected offer snapshot is stale.")
+                if hasattr(norm_offer, "expires_at") and norm_offer.expires_at and norm_offer.expires_at <= now:
+                    raise OfferSelectionError(409, "Selected offer has expired.")
+
+                meta = trip.get("metadata") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                meta = dict(meta)
+
+                key = f"selected_{req.offer_type}_snapshot_id"
+                meta[key] = str(req.snapshot_id)
+
+                if req.offer_type == "flight":
+                    dep_date = None
+                    ret_date = None
+                    if hasattr(norm_offer, "candidate_departure_date") and norm_offer.candidate_departure_date:
+                        dep_date = norm_offer.candidate_departure_date.isoformat()
+                    elif getattr(norm_offer, "segments", None):
+                        dep_date = norm_offer.segments[0].departure_time.date().isoformat()
+
+                    if hasattr(norm_offer, "candidate_return_date") and norm_offer.candidate_return_date:
+                        ret_date = norm_offer.candidate_return_date.isoformat()
+                    elif getattr(norm_offer, "segments", None) and len(norm_offer.segments) > 1:
+                        first_orig = norm_offer.segments[0].origin_iata
+                        for seg in norm_offer.segments[1:]:
+                            if seg.destination_iata == first_orig:
+                                ret_date = seg.departure_time.date().isoformat()
+                                break
+
+                    constraints = meta.get("constraints") or {}
+                    if dep_date:
+                        constraints["departure_date"] = dep_date
+                        constraints["checkin_date"] = dep_date
+                    if ret_date:
+                        constraints["return_date"] = ret_date
+                        constraints["checkout_date"] = ret_date
+                    meta["constraints"] = constraints
+
+                    canonical_tr_dict = meta.get("canonical_trip_request")
+                    if canonical_tr_dict and isinstance(canonical_tr_dict, dict):
+                        slices = canonical_tr_dict.get("slices") or []
+                        if slices and dep_date:
+                            slices[0]["departure_date"] = dep_date
+                        if len(slices) > 1 and ret_date:
+                            slices[1]["departure_date"] = ret_date
+                        canonical_tr_dict["slices"] = slices
+                        meta["canonical_trip_request"] = canonical_tr_dict
+
+                # 6. Update trip inside the SAME transaction
+                updated_row = conn.execute(
+                    """
+                    UPDATE trips
+                    SET metadata = %s::jsonb, updated_at = %s
+                    WHERE id = %s AND user_id = %s
+                    RETURNING *
+                    """,
+                    (json.dumps(meta), now, tid_str, uid_str),
+                ).fetchone()
+                return dict(updated_row)
+
+    def create_revision_atomic(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        feedback: str = "",
+        updated_constraints: dict[str, Any] | None = None,
+        expected_base_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically advance trip plan revision under parent trip row lock in a single transaction.
+
+        Guarantees:
+        1. Universal parent trip row lock (SELECT ... FOR UPDATE) inside a single transaction.
+        2. Derives changeset and replanning decisions from the LOCKED current constraints/metadata.
+        3. Advances revision pointer, records PlanRevision, and persists updated metadata in the SAME transaction.
+        4. Zero possibility of overwriting concurrent offer selections or metadata updates.
+        """
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        constraints_update = updated_constraints or {}
+        now = datetime.now(timezone.utc)
+
+        from domain.change_set import compute_change_set, calculate_replanning_plan
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with _get_memory_trip_lock(tid_str):
+                t = self._memory_trips.get(tid_str)
+                if not t or str(t.get("user_id")) != uid_str:
+                    raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+                trip_row = dict(t)
+                authoritative_rev = int(trip_row.get("current_revision_number") or 0)
+                if expected_base_revision is not None and authoritative_rev != expected_base_revision:
+                    raise OfferSelectionError(
+                        409,
+                        f"Conflict: Expected base revision {expected_base_revision} but current is {authoritative_rev}.",
+                    )
+
+                meta = dict(trip_row.get("metadata") or {})
+                locked_constraints = dict(meta.get("constraints") or {})
+
+                change_set = compute_change_set(locked_constraints, constraints_update, feedback)
+                plan = calculate_replanning_plan(change_set)
+
+                new_revision_number = authoritative_rev + 1
+                new_constraints = {**locked_constraints, **constraints_update}
+                meta["revision"] = new_revision_number
+                meta["trip_revision"] = new_revision_number
+                meta["constraints"] = new_constraints
+                meta["last_feedback"] = feedback
+
+                if plan.requires_flight_search:
+                    meta.pop("selected_flight_snapshot_id", None)
+                if plan.requires_hotel_search:
+                    meta.pop("selected_hotel_snapshot_id", None)
+
+                new_rev_id = uuid.uuid4()
+                plan_snapshot = {
+                    "title": trip_row.get("title") or "",
+                    "destination": trip_row.get("destination") or "",
+                    "origin": trip_row.get("origin") or "",
+                    "constraints": new_constraints,
+                    "metadata": meta,
+                }
+
+                from domain.plan_revision import PlanRevision
+                from services.evidence_store import EvidenceRevisionStore
+                ev_store = EvidenceRevisionStore()
+                rev = PlanRevision(
+                    revision_id=new_rev_id,
+                    trip_id=uuid.UUID(tid_str),
+                    user_id=uuid.UUID(uid_str),
+                    revision_number=new_revision_number,
+                    change_set=change_set.model_dump(),
+                    plan_snapshot=plan_snapshot,
+                    is_published=True,
+                    published_at=now,
+                    created_at=now,
+                )
+                ev_store._IN_MEMORY_REVISIONS[str(new_rev_id)] = rev
+
+                t["current_revision_id"] = str(new_rev_id)
+                t["current_revision_number"] = new_revision_number
+                t["status"] = "awaiting_approval"
+                t["metadata"] = meta
+                t["updated_at"] = now
+
+                return {
+                    "success": True,
+                    "trip_id": tid_str,
+                    "revision": new_revision_number,
+                    "revision_id": str(new_rev_id),
+                    "status": "awaiting_approval",
+                    "change_set": change_set.model_dump(),
+                    "affected_agents": plan.affected_agents,
+                    "trip": dict(t),
+                }
+
+        with self._connect() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT id, user_id, title, destination, origin, status, current_revision_id, current_revision_number, metadata
+                    FROM trips
+                    WHERE id = %s AND user_id = %s
+                    FOR UPDATE
+                    """,
+                    (tid_str, uid_str),
+                ).fetchone()
+
+                if not row:
+                    raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+
+                trip_row = dict(row)
+                authoritative_rev = int(trip_row.get("current_revision_number") or 0)
+
+                if expected_base_revision is not None and authoritative_rev != expected_base_revision:
+                    raise OfferSelectionError(
+                        409,
+                        f"Conflict: Expected base revision {expected_base_revision} but current is {authoritative_rev}.",
+                    )
+
+                meta = trip_row.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                meta = dict(meta)
+
+                locked_constraints = meta.get("constraints") or {}
+                if isinstance(locked_constraints, str):
+                    try:
+                        locked_constraints = json.loads(locked_constraints)
+                    except Exception:
+                        locked_constraints = {}
+                locked_constraints = dict(locked_constraints)
+
+                change_set = compute_change_set(locked_constraints, constraints_update, feedback)
+                plan = calculate_replanning_plan(change_set)
+
+                new_revision_number = authoritative_rev + 1
+                new_constraints = {**locked_constraints, **constraints_update}
+                meta["revision"] = new_revision_number
+                meta["trip_revision"] = new_revision_number
+                meta["constraints"] = new_constraints
+                meta["last_feedback"] = feedback
+
+                if plan.requires_flight_search:
+                    meta.pop("selected_flight_snapshot_id", None)
+                if plan.requires_hotel_search:
+                    meta.pop("selected_hotel_snapshot_id", None)
+
+                new_rev_id = uuid.uuid4()
+                plan_snapshot = {
+                    "title": trip_row.get("title") or "",
+                    "destination": trip_row.get("destination") or "",
+                    "origin": trip_row.get("origin") or "",
+                    "constraints": new_constraints,
+                    "metadata": meta,
+                }
+
+                conn.execute(
+                    """
+                    INSERT INTO plan_revisions (
+                        revision_id, trip_id, user_id, revision_number,
+                        change_set, plan_snapshot, is_published, published_at, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s::jsonb, %s::jsonb, TRUE, %s, %s
+                    )
+                    """,
+                    (
+                        str(new_rev_id),
+                        tid_str,
+                        uid_str,
+                        new_revision_number,
+                        json.dumps(change_set.model_dump()),
+                        json.dumps(plan_snapshot),
+                        now,
+                        now,
+                    ),
+                )
+
+                updated_row = conn.execute(
+                    """
+                    UPDATE trips
+                    SET current_revision_id = %s,
+                        current_revision_number = %s,
+                        status = 'awaiting_approval',
+                        metadata = %s::jsonb,
+                        updated_at = %s
+                    WHERE id = %s AND user_id = %s
+                    RETURNING *
+                    """,
+                    (str(new_rev_id), new_revision_number, json.dumps(meta), now, tid_str, uid_str),
+                ).fetchone()
+
+                updated_trip = dict(updated_row) if updated_row else trip_row
+                return {
+                    "success": True,
+                    "trip_id": tid_str,
+                    "revision": new_revision_number,
+                    "revision_id": str(new_rev_id),
+                    "status": "awaiting_approval",
+                    "change_set": change_set.model_dump(),
+                    "affected_agents": plan.affected_agents,
+                    "trip": updated_trip,
+                }
 
 
     def create_thread(

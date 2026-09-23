@@ -6,12 +6,15 @@ Endpoints require get_current_user dependency; tenant enumeration is blocked.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from fastapi.responses import Response
+
+logger = logging.getLogger(__name__)
 
 from dependencies.auth import get_current_user
 from domain.user import UserResponse
@@ -23,10 +26,16 @@ from services.razorpay_service import RazorpayService, RazorpayError
 from services.ticket_service import build_booking_pdf
 from services.hotel_booking_pdf import build_hotel_booking_pdf
 from services.hotel_transaction_store import HotelTransactionStore
-from services.trip_store import TripStore
+from services.trip_store import (
+    TripStore,
+    OfferSelectionError,
+    RevisionContextError,
+    resolve_current_revision,
+)
 from services.search_session_store import SearchSessionStore
 from services.evidence_store import EvidenceRevisionStore
 from domain.evidence import UsageState
+from domain.live_offer import AvailabilityStatus, FreshnessStatus
 
 router = APIRouter(prefix="/api/trips", tags=["trips"])
 
@@ -445,33 +454,33 @@ async def select_trip_offer(
 ):
     """Bind an explicit flight or hotel offer to the trip.
 
-    Validates tenant ownership of both trip and snapshot.
+    Validates tenant ownership of both trip and snapshot atomically under parent trip row lock.
     Does NOT increment trip revision and does NOT invalidate other plan evidence.
     """
-    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
-    if not trip:
-        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
-
     snap_store = SearchSessionStore()
-    snapshot = snap_store.get_snapshot(req.snapshot_id, current_user.id)
-    if not snapshot:
-        raise HTTPException(status_code=403, detail="Offer snapshot not found or does not belong to you.")
-
-    if snapshot.offer_type != req.offer_type:
-        raise HTTPException(status_code=400, detail=f"Snapshot is a {snapshot.offer_type} offer, not a {req.offer_type} offer.")
-
-    meta = trip.get("metadata") or {}
-    key = f"selected_{req.offer_type}_snapshot_id"
-    meta[key] = str(req.snapshot_id)
-    updated_trip = trip_store.update_trip(trip_id, current_user.id, metadata=meta)
-
-    return {
-        "success": True,
-        "trip_id": trip_id,
-        "offer_type": req.offer_type,
-        "snapshot_id": str(req.snapshot_id),
-        "trip": updated_trip,
-    }
+    try:
+        updated_trip = trip_store.select_offer_atomic(
+            trip_id=trip_id,
+            user_id=current_user.id,
+            req=req,
+            snap_store=snap_store,
+        )
+        return {
+            "success": True,
+            "trip_id": trip_id,
+            "offer_type": req.offer_type,
+            "snapshot_id": str(req.snapshot_id),
+            "trip": updated_trip,
+        }
+    except OfferSelectionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except RevisionContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Atomic offer selection failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Offer selection failed due to an internal error.")
 
 
 @router.post("/{trip_id}/revisions")
@@ -481,71 +490,27 @@ async def create_trip_revision(
     current_user: UserResponse = Depends(get_current_user),
     trip_store: TripStore = Depends(_trip_store),
 ):
-    """Submit human feedback causing a TripChangeSet, advancing revision, and updating status to awaiting_approval."""
-    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
-    if not trip:
-        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+    """Submit human feedback causing a TripChangeSet, advancing revision, and updating status to awaiting_approval.
 
-    meta = trip.get("metadata") or {}
-    current_constraints = meta.get("constraints") or {}
-    current_revision = int(trip.get("current_revision_number") or meta.get("revision", 0))
-
-    if req.expected_base_revision is not None and current_revision != req.expected_base_revision:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Conflict: Expected base revision {req.expected_base_revision} but current is {current_revision}.",
+    Executed atomically under parent trip row lock inside a single transaction.
+    """
+    try:
+        return trip_store.create_revision_atomic(
+            trip_id=trip_id,
+            user_id=current_user.id,
+            feedback=req.feedback,
+            updated_constraints=req.updated_constraints,
+            expected_base_revision=req.expected_base_revision,
         )
-
-    change_set = compute_change_set(current_constraints, req.updated_constraints, req.feedback)
-    plan = calculate_replanning_plan(change_set)
-
-    new_revision = current_revision + 1
-    new_constraints = {**current_constraints, **req.updated_constraints}
-    meta["revision"] = new_revision
-    meta["constraints"] = new_constraints
-    meta["last_feedback"] = req.feedback
-
-    # Clear stale offer selections when dependency replanning requires fresh search
-    if plan.requires_flight_search:
-        meta.pop("selected_flight_snapshot_id", None)
-    if plan.requires_hotel_search:
-        meta.pop("selected_hotel_snapshot_id", None)
-
-    # Publish revision via EvidenceRevisionStore under parent trip lock
-    ev_store = EvidenceRevisionStore()
-    plan_snapshot = {
-        "title": trip.get("title"),
-        "destination": trip.get("destination"),
-        "origin": trip.get("origin"),
-        "constraints": new_constraints,
-        "metadata": meta,
-    }
-
-    published_rev = ev_store.publish_revision_transaction(
-        trip_id=trip_id,
-        user_id=current_user.id,
-        expected_base_revision=req.expected_base_revision,
-        change_set=change_set.model_dump(),
-        plan_snapshot=plan_snapshot,
-    )
-
-    # Sync metadata and fetch updated trip
-    updated_trip = trip_store.update_trip(
-        trip_id,
-        current_user.id,
-        metadata=meta,
-    )
-
-    return {
-        "success": True,
-        "trip_id": trip_id,
-        "revision": new_revision,
-        "revision_id": str(published_rev.revision_id),
-        "status": "awaiting_approval",
-        "change_set": change_set.model_dump(),
-        "affected_agents": plan.affected_agents,
-        "trip": updated_trip,
-    }
+    except OfferSelectionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except RevisionContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Atomic trip revision creation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trip revision failed due to an internal error.")
 
 
 @router.post("/{trip_id}/approve")

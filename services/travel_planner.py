@@ -603,20 +603,104 @@ def parse_trip_request(
 
 
 def candidate_dates(constraints: dict[str, Any], limit: int = 3) -> list[tuple[str, str | None]]:
+    """Generate deterministic, deduplicated, past-pruned candidate travel date windows.
+
+    Supports exact date, plus_minus_days (+/- 1 to 3), date_range, and near_term_fallback.
+    Strictly caps candidate pairs to at most 7 (and <= limit).
+    """
+    max_cap = min(limit, 7) if limit is not None else 7
+    if max_cap < 1:
+        return []
+
+    mode = str(constraints.get("flexibility_mode") or "").strip().lower()
+    flex_days = int(constraints.get("flexibility_days", 0) or 0)
     start = constraints.get("departure_date")
     duration = int(constraints.get("duration_days") or 5)
-    if start:
-        d = date.fromisoformat(start)
-        explicit_return = constraints.get("return_date")
-        return [(d.isoformat(), explicit_return or (d + timedelta(days=max(1, duration - 1))).isoformat())]
+    today = date.today()
 
-    # No date supplied: search a few near-term windows instead of inventing one.
-    today = date.today() + timedelta(days=2)
-    return [
-        ((today + timedelta(days=i * 3)).isoformat(),
-         (today + timedelta(days=i * 3 + duration)).isoformat())
-        for i in range(limit)
-    ]
+    candidates: list[tuple[str, str | None]] = []
+
+    # 1. Date Range Mode
+    if mode == "date_range" or (constraints.get("earliest_departure") and constraints.get("latest_departure")):
+        earliest_raw = constraints.get("earliest_departure")
+        latest_raw = constraints.get("latest_departure")
+        try:
+            earliest = date.fromisoformat(str(earliest_raw)[:10]) if earliest_raw else today
+            latest = date.fromisoformat(str(latest_raw)[:10]) if latest_raw else today
+        except Exception:
+            earliest, latest = today, today
+
+        if earliest > latest:
+            earliest, latest = latest, earliest
+
+        curr = earliest
+        while curr <= latest and len(candidates) < max_cap:
+            if curr >= today:
+                ret = (curr + timedelta(days=max(1, duration - 1))).isoformat()
+                candidates.append((curr.isoformat(), ret))
+            curr += timedelta(days=1)
+
+    # 2. Plus/Minus Days Mode
+    elif (mode == "plus_minus_days" or flex_days > 0) and start:
+        try:
+            base_dep = date.fromisoformat(str(start)[:10])
+        except Exception:
+            base_dep = today + timedelta(days=2)
+
+        span = max(1, min(3, flex_days if flex_days > 0 else 1))
+        explicit_ret_str = constraints.get("return_date")
+        explicit_ret: date | None = None
+        if explicit_ret_str:
+            try:
+                explicit_ret = date.fromisoformat(str(explicit_ret_str)[:10])
+            except Exception:
+                explicit_ret = None
+
+        for offset in range(-span, span + 1):
+            dep = base_dep + timedelta(days=offset)
+            if dep < today:
+                continue
+            if explicit_ret:
+                ret = explicit_ret + timedelta(days=offset)
+                if ret < dep:
+                    ret = dep + timedelta(days=max(1, duration - 1))
+                ret_str: str | None = ret.isoformat()
+            else:
+                ret_str = (dep + timedelta(days=max(1, duration - 1))).isoformat()
+            candidates.append((dep.isoformat(), ret_str))
+
+    # 3. Exact Date Mode (explicit date without flexibility)
+    elif start and mode != "near_term_fallback":
+        try:
+            d = date.fromisoformat(str(start)[:10])
+        except Exception:
+            d = None
+        if d and d >= today:
+            explicit_return = constraints.get("return_date")
+            candidates.append((d.isoformat(), explicit_return or (d + timedelta(days=max(1, duration - 1))).isoformat()))
+        # Exact date mode must never silently fall into near-term fallback when date is in the past
+        return candidates
+
+    # 4. Near-Term Fallback Mode (explicitly requested or no date was supplied at all)
+    elif mode == "near_term_fallback" or (not start and not constraints.get("earliest_departure")):
+        base_fallback = today + timedelta(days=2)
+        for i in range(max_cap):
+            dep = base_fallback + timedelta(days=i * 3)
+            ret = dep + timedelta(days=duration)
+            candidates.append((dep.isoformat(), ret.isoformat()))
+
+    # Deduplicate preserving order and cap to max_cap
+    seen = set()
+    deduped: list[tuple[str, str | None]] = []
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+        if len(deduped) >= max_cap:
+            break
+
+    return deduped
+
 
 
 def _provider_text(value: Any) -> str:

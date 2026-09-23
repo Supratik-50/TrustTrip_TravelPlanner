@@ -5,10 +5,14 @@ encryption for raw supplier payloads.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
+import hashlib
 import json
 import os
 import secrets
+import struct
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -131,12 +135,20 @@ def validate_travel_intelligence_schema() -> None:
                 )
 
 
+def _criteria_lock_id(user_id: Any, trip_id: Any, criteria_hash: str) -> int:
+    """Compute a signed 64-bit integer for PostgreSQL advisory locking."""
+    raw = f"{user_id}:{trip_id}:{criteria_hash}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    return struct.unpack(">q", digest[:8])[0]
+
+
 class SearchSessionStore:
     """Thread-safe, tenant-isolated repository for search sessions and immutable offer snapshots."""
 
     _IN_MEMORY_SESSIONS: dict[str, dict[str, Any]] = {}
     _IN_MEMORY_SNAPSHOTS: dict[str, dict[str, Any]] = {}
     _IN_MEMORY_REVALIDATIONS: dict[str, dict[str, Any]] = {}
+    _IN_MEMORY_SEARCH_LOCKS: dict[str, asyncio.Lock] = {}
 
     def __init__(self) -> None:
         self.use_in_memory = os.getenv("USE_IN_MEMORY_AUTH", "").lower() in {"1", "true", "yes"}
@@ -150,13 +162,50 @@ class SearchSessionStore:
     def _connect(self):
         return psycopg.connect(_dsn(), row_factory=dict_row, autocommit=True)
 
+    @contextlib.asynccontextmanager
+    async def search_lock(
+        self,
+        user_id: UUID | str,
+        trip_id: UUID | str,
+        criteria_hash: str,
+    ):
+        """Cross-worker / cross-process lock on (user_id, trip_id, criteria_hash).
+
+        In PostgreSQL mode, acquires a session-level advisory lock using pg_advisory_lock
+        on a dedicated connection. In in-memory mode, uses a keyed asyncio.Lock.
+        """
+        lock_key = f"{user_id}:{trip_id}:{criteria_hash}"
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            if lock_key not in self._IN_MEMORY_SEARCH_LOCKS:
+                self._IN_MEMORY_SEARCH_LOCKS[lock_key] = asyncio.Lock()
+            async with self._IN_MEMORY_SEARCH_LOCKS[lock_key]:
+                yield
+            return
+
+        lock_id = _criteria_lock_id(user_id, trip_id, criteria_hash)
+        conn = await asyncio.to_thread(psycopg.connect, _dsn(), autocommit=True)
+        try:
+            await asyncio.to_thread(conn.execute, "SELECT pg_advisory_lock(%s)", (lock_id,))
+            yield
+        finally:
+            try:
+                await asyncio.to_thread(conn.execute, "SELECT pg_advisory_unlock(%s)", (lock_id,))
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(conn.close)
+            except Exception:
+                pass
+
+
     def get_active_session_by_hash(
         self,
         user_id: UUID | str,
         trip_id: UUID | str,
         criteria_hash: str,
+        trip_revision: int | None = None,
     ) -> SearchSession | None:
-        """Find an active, non-expired search session for the given user, trip, and query hash."""
+        """Find an active, non-expired search session for the given user, trip, criteria hash, and revision."""
         uid_str = str(user_id)
         tid_str = str(trip_id)
         now = datetime.now(timezone.utc)
@@ -169,23 +218,61 @@ class SearchSessionStore:
                     and s["criteria_hash"] == criteria_hash
                     and s["status"] == "active"
                     and s["session_reuse_expires_at"] > now
+                    and (trip_revision is None or s.get("trip_revision", 0) == trip_revision)
                 ):
                     return SearchSession.model_validate(s)
             return None
 
         with self._connect() as conn:
-            row = conn.execute(
-                """
+            query = """
                 SELECT id AS session_id, user_id, trip_id, thread_id, trip_revision,
                        search_type, criteria_hash, status, created_at, session_reuse_expires_at
                 FROM search_sessions
                 WHERE user_id = %s AND trip_id = %s AND criteria_hash = %s
                   AND status = 'active' AND session_reuse_expires_at > %s
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (uid_str, tid_str, criteria_hash, now),
-            ).fetchone()
+            """
+            params: list[Any] = [uid_str, tid_str, criteria_hash, now]
+            if trip_revision is not None:
+                query += " AND trip_revision = %s"
+                params.append(trip_revision)
+            query += " ORDER BY created_at DESC LIMIT 1"
+
+            row = conn.execute(query, params).fetchone()
+            return SearchSession.model_validate(dict(row)) if row else None
+
+    def get_session(
+        self,
+        session_id: UUID | str,
+        user_id: UUID | str | None = None,
+        conn: psycopg.Connection | None = None,
+    ) -> SearchSession | None:
+        """Fetch search session, optionally verifying tenant ownership."""
+        sid_str = str(session_id)
+        if self.use_in_memory:
+            s = self._IN_MEMORY_SESSIONS.get(sid_str)
+            if not s:
+                return None
+            if user_id and str(s["user_id"]) != str(user_id):
+                return None
+            return SearchSession.model_validate(s)
+
+        query = """
+            SELECT id AS session_id, user_id, trip_id, thread_id, trip_revision,
+                   search_type, criteria_hash, status, created_at, session_reuse_expires_at
+            FROM search_sessions
+            WHERE id = %s
+        """
+        params: list[Any] = [sid_str]
+        if user_id:
+            query += " AND user_id = %s"
+            params.append(str(user_id))
+
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
+            return SearchSession.model_validate(dict(row)) if row else None
+
+        with self._connect() as local_conn:
+            row = local_conn.execute(query, params).fetchone()
             return SearchSession.model_validate(dict(row)) if row else None
 
     def create_session(
@@ -315,6 +402,7 @@ class SearchSessionStore:
         self,
         snapshot_id: UUID | str,
         user_id: UUID | str,
+        conn: psycopg.Connection | None = None,
     ) -> OfferSnapshot | None:
         """Fetch snapshot enforcing that it belongs to the authenticated user via its session."""
         sid_str = str(snapshot_id)
@@ -330,19 +418,19 @@ class SearchSessionStore:
             clean_record = {k: v for k, v in record.items() if k != "raw_payload_encrypted"}
             return OfferSnapshot.model_validate(clean_record)
 
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT s.id AS snapshot_id, s.session_id, s.provider, s.provider_offer_id,
-                       s.offer_type, s.price_total, s.currency, s.normalized_offer,
-                       s.freshness, s.availability, s.retrieved_at, s.expires_at,
-                       s.predecessor_snapshot_id
-                FROM offer_snapshots s
-                JOIN search_sessions ss ON s.session_id = ss.id
-                WHERE s.id = %s AND ss.user_id = %s
-                """,
-                (sid_str, uid_str),
-            ).fetchone()
+        query = """
+            SELECT s.id AS snapshot_id, s.session_id, s.provider, s.provider_offer_id,
+                   s.offer_type, s.price_total, s.currency, s.normalized_offer,
+                   s.freshness, s.availability, s.retrieved_at, s.expires_at,
+                   s.predecessor_snapshot_id
+            FROM offer_snapshots s
+            JOIN search_sessions ss ON s.session_id = ss.id
+            WHERE s.id = %s AND ss.user_id = %s
+        """
+        params = (sid_str, uid_str)
+
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
             if not row:
                 return None
             data = dict(row)
@@ -352,6 +440,62 @@ class SearchSessionStore:
             else:
                 data["normalized_offer"] = HotelOffer.model_validate(offer_dict)
             return OfferSnapshot.model_validate(data)
+
+        with self._connect() as local_conn:
+            row = local_conn.execute(query, params).fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            offer_dict = data["normalized_offer"]
+            if data["offer_type"] == "flight":
+                data["normalized_offer"] = FlightOffer.model_validate(offer_dict)
+            else:
+                data["normalized_offer"] = HotelOffer.model_validate(offer_dict)
+            return OfferSnapshot.model_validate(data)
+
+    def get_snapshots_for_session(
+        self,
+        session_id: UUID | str,
+        user_id: UUID | str,
+    ) -> list[OfferSnapshot]:
+        """Fetch all snapshots for a given session, enforcing tenant ownership."""
+        sid_str = str(session_id)
+        uid_str = str(user_id)
+
+        if self.use_in_memory:
+            results = []
+            for record in self._IN_MEMORY_SNAPSHOTS.values():
+                if str(record["session_id"]) == sid_str:
+                    session = self._IN_MEMORY_SESSIONS.get(sid_str)
+                    if session and str(session["user_id"]) == uid_str:
+                        clean_record = {k: v for k, v in record.items() if k != "raw_payload_encrypted"}
+                        results.append(OfferSnapshot.model_validate(clean_record))
+            return results
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.id AS snapshot_id, s.session_id, s.provider, s.provider_offer_id,
+                       s.offer_type, s.price_total, s.currency, s.normalized_offer,
+                       s.freshness, s.availability, s.retrieved_at, s.expires_at,
+                       s.predecessor_snapshot_id
+                FROM offer_snapshots s
+                JOIN search_sessions ss ON s.session_id = ss.id
+                WHERE s.session_id = %s AND ss.user_id = %s
+                ORDER BY s.retrieved_at ASC
+                """,
+                (sid_str, uid_str),
+            ).fetchall()
+            results = []
+            for row in rows:
+                data = dict(row)
+                offer_dict = data["normalized_offer"]
+                if data["offer_type"] == "flight":
+                    data["normalized_offer"] = FlightOffer.model_validate(offer_dict)
+                else:
+                    data["normalized_offer"] = HotelOffer.model_validate(offer_dict)
+                results.append(OfferSnapshot.model_validate(data))
+            return results
 
     def get_raw_payload(
         self,

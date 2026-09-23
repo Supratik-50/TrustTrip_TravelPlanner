@@ -3,19 +3,35 @@
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'freshness_status_enum') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_type
+        WHERE typname = 'freshness_status_enum'
+          AND typnamespace = to_regnamespace(current_schema())
+    ) THEN
         CREATE TYPE freshness_status_enum AS ENUM ('fresh', 'stale', 'expired');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'availability_status_enum') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_type
+        WHERE typname = 'availability_status_enum'
+          AND typnamespace = to_regnamespace(current_schema())
+    ) THEN
         CREATE TYPE availability_status_enum AS ENUM ('available', 'limited_inventory', 'sold_out', 'unavailable');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'revalidation_status_enum') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_type
+        WHERE typname = 'revalidation_status_enum'
+          AND typnamespace = to_regnamespace(current_schema())
+    ) THEN
         CREATE TYPE revalidation_status_enum AS ENUM ('pending', 'confirmed_unchanged', 'price_changed', 'schedule_changed', 'offer_withdrawn');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'offer_type_enum') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_type
+        WHERE typname = 'offer_type_enum'
+          AND typnamespace = to_regnamespace(current_schema())
+    ) THEN
         CREATE TYPE offer_type_enum AS ENUM ('flight', 'hotel');
     END IF;
 END$$;

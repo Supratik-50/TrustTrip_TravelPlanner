@@ -1,9 +1,10 @@
 """Canonical Live Offer, View Projections, and Intelligence Models for Phase 4."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -96,6 +97,23 @@ class FlightSegmentModel(BaseModel):
 
 
 # =====================================================================
+# Candidate Date Summaries & Multi-Date Responses (Phase 7)
+# =====================================================================
+
+class CandidateDateSummary(BaseModel):
+    """Aggregated status and lowest price for a specific candidate travel date window."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    departure_date: date
+    return_date: date | None = None
+    offer_count: int = Field(default=0, ge=0)
+    lowest_price: Decimal | None = None
+    currency: str = "USD"
+    status: str = "ok"  # "ok", "no_offers", "provider_error"
+    error_message: str | None = None
+
+
+# =====================================================================
 # Client-Facing View Projections (Publicly Exposed over REST)
 # =====================================================================
 
@@ -117,6 +135,21 @@ class FlightOfferView(BaseModel):
     limitations: list[ProviderLimitationWarning] = Field(default_factory=list)
     is_recommended: bool = False
     recommendation_rank: int = 1
+    candidate_departure_date: date | None = None
+    candidate_return_date: date | None = None
+
+
+class FlexibleFlightSearchResponse(BaseModel):
+    """Client-facing aggregated response for flexible live flight search across candidate dates."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    success: bool = True
+    session_id: UUID
+    candidate_dates: list[CandidateDateSummary]
+    offers_by_date: dict[str, list[FlightOfferView]]
+    cheapest_offer: FlightOfferView | None = None
+    recommended_offer: FlightOfferView | None = None
+    errors: list[str] = Field(default_factory=list)
 
 
 class HotelOfferView(BaseModel):
@@ -175,6 +208,8 @@ class FlightOffer(BaseModel):
     limitations: list[ProviderLimitationWarning] = Field(default_factory=list)
     is_recommended: bool = False
     recommendation_rank: int = 1
+    candidate_departure_date: date | None = None
+    candidate_return_date: date | None = None
 
     def to_client_view(self) -> FlightOfferView:
         data = self.model_dump(exclude={"provider_offer_id"})

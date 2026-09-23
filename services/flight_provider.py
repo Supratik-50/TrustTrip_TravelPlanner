@@ -13,6 +13,10 @@ class FlightProviderTimeout(FlightProviderError):
     """Provider request exceeded its configured timeout."""
 
 
+class FlightProviderRateLimitError(FlightProviderError):
+    """Provider request exceeded rate limit (e.g. HTTP 429)."""
+
+
 class FlightProvider(ABC):
     name = "base"
 

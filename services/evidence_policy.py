@@ -98,6 +98,8 @@ def build_applicability_key(evidence_type: EvidenceType, constraints: dict[str, 
     infants = int(constraints.get("infants") or 0)
 
     if evidence_type == EvidenceType.FLIGHT:
+        cand_dates = constraints.get("candidate_dates")
+        cand_list = [str(d) for d in cand_dates] if isinstance(cand_dates, (list, tuple)) else []
         return {
             "origin": orig,
             "destination": dest,
@@ -107,6 +109,14 @@ def build_applicability_key(evidence_type: EvidenceType, constraints: dict[str, 
             "children": children,
             "infants": infants,
             "cabin_class": str(constraints.get("cabin_class") or "economy").lower(),
+            "max_connections": int(constraints.get("max_connections") or 2),
+            "currency": str(constraints.get("currency") or "USD").upper(),
+            "flexibility_mode": str(constraints.get("flexibility_mode") or "exact").lower(),
+            "flexibility_days": int(constraints.get("flexibility_days") or 0),
+            "duration_days": int(constraints["duration_days"]) if constraints.get("duration_days") is not None else None,
+            "earliest_departure": str(constraints.get("earliest_departure") or "").strip(),
+            "latest_departure": str(constraints.get("latest_departure") or "").strip(),
+            "candidate_dates": cand_list,
         }
     elif evidence_type == EvidenceType.HOTEL:
         return {

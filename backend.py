@@ -308,7 +308,8 @@ def flight_agent(state: TravelState):
     passenger_list = ([{"type": "adult"}] * int(constraints.get("adults", 1)))
     passenger_list += ([{"type": "child"}] * int(constraints.get("children", 0)))
     passenger_list += ([{"type": "infant_without_seat"}] * int(constraints.get("infants", 0)))
-    search_windows = candidate_dates(constraints, limit=1)
+    limit = int(constraints.get("candidate_dates_limit") or (7 if constraints.get("flexibility_days") or constraints.get("flexibility_mode") else 1))
+    search_windows = candidate_dates(constraints, limit=limit)
     recommendation_date = search_windows[0][0] if search_windows else None
     recommendation_return = search_windows[0][1] if search_windows else None
     for departure, return_date in search_windows:
@@ -361,6 +362,22 @@ def flight_agent(state: TravelState):
         offer["is_recommended"] = idx == 0
         offer["recommendation_rank"] = idx + 1
     recommended = offers[0] if offers else None
+    if recommended:
+        recommendation_date = recommended.get("planning_departure") or recommendation_date
+        recommendation_return = recommended.get("planning_return") or recommendation_return
+
+    candidate_summaries = []
+    for dep, ret in search_windows:
+        matching_offers = [o for o in offers if o.get("planning_departure") == dep]
+        matching_prices = [float(o.get("price") or 0) for o in matching_offers if o.get("price") is not None]
+        lowest_p = min(matching_prices) if matching_prices else None
+        candidate_summaries.append({
+            "departure_date": dep,
+            "return_date": ret,
+            "offer_count": len(matching_offers),
+            "lowest_price": lowest_p,
+        })
+
     lines = [
         f"Live {service.provider.name} flight search: {len(offers)} candidate offer(s) for {origin} → {destination}.",
         f"Date strategy: {'user-specified date' if constraints.get('departure_date') else 'near-term flexible windows because no date was supplied'}.",
@@ -379,6 +396,7 @@ def flight_agent(state: TravelState):
     return {
         "flight_results": "\n".join(lines),
         "live_flight_offers": offers,
+        "flight_candidate_dates": candidate_summaries,
         "recommended_flight": recommended or {},
         "trip_constraints": {**constraints, **({"flight_recommendation_date": recommendation_date, "flight_recommendation_return": recommendation_return} if recommendation_date else {})},
         "messages": [AIMessage(content="Live flight offers refreshed.")],

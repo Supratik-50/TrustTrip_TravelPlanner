@@ -11,6 +11,8 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
+import os
+import httpx
 from domain.live_offer import (
     AvailabilityStatus,
     FlightOffer,
@@ -23,7 +25,11 @@ from domain.live_offer import (
 )
 from domain.search_criteria import FlightSearchCriteria
 from services.duffel_provider import DuffelProvider
-from services.flight_provider import FlightProviderError, FlightProviderTimeout
+from services.flight_provider import (
+    FlightProviderError,
+    FlightProviderRateLimitError,
+    FlightProviderTimeout,
+)
 from services.travel_intelligence.ports import FlightSearchProviderPort, ProviderCapability
 
 
@@ -144,7 +150,7 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
         self._capability = ProviderCapability(
             provider_name="duffel",
             infant_support=InfantSupportLevel.NATIVE,
-            supports_flexible_dates=False,
+            supports_flexible_dates=True,
             supports_cancellation_policies=True,
             supports_multi_room=False,
         )
@@ -157,27 +163,12 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
     def capability(self) -> ProviderCapability:
         return self._capability
 
-    def _sync_search(self, criteria: FlightSearchCriteria) -> list[tuple[FlightOffer, dict[str, Any]]]:
-        slices = [
-            {
-                "origin": s.origin_iata.upper(),
-                "destination": s.destination_iata.upper(),
-                "departure_date": s.departure_date.isoformat(),
-            }
-            for s in criteria.slices
-        ]
-        passengers = [{"type": "adult"}] * criteria.adults
-        passengers += [{"type": "child"}] * criteria.children
-        passengers += [{"type": "infant_without_seat"}] * criteria.infants
-
-        req_payload = {
-            "slices": slices,
-            "passengers": passengers,
-            "cabin_class": criteria.cabin_class,
-            "max_connections": criteria.max_connections,
-        }
-
-        raw_offers = self._provider.search(req_payload)
+    def _build_flight_offers(
+        self,
+        raw_offers: list[dict[str, Any]],
+        criteria: FlightSearchCriteria,
+        total_pax: int,
+    ) -> list[tuple[FlightOffer, dict[str, Any]]]:
         results: list[tuple[FlightOffer, dict[str, Any]]] = []
         now = datetime.now(timezone.utc)
 
@@ -250,7 +241,8 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
                 exp_dt = datetime.fromtimestamp(now.timestamp() + 1800, tz=timezone.utc)
 
             stops = int(raw.get("stops") or max(0, len(segments) - 1))
-            total_pax = criteria.adults + criteria.children + criteria.infants
+            dep_date = criteria.slices[0].departure_date if criteria.slices else None
+            ret_date = criteria.slices[1].departure_date if len(criteria.slices) > 1 else None
 
             offer = FlightOffer(
                 provider="duffel",
@@ -265,6 +257,8 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
                 freshness=FreshnessStatus.FRESH,
                 availability=AvailabilityStatus.AVAILABLE,
                 limitations=[],
+                candidate_departure_date=dep_date,
+                candidate_return_date=ret_date,
             )
 
             sanitized_raw = _scrub_payload(raw.get("raw") or raw)
@@ -272,26 +266,201 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
 
         return results
 
+    def _sync_search(self, criteria: FlightSearchCriteria) -> list[tuple[FlightOffer, dict[str, Any]]]:
+        slices = [
+            {
+                "origin": s.origin_iata.upper(),
+                "destination": s.destination_iata.upper(),
+                "departure_date": s.departure_date.isoformat(),
+            }
+            for s in criteria.slices
+        ]
+        total_pax = criteria.adults + criteria.children + criteria.infants
+        passengers = [{"type": "adult"}] * criteria.adults
+        passengers += [{"type": "child"}] * criteria.children
+        passengers += [{"type": "infant_without_seat"}] * criteria.infants
+
+        req_payload = {
+            "slices": slices,
+            "passengers": passengers,
+            "cabin_class": criteria.cabin_class,
+            "max_connections": criteria.max_connections,
+        }
+
+        raw_offers = self._provider.search(req_payload)
+        return self._build_flight_offers(raw_offers, criteria, total_pax)
+
     async def search_flights(
         self,
         criteria: FlightSearchCriteria,
+        call_timeout: float | None = None,
     ) -> list[tuple[FlightOffer, dict[str, Any]]]:
-        return await asyncio.to_thread(self._sync_search, criteria)
+        """Perform native async flight search via Duffel REST API using httpx.AsyncClient.
 
-    def _sync_revalidate(
+        Guarantees deterministic socket closure upon cancellation without leaving worker threads running.
+        """
+        slices = [
+            {
+                "origin": s.origin_iata.upper(),
+                "destination": s.destination_iata.upper(),
+                "departure_date": s.departure_date.isoformat(),
+            }
+            for s in criteria.slices
+        ]
+        total_pax = criteria.adults + criteria.children + criteria.infants
+        passengers = [{"type": "adult"}] * criteria.adults
+        passengers += [{"type": "child"}] * criteria.children
+        passengers += [{"type": "infant_without_seat"}] * criteria.infants
+
+        req_payload = {
+            "data": {
+                "slices": slices,
+                "passengers": passengers,
+                "cabin_class": criteria.cabin_class,
+                "max_connections": criteria.max_connections,
+            }
+        }
+
+        token = getattr(self._provider, "token", None) or os.getenv("DUFFEL_ACCESS_TOKEN") or ""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Duffel-Version": "v2",
+        }
+        base_url = getattr(self._provider, "BASE_URL", "https://api.duffel.com")
+        timeout_sec = call_timeout or getattr(self._provider, "timeout", 30)
+
+        supplier_timeout_ms = int(os.getenv("DUFFEL_SUPPLIER_TIMEOUT_MS", "45000"))
+        supplier_timeout_ms = max(2000, min(60000, supplier_timeout_ms))
+        params = {
+            "return_offers": "true",
+            "view": "offers",
+            "supplier_timeout": str(supplier_timeout_ms),
+        }
+
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            try:
+                response = await client.post(
+                    f"{base_url}/air/offer_requests",
+                    params=params,
+                    json=req_payload,
+                    headers=headers,
+                )
+            except asyncio.CancelledError:
+                # Deterministic socket and connection cleanup via context manager exit
+                raise
+            except httpx.TimeoutException as exc:
+                raise FlightProviderTimeout(f"Duffel async request timed out after {timeout_sec}s: {exc}") from exc
+            except httpx.RequestError as exc:
+                raise FlightProviderError(f"Duffel async request failed: {exc}") from exc
+
+            if response.status_code == 429:
+                raise FlightProviderRateLimitError("Duffel API rate limit exceeded (HTTP 429).")
+            if not response.is_success:
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = response.text
+                raise FlightProviderError(f"Duffel API returned HTTP {response.status_code}: {detail}")
+
+            try:
+                data = response.json()
+            except Exception as exc:
+                raise FlightProviderError("Duffel returned invalid JSON.") from exc
+
+            offers = (data.get("data") or {}).get("offers") or []
+            normalized_raw = [DuffelProvider._normalize_offer(item) for item in offers]
+            return self._build_flight_offers(normalized_raw, criteria, total_pax)
+
+    async def revalidate_flight(
         self,
         provider_offer_id: str,
         expected_price: float | None = None,
         expected_currency: str | None = None,
+        call_timeout: float | None = None,
     ) -> RevalidationResult:
+        """Asynchronously revalidate a flight offer with Duffel via native async HTTP."""
         now = datetime.now(timezone.utc)
         reval_id = uuid4()
+        token = getattr(self._provider, "token", None)
+        if not token:
+            token = os.getenv("DUFFEL_ACCESS_TOKEN") or os.getenv("DUFFEL_TEST_API_TOKEN") or os.getenv("DUFFEL_LIVE_API_TOKEN")
+        if not token:
+            raise FlightProviderError("Duffel API token is missing.")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Duffel-Version": "v2",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "TrustTrip/1.0",
+        }
+        base_url = getattr(self._provider, "BASE_URL", "https://api.duffel.com")
+        timeout_sec = call_timeout or getattr(self._provider, "timeout", 30)
+
+        if not provider_offer_id or not provider_offer_id.startswith("off_"):
+            return RevalidationResult(
+                revalidation_id=reval_id,
+                original_snapshot_id=uuid4(),
+                status=RevalidationStatus.OFFER_WITHDRAWN,
+                verified_at=now,
+                price_changed=False,
+                original_price=Decimal(str(expected_price or 0)),
+                current_price=Decimal("0.00"),
+                currency=expected_currency or "USD",
+                schedule_changed=False,
+                details="A valid Duffel offer ID is required.",
+            )
+
         try:
-            latest = self._provider.get_offer(provider_offer_id)
+            async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                try:
+                    response = await client.get(
+                        f"{base_url}/air/offers/{provider_offer_id}",
+                        headers=headers,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except httpx.TimeoutException as exc:
+                    raise FlightProviderTimeout(f"Duffel async revalidation timed out after {timeout_sec}s: {exc}") from exc
+                except httpx.RequestError as exc:
+                    raise FlightProviderError(f"Duffel async revalidation request failed: {exc}") from exc
+
+                if response.status_code in {404, 410}:
+                    return RevalidationResult(
+                        revalidation_id=reval_id,
+                        original_snapshot_id=uuid4(),
+                        status=RevalidationStatus.OFFER_WITHDRAWN,
+                        verified_at=now,
+                        price_changed=False,
+                        original_price=Decimal(str(expected_price or 0)),
+                        current_price=Decimal("0.00"),
+                        currency=expected_currency or "USD",
+                        schedule_changed=False,
+                        details="The selected flight offer is no longer available from the provider.",
+                    )
+
+                if response.status_code == 429:
+                    raise FlightProviderRateLimitError("Duffel API rate limit exceeded (HTTP 429).")
+
+                if not response.is_success:
+                    try:
+                        detail = response.json()
+                    except Exception:
+                        detail = response.text
+                    raise FlightProviderError(f"Duffel API returned HTTP {response.status_code}: {detail}")
+
+                try:
+                    data = response.json()
+                except Exception as exc:
+                    raise FlightProviderError("Duffel returned invalid JSON.") from exc
+
+                latest = data.get("data") or {}
         except (FlightProviderError, FlightProviderTimeout) as exc:
             return RevalidationResult(
                 revalidation_id=reval_id,
-                original_snapshot_id=uuid4(),  # Populated by application service
+                original_snapshot_id=uuid4(),
                 status=RevalidationStatus.OFFER_WITHDRAWN,
                 verified_at=now,
                 price_changed=False,
@@ -302,10 +471,10 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
                 details=f"Offer withdrawn or supplier error: {exc}",
             )
 
-        current_amount = latest.get("price")
-        current_currency = str(latest.get("currency") or "USD").upper()
+        total_amount = latest.get("total_amount")
+        current_currency = str(latest.get("total_currency") or "USD").upper()
 
-        if current_amount is None:
+        if total_amount is None:
             return RevalidationResult(
                 revalidation_id=reval_id,
                 original_snapshot_id=uuid4(),
@@ -319,7 +488,7 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
                 details="Supplier offer does not contain a price.",
             )
 
-        current_dec = Decimal(str(current_amount))
+        current_dec = Decimal(str(total_amount))
         orig_dec = Decimal(str(expected_price)) if expected_price is not None else current_dec
 
         price_delta = abs(current_dec - orig_dec) > Decimal("0.01")
@@ -343,19 +512,6 @@ class DuffelFlightAdapter(FlightSearchProviderPort):
             currency=current_currency,
             schedule_changed=False,
             details=details,
-        )
-
-    async def revalidate_flight(
-        self,
-        provider_offer_id: str,
-        expected_price: float | None = None,
-        expected_currency: str | None = None,
-    ) -> RevalidationResult:
-        return await asyncio.to_thread(
-            self._sync_revalidate,
-            provider_offer_id,
-            expected_price,
-            expected_currency,
         )
 
     def resolve_booking_destination(

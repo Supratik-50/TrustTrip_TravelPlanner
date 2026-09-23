@@ -8,17 +8,26 @@ from __future__ import annotations
 
 from typing import Any
 import asyncio
+import logging
 import os
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator
 
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
 from dependencies.auth import get_current_user
 from domain.booking import FlightHandoffRequest, FlightBookingDestination
+from domain.live_offer import FlexibleFlightSearchResponse
+from domain.search_criteria import FlexibleFlightSearchCriteria
 from domain.user import UserResponse
 from services.flight_service import FlightService
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
 from services.flight_booking_service import FlightBookingService, FareChangedException, OfferWithdrawnException
+from services.travel_intelligence.orchestrator import TravelIntelligenceOrchestrator
+from services.trip_store import TripStore, resolve_current_revision
 
 router = APIRouter(prefix="/api/flights", tags=["flights"])
 
@@ -55,12 +64,54 @@ async def select_flight_booking(
                 "details": exc.details,
             },
         )
-    except OfferWithdrawnException as exc:
-        raise HTTPException(status_code=410, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except OfferWithdrawnException:
+        raise HTTPException(status_code=410, detail="The selected flight offer is no longer available from the provider.")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid booking parameters.")
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Flight selection handoff failed: {exc}")
+        logger.error("Flight selection handoff failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Flight selection handoff failed due to an internal error.")
+
+
+@router.post("/search-flexible", response_model=FlexibleFlightSearchResponse)
+async def search_flexible_flights(
+    req: FlexibleFlightSearchCriteria,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Execute flexible live flight search across candidate date windows.
+
+    Guarantees tenant isolation, provider offer ID shielding, and binds directly to authentic trip.
+    """
+    trip_store = TripStore()
+    trip = trip_store.get_trip(req.trip_id, current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    current_revision = resolve_current_revision(trip)
+    if current_revision is None:
+        raise HTTPException(status_code=400, detail="Trip revision context unavailable.")
+
+    orchestrator = TravelIntelligenceOrchestrator()
+    try:
+        res = await orchestrator.search_flexible_flights(
+            user_id=current_user.id,
+            trip_id=req.trip_id,
+            criteria=req,
+            trip_revision=current_revision,
+            global_timeout=35.0,
+        )
+        return res
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Flexible flight search failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail="Flexible flight search encountered a provider or system error. Please retry.",
+        )
+
 
 
 
@@ -177,7 +228,8 @@ async def search_flights(request: FlightSearchRequest):
             offer["search_context"] = {**search_context, "selected_offer": selected_snapshot}
         return {"success": True, **result}
     except FlightProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.error("Flight provider search error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="Flight provider search encountered an error.") from exc
 
 
 @router.post("/recheck")
@@ -186,7 +238,8 @@ async def recheck_flight(request: RecheckRequest):
         offer = await asyncio.to_thread(_service().recheck, request.offer_id)
         return {"success": True, "offer": offer}
     except FlightProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.error("Flight provider recheck error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="Flight provider recheck encountered an error.") from exc
 
 
 @router.post("/refresh-selected-offer")
@@ -203,7 +256,8 @@ async def refresh_selected_offer(request: RefreshOfferRequest):
         offer = await asyncio.to_thread(provider.refresh_bookable_offer, request.offer_id, request.search_context)
         return {"success": True, "offer": offer, "fresh_offer": True}
     except FlightProviderError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.error("Flight provider refresh offer error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=409, detail="Flight provider could not refresh bookable offer.") from exc
 
 
 @router.post("/book")

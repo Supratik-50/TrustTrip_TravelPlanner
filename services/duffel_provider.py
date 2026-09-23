@@ -7,7 +7,7 @@ from datetime import date, datetime
 
 import requests
 
-from .flight_provider import FlightProvider, FlightProviderError, FlightProviderTimeout
+from .flight_provider import FlightProvider, FlightProviderError, FlightProviderTimeout, FlightProviderRateLimitError
 
 
 def _departure_date_from_offer(offer: dict[str, Any]) -> date:
@@ -149,6 +149,8 @@ class DuffelProvider(FlightProvider):
             raise FlightProviderError(f"Duffel request failed: {exc}") from exc
 
         if not response.ok:
+            if response.status_code == 429:
+                raise FlightProviderRateLimitError("Duffel API rate limit exceeded (HTTP 429).")
             try:
                 detail = response.json()
             except ValueError:

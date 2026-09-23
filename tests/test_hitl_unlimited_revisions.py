@@ -14,7 +14,7 @@ from domain.live_offer import (
     PriceBreakdown,
 )
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from services.auth_store import UserStore
 from services.search_session_store import SearchSessionStore
 from services.trip_store import TripStore
@@ -105,8 +105,9 @@ def test_offer_selection_does_not_increment_revision():
 
     # Create a flight offer snapshot owned by user
     store = SearchSessionStore()
-    session = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="flights", criteria_hash="h1")
+    session = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="flights", criteria_hash="h1", trip_revision=2)
     now = datetime.now(timezone.utc)
+    future_exp = now + timedelta(hours=1)
     offer = FlightOffer(
         snapshot_id=uuid4(),
         provider="duffel",
@@ -115,7 +116,7 @@ def test_offer_selection_does_not_increment_revision():
         stops=0,
         segments=[],
         retrieved_at=now,
-        expires_at=now,
+        expires_at=future_exp,
     )
     snap = store.save_snapshot(session.session_id, offer, raw_payload={"fare": 300})
 
@@ -141,9 +142,10 @@ def test_stale_selections_invalidated_on_material_revisions():
 
     store = SearchSessionStore()
     now = datetime.now(timezone.utc)
+    future_exp = now + timedelta(hours=1)
 
-    # Save flight snapshot
-    f_sess = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="flights", criteria_hash="h1")
+    # Save flight snapshot for initial trip revision 0
+    f_sess = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="flights", criteria_hash="h1", trip_revision=0)
     flight_offer = FlightOffer(
         snapshot_id=uuid4(),
         provider="duffel",
@@ -152,13 +154,13 @@ def test_stale_selections_invalidated_on_material_revisions():
         stops=0,
         segments=[],
         retrieved_at=now,
-        expires_at=now,
+        expires_at=future_exp,
     )
     f_snap = store.save_snapshot(f_sess.session_id, flight_offer, raw_payload={})
 
-    # Save hotel snapshot
+    # Save hotel snapshot for initial trip revision 0
     from domain.live_offer import HotelOffer
-    h_sess = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="hotels", criteria_hash="h2")
+    h_sess = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="hotels", criteria_hash="h2", trip_revision=0)
     hotel_offer = HotelOffer(
         snapshot_id=uuid4(),
         provider="liteapi",
@@ -173,7 +175,7 @@ def test_stale_selections_invalidated_on_material_revisions():
         nightly_price=Decimal("100.00"),
         nights=2,
         retrieved_at=now,
-        expires_at=now,
+        expires_at=future_exp,
     )
     h_snap = store.save_snapshot(h_sess.session_id, hotel_offer, raw_payload={})
 
@@ -203,9 +205,13 @@ def test_stale_selections_invalidated_on_material_revisions():
     assert "selected_flight_snapshot_id" not in meta or meta.get("selected_flight_snapshot_id") is None
     assert "selected_hotel_snapshot_id" not in meta or meta.get("selected_hotel_snapshot_id") is None
 
-    # Re-select for specific hotel tests
-    client.post(f"/api/trips/{trip_id}/select-offer", json={"offer_type": "hotel", "snapshot_id": str(h_snap.snapshot_id)})
-    assert client.get(f"/api/trips/{trip_id}").json()["trip"]["metadata"].get("selected_hotel_snapshot_id") == str(h_snap.snapshot_id)
+    # Re-select for specific hotel tests with snapshot matching current revision (revision 2)
+    h_sess2 = store.create_session(user_id=user_id, trip_id=trip_id, thread_id="t1", search_type="hotels", criteria_hash="h2_rev2", trip_revision=2)
+    hotel_offer2 = hotel_offer.model_copy(update={"snapshot_id": uuid4(), "retrieved_at": now, "expires_at": future_exp})
+    h_snap2 = store.save_snapshot(h_sess2.session_id, hotel_offer2, raw_payload={})
+    res_sel2 = client.post(f"/api/trips/{trip_id}/select-offer", json={"offer_type": "hotel", "snapshot_id": str(h_snap2.snapshot_id)})
+    assert res_sel2.status_code == 200
+    assert client.get(f"/api/trips/{trip_id}").json()["trip"]["metadata"].get("selected_hotel_snapshot_id") == str(h_snap2.snapshot_id)
 
     # 3. Hotel preference change -> clears hotel selection
     client.post(
