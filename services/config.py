@@ -1,0 +1,97 @@
+"""Centralized configuration validation for TrustTrip backend (Phase 10).
+
+Validates required and environment-specific variables at application startup.
+Follows a plain-Python, zero-enterprise approach without pydantic-settings.
+"""
+from __future__ import annotations
+
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+# Required in production; dev falls back with warning
+PRODUCTION_SECURITY_VARS = ["JWT_SECRET", "PAYLOAD_ENCRYPTION_KEY"]
+
+# Optional external integration credential groups (service degrades gracefully)
+OPTIONAL_INTEGRATION_VARS: list[tuple[str, list[str]]] = [
+    ("Duffel Flight API", ["DUFFEL_TEST_API_TOKEN", "DUFFEL_LIVE_API_TOKEN", "DUFFEL_API_TOKEN"]),
+    ("Razorpay Payments", ["RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET"]),
+    ("LLM Intelligence", ["GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"]),
+    ("Search / Weather", ["TAVILY_API_KEY", "OPENWEATHER_API_KEY"]),
+    ("Hotel Providers", ["LITEAPI_SANDBOX_API_KEY", "LITEAPI_PRODUCTION_API_KEY", "HOTELBEDS_API_KEY"]),
+]
+
+
+def is_in_memory_auth() -> bool:
+    """Return True if running in in-memory test mode."""
+    return os.getenv("USE_IN_MEMORY_AUTH", "").lower() in {"1", "true", "yes"}
+
+
+def is_production() -> bool:
+    """Return True if running in production mode."""
+    return os.getenv("APP_ENV", "development").lower() == "production"
+
+
+def get_jwt_secret() -> str | None:
+    """Return configured JWT secret or None if unset."""
+    return os.getenv("JWT_SECRET") or os.getenv("AUTH_SECRET") or os.getenv("AUTH_SECRET_KEY")
+
+
+def validate_config() -> None:
+    """Validate environment configuration at application startup.
+
+    Hard fails (RuntimeError):
+      - DATABASE_URL missing when USE_IN_MEMORY_AUTH is not enabled.
+      - In production (APP_ENV=production): JWT_SECRET or PAYLOAD_ENCRYPTION_KEY missing.
+
+    Soft warnings:
+      - In development: missing JWT_SECRET or PAYLOAD_ENCRYPTION_KEY (safe dev fallbacks used).
+      - Missing optional provider credentials (related features degrade gracefully).
+    """
+    # 1. DATABASE_URL validation
+    if not is_in_memory_auth():
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url or not db_url.strip():
+            raise RuntimeError(
+                "DATABASE_URL is not configured. A PostgreSQL connection string is required "
+                "for persistent operation (or set USE_IN_MEMORY_AUTH=1 for test mode)."
+            )
+
+    # Ensure libpq connect_timeout is set if not already present
+    if "PGCONNECT_TIMEOUT" not in os.environ:
+        os.environ["PGCONNECT_TIMEOUT"] = os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")
+
+    # 2. Security credentials validation
+    jwt_secret = get_jwt_secret()
+    payload_key = os.getenv("PAYLOAD_ENCRYPTION_KEY")
+
+    if is_production():
+        if not jwt_secret:
+            raise RuntimeError(
+                "JWT_SECRET is required in production environment (APP_ENV=production)."
+            )
+        if not payload_key:
+            raise RuntimeError(
+                "PAYLOAD_ENCRYPTION_KEY is required in production environment (APP_ENV=production)."
+            )
+    else:
+        if not jwt_secret:
+            logger.warning(
+                "JWT_SECRET is not set; an ephemeral secret will be used for this process. "
+                "Set JWT_SECRET to keep user sessions across restarts."
+            )
+        if not payload_key and not is_in_memory_auth():
+            logger.warning(
+                "PAYLOAD_ENCRYPTION_KEY is not set; an ephemeral AES key will be used. "
+                "Set PAYLOAD_ENCRYPTION_KEY for persistent search session encryption."
+            )
+
+    # 3. Optional integration credentials (warn only)
+    for group_name, env_names in OPTIONAL_INTEGRATION_VARS:
+        if not any(os.getenv(k) for k in env_names):
+            logger.warning(
+                "Optional integration '%s' credentials not configured (%s). Features will degrade gracefully.",
+                group_name,
+                ", ".join(env_names),
+            )

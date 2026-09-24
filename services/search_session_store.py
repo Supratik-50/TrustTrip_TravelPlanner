@@ -95,10 +95,38 @@ def _dsn() -> str:
         raise RuntimeError("DATABASE_URL is required for travel intelligence persistence.")
     if "sslmode=" not in value:
         value += ("&" if "?" in value else "?") + "sslmode=require"
+    if "connect_timeout=" not in value:
+        timeout = os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")
+        value += ("&" if "?" in value else "?") + f"connect_timeout={timeout}"
     return value
 
 
 REQUIRED_TRAVEL_INTELLIGENCE_TABLES = ("search_sessions", "offer_snapshots", "revalidation_history")
+
+REQUIRED_SCHEMA_TABLES_BY_MIGRATION: dict[str, tuple[str, ...]] = {
+    "migrations/004_travel_intelligence.sql": ("search_sessions", "offer_snapshots", "revalidation_history"),
+    "migrations/005_evidence_revision_lifecycle.sql": (
+        "plan_revisions",
+        "evidence_records",
+        "evidence_provenance",
+        "plan_revision_evidence_links",
+        "plan_approvals",
+    ),
+    "migrations/006_research_and_rag.sql": (
+        "research_sessions",
+        "research_queries",
+        "research_sources",
+        "research_evidence",
+        "research_citations",
+        "rag_documents",
+        "rag_chunks",
+    ),
+    "migrations/007_flight_booking_lifecycle.sql": (
+        "booking_intents",
+        "booking_attempts",
+        "booking_transitions",
+    ),
+}
 
 
 def validate_travel_intelligence_schema() -> None:
@@ -133,6 +161,48 @@ def validate_travel_intelligence_schema() -> None:
                     f"Travel intelligence database tables missing: {sorted(missing)}. "
                     f"Run migration 'migrations/004_travel_intelligence.sql' before starting the application."
                 )
+
+
+def validate_database_schema(migrations: tuple[str, ...] | None = None) -> None:
+    """Validate that required database tables exist in PostgreSQL across migrations 004-007.
+
+    Fails closed with RuntimeError if any tables are missing (unmigrated database).
+    Executes ZERO DDL statements. Schema creation/modification must be performed
+    exclusively via versioned migrations.
+    """
+    if os.getenv("USE_IN_MEMORY_AUTH", "").lower() in {"1", "true", "yes"}:
+        return
+
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL must be configured.")
+
+    schema_map = REQUIRED_SCHEMA_TABLES_BY_MIGRATION
+    if migrations is not None:
+        schema_map = {k: v for k, v in schema_map.items() if any(m in k for m in migrations)}
+
+    all_tables = [table for tables in schema_map.values() for table in tables]
+
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY(%s)
+                """,
+                (all_tables,),
+            )
+            found = {row[0] for row in cur.fetchall()}
+            for mig_file, tables in schema_map.items():
+                missing = set(tables) - found
+                if missing:
+                    raise RuntimeError(
+                        f"Database tables missing for {mig_file}: {sorted(missing)}. "
+                        f"Run migration '{mig_file}' before starting the application."
+                    )
+
 
 
 def _criteria_lock_id(user_id: Any, trip_id: Any, criteria_hash: str) -> int:

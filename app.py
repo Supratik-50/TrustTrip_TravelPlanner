@@ -1,12 +1,24 @@
 from contextlib import asynccontextmanager
+import logging
+import os
 from pathlib import Path
 import traceback
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# Configure stdlib logging before other imports
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+logger = logging.getLogger(__name__)
+
 import uvicorn
 from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -37,14 +49,31 @@ BASE_DIR = Path(__file__).resolve().parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from services.config import validate_config
+    from services.db import probe_db, init_db, close_db
     from services.auth_store import init_auth_tables
     from services.trip_store import init_trip_tables
-    from services.search_session_store import validate_travel_intelligence_schema
+    from services.search_session_store import validate_database_schema
+
+    logger.info("Application starting up...")
+    validate_config()
+    init_db()
+
+    # In persistent DB mode, verify connectivity at startup
+    if os.getenv("USE_IN_MEMORY_AUTH", "").lower() not in {"1", "true", "yes"}:
+        if not probe_db():
+            raise RuntimeError("Database connectivity check failed during startup.")
+
     init_auth_tables()
     init_trip_tables()
-    validate_travel_intelligence_schema()
+    validate_database_schema()
+    logger.info("Application ready")
+
     yield
 
+    logger.info("Application shutting down...")
+    close_db()
+    logger.info("Application shutdown complete")
 
 
 app = FastAPI(
@@ -56,6 +85,29 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# CORS Configuration
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000")
+allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+has_wildcard = "*" in allowed_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=not has_wildcard,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": "An internal server error occurred."},
+    )
+
 
 app.include_router(auth_router)
 app.include_router(flight_router)
@@ -133,14 +185,12 @@ async def travel_planner(
     except PermissionError as p_exc:
         raise HTTPException(status_code=403, detail=str(p_exc))
     except Exception as exc:
-        print("ERROR:", exc)
-        traceback.print_exc()
-
+        logger.exception("Error processing travel request: %s", exc)
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": str(exc),
+                "error": "Travel planner processing failed.",
             },
         )
 
@@ -155,8 +205,11 @@ async def download_travel_plan_pdf(request_data: TravelPlanPDFRequest):
             headers={"Content-Disposition": 'attachment; filename="trust-trip-travel-plan.pdf"'},
         )
     except Exception as exc:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"success": False, "error": f"Travel plan PDF generation failed: {exc}"})
+        logger.exception("Travel plan PDF generation failed: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "Travel plan PDF generation failed."},
+        )
 
 
 @app.post("/api/travel/approve")
@@ -191,14 +244,12 @@ async def approve_travel_plan(
     except PermissionError as p_exc:
         raise HTTPException(status_code=403, detail=str(p_exc))
     except Exception as exc:
-        print("APPROVAL ERROR:", exc)
-        traceback.print_exc()
-
+        logger.exception("Error approving travel plan: %s", exc)
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": str(exc),
+                "error": "Travel plan approval processing failed.",
             },
         )
 
@@ -207,6 +258,7 @@ async def approve_travel_plan(
 async def health_check():
     return {
         "status": "ok",
+        "version": "2.0.0",
         "message": "Trust Trip MAS API is running",
         "features": [
             "supervisor_agent",
@@ -228,6 +280,18 @@ async def health_check():
             "postgres_connection_pool",
         ],
     }
+
+
+@app.get("/ready")
+async def readiness_check():
+    from services.db import probe_db
+
+    if probe_db():
+        return {"status": "ready"}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "not_ready", "reason": "database_unavailable"},
+    )
 
 
 @app.get("/favicon.ico")
