@@ -6,6 +6,7 @@ All queries require WHERE user_id = %s.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -13,6 +14,8 @@ from datetime import datetime, timezone
 from typing import Any
 import psycopg
 from psycopg.rows import dict_row
+
+logger = logging.getLogger(__name__)
 
 from domain.live_offer import AvailabilityStatus, FreshnessStatus
 
@@ -578,6 +581,7 @@ class TripStore:
         feedback: str = "",
         updated_constraints: dict[str, Any] | None = None,
         expected_base_revision: int | None = None,
+        constraints_update: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically advance trip plan revision under parent trip row lock in a single transaction.
 
@@ -589,7 +593,8 @@ class TripStore:
         """
         tid_str = str(trip_id)
         uid_str = str(user_id)
-        constraints_update = updated_constraints or {}
+        effective_constraints = updated_constraints if updated_constraints is not None else (constraints_update or {})
+        constraints_update = effective_constraints
         now = datetime.now(timezone.utc)
 
         from domain.change_set import compute_change_set, calculate_replanning_plan
@@ -620,8 +625,28 @@ class TripStore:
                 meta["constraints"] = new_constraints
                 meta["last_feedback"] = feedback
 
-                if plan.requires_flight_search:
-                    meta.pop("selected_flight_snapshot_id", None)
+                old_flight = meta.get("selected_flight_snapshot_id")
+                new_flight = constraints_update.get("selected_flight_snapshot_id", old_flight)
+                flight_selection_changed = (old_flight is not None and new_flight != old_flight)
+                flight_dates_or_route_changed = (
+                    ("origin" in constraints_update and constraints_update["origin"] != locked_constraints.get("origin"))
+                    or ("destination" in constraints_update and constraints_update["destination"] != locked_constraints.get("destination"))
+                    or ("departure_date" in constraints_update and constraints_update["departure_date"] != locked_constraints.get("departure_date"))
+                    or ("return_date" in constraints_update and constraints_update["return_date"] != locked_constraints.get("return_date"))
+                    or ("passengers" in constraints_update and constraints_update["passengers"] != locked_constraints.get("passengers"))
+                )
+
+                if plan.requires_flight_search or flight_selection_changed or flight_dates_or_route_changed:
+                    if plan.requires_flight_search or new_flight is None:
+                        meta.pop("selected_flight_snapshot_id", None)
+                    else:
+                        meta["selected_flight_snapshot_id"] = new_flight
+                    try:
+                        from services.flight_booking_lifecycle_service import FlightBookingLifecycleService
+                        FlightBookingLifecycleService.invalidate_active_flight_intents(tid_str)
+                    except Exception as exc:
+                        logger.error("Failed to invalidate active flight intents for trip %s: %s", tid_str, exc)
+                        raise
                 if plan.requires_hotel_search:
                     meta.pop("selected_hotel_snapshot_id", None)
 
@@ -717,8 +742,28 @@ class TripStore:
                 meta["constraints"] = new_constraints
                 meta["last_feedback"] = feedback
 
-                if plan.requires_flight_search:
-                    meta.pop("selected_flight_snapshot_id", None)
+                old_flight = meta.get("selected_flight_snapshot_id")
+                new_flight = constraints_update.get("selected_flight_snapshot_id", old_flight)
+                flight_selection_changed = (old_flight is not None and new_flight != old_flight)
+                flight_dates_or_route_changed = (
+                    ("origin" in constraints_update and constraints_update["origin"] != locked_constraints.get("origin"))
+                    or ("destination" in constraints_update and constraints_update["destination"] != locked_constraints.get("destination"))
+                    or ("departure_date" in constraints_update and constraints_update["departure_date"] != locked_constraints.get("departure_date"))
+                    or ("return_date" in constraints_update and constraints_update["return_date"] != locked_constraints.get("return_date"))
+                    or ("passengers" in constraints_update and constraints_update["passengers"] != locked_constraints.get("passengers"))
+                )
+
+                if plan.requires_flight_search or flight_selection_changed or flight_dates_or_route_changed:
+                    if plan.requires_flight_search or new_flight is None:
+                        meta.pop("selected_flight_snapshot_id", None)
+                    else:
+                        meta["selected_flight_snapshot_id"] = new_flight
+                    try:
+                        from services.flight_booking_lifecycle_service import FlightBookingLifecycleService
+                        FlightBookingLifecycleService.invalidate_active_flight_intents(tid_str)
+                    except Exception as exc:
+                        logger.error("Failed to invalidate active flight intents for trip %s: %s", tid_str, exc)
+                        raise
                 if plan.requires_hotel_search:
                     meta.pop("selected_hotel_snapshot_id", None)
 

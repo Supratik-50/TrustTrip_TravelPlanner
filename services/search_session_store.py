@@ -531,6 +531,29 @@ class SearchSessionStore:
             blob = bytes(row["raw_payload_encrypted"])
             return decrypt_payload(blob, self._key)
 
+    def get_raw_payload_internal(
+        self,
+        snapshot_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        """Internal service retrieval of decrypted raw supplier payload without user parameter requirement."""
+        sid_str = str(snapshot_id)
+        if self.use_in_memory:
+            record = self._IN_MEMORY_SNAPSHOTS.get(sid_str)
+            if not record:
+                return None
+            blob = record.get("raw_payload_encrypted")
+            return decrypt_payload(blob, self._key) if blob else None
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT raw_payload_encrypted FROM offer_snapshots WHERE id = %s",
+                (sid_str,),
+            ).fetchone()
+            if not row or not row["raw_payload_encrypted"]:
+                return None
+            blob = bytes(row["raw_payload_encrypted"])
+            return decrypt_payload(blob, self._key)
+
     def record_revalidation(
         self,
         original_snapshot_id: UUID | str,
