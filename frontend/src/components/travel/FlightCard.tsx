@@ -343,11 +343,6 @@ export const FlightCard: React.FC<FlightCardProps> = ({
                 ))}
               </div>
             ))}
-
-            <div className="pt-2 text-[11px] font-mono text-[var(--text-muted)] flex items-center justify-between">
-              <span>Canonical Offer ID: {offer.id}</span>
-              {offer.snapshot_id && <span>Snapshot: {offer.snapshot_id}</span>}
-            </div>
           </div>
         )}
       </div>

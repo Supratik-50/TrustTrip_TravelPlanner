@@ -217,6 +217,8 @@ export interface TravelPlanResponse {
   };
   estimated_budget?: {
     total?: number;
+    target?: number;
+    remaining?: number;
     currency?: string;
     breakdown?: Record<string, number | string>;
   };

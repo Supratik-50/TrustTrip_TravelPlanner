@@ -1019,6 +1019,12 @@ def _serialize_result(
         )
 
     return {
+        "success": (
+            result.get("success", True)
+            if (result.get("guardrail_allowed", True) and not result.get("planning_blocked", False) and not result.get("error"))
+            else False
+        ),
+        "error": result.get("error", "" if result.get("guardrail_allowed", True) else result.get("guardrail_reason", "Blocked by guardrails")),
         "thread_id": thread_id,
         "answer": answer,
         "requires_approval": interrupt_payload is not None,

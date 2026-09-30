@@ -42,6 +42,21 @@ export const PlanningWorkspace: React.FC<PlanningWorkspaceProps> = ({ trip, onUp
         }
       }
 
+      const planStart = response.plan_json?.departure_date;
+      if (planStart && trip.start_date && planStart.slice(0, 10) !== trip.start_date.slice(0, 10)) {
+        throw new Error(`Consistency error: Generated plan departure (${planStart}) does not match your trip start date (${trip.start_date}).`);
+      }
+
+      const planEnd = response.plan_json?.return_date;
+      if (planEnd && trip.end_date && planEnd.slice(0, 10) !== trip.end_date.slice(0, 10)) {
+        throw new Error(`Consistency error: Generated plan return (${planEnd}) does not match your trip end date (${trip.end_date}).`);
+      }
+
+      const planTravelers = response.plan_json?.travelers;
+      if (planTravelers && trip.travelers_count && Number(planTravelers) !== Number(trip.travelers_count)) {
+        throw new Error(`Consistency error: Generated plan traveler count (${planTravelers}) does not match your trip traveler count (${trip.travelers_count}).`);
+      }
+
       const updatedTrip: TripDetail = {
         ...trip,
         status: 'planning',

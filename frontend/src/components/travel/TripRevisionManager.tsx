@@ -19,6 +19,7 @@ import { api } from '../../lib/apiClient';
 import { useNotification } from '../../context/NotificationContext';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
+import { formatCurrency } from '../../lib/currency';
 
 interface TripRevisionManagerProps {
   trip: TripDetail;
@@ -280,7 +281,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
                 required
               />
               <Input
-                label={`Budget Limit (${trip.currency || 'USD'})`}
+                label={`Budget Limit (${trip.currency || 'INR'})`}
                 type="number"
                 value={budget}
                 onChange={(e) => setBudget(e.target.value)}
@@ -430,7 +431,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
                   <div className="flex justify-between pt-1 border-t border-[var(--border)]/70">
                     <span>Budget Shift:</span>
                     <span className="font-mono">
-                      ${selectedHistoricalRev.budget?.toLocaleString()} ➔ ${trip.budget?.toLocaleString()}
+                      {formatCurrency(selectedHistoricalRev.budget || 0, trip.currency || 'INR')} ➔ {formatCurrency(trip.budget || 0, trip.currency || 'INR')}
                     </span>
                   </div>
                 )}

@@ -29,7 +29,7 @@ CITY_TO_IATA = {
     "istanbul": "IST", "hong kong": "HKG", "seoul": "ICN", "beijing": "PEK",
     "dhaka": "DAC", "dubai": "DXB", "bangkok": "BKK", "singapore": "SIN",
     "kathmandu": "KTM", "tokyo": "HND", "london": "LHR", "paris": "CDG",
-    "kyoto": "KIX", "udaipur": "UDR",
+    "kyoto": "KIX", "udaipur": "UDR", "genoa": "GOA", "genova": "GOA",
 }
 
 CITY_TO_NAME = {
@@ -45,12 +45,34 @@ CITY_TO_NAME = {
     "DOH": "Doha", "RUH": "Riyadh", "JED": "Jeddah", "IST": "Istanbul", "HKG": "Hong Kong",
     "ICN": "Seoul", "PEK": "Beijing", "DAC": "Dhaka", "DXB": "Dubai",
     "BKK": "Bangkok", "SIN": "Singapore", "KTM": "Kathmandu", "HND": "Tokyo", "NRT": "Tokyo",
-    "LHR": "London", "CDG": "Paris", "KIX": "Kyoto",
+    "LHR": "London", "CDG": "Paris", "KIX": "Kyoto", "GOA": "Genoa",
 }
 
 
 def _clean(text: str) -> str:
     return " ".join(str(text).strip().split())
+
+
+MONTH_MAP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "aug": 8, "august": 8, "sep": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def _resolve_year_for_date(month: int, day: int, base_year: int | None = None) -> str:
+    """Explicit year policy: use base_year if provided. Otherwise, if date is in the future
+    relative to today in the current year, use current year; if passed, roll to next year."""
+    today = date.today()
+    target_year = base_year or today.year
+    try:
+        cand = date(target_year, month, day)
+        if not base_year and cand < today:
+            cand = date(target_year + 1, month, day)
+        return cand.isoformat()
+    except ValueError:
+        return f"{target_year:04d}-{month:02d}-{day:02d}"
 
 
 def _find_date(text: str) -> str | None:
@@ -70,6 +92,14 @@ def _find_date(text: str) -> str | None:
             return date(y, mo, d).isoformat()
         except ValueError:
             pass
+
+    # Yearless single date support: "Oct 14", "October 14", "14 Oct", "14th October"
+    m_name = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b", text, re.I)
+    if m_name and m_name.group(1).lower() in MONTH_MAP:
+        return _resolve_year_for_date(MONTH_MAP[m_name.group(1).lower()], int(m_name.group(2)))
+    m_day = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\b", text, re.I)
+    if m_day and m_day.group(2).lower() in MONTH_MAP:
+        return _resolve_year_for_date(MONTH_MAP[m_day.group(2).lower()], int(m_day.group(1)))
 
     low = text.lower()
     today = date.today()
@@ -108,6 +138,21 @@ def _find_budget(text: str) -> float | None:
                 value *= 1000
             return value
     return None
+
+
+def _find_currency(text: str, previous: dict[str, Any] | None = None) -> str:
+    low = text.lower()
+    if "usd" in low or "$" in text:
+        return "USD"
+    if "eur" in low or "€" in text:
+        return "EUR"
+    if "gbp" in low or "£" in text:
+        return "GBP"
+    if "inr" in low or "₹" in text or "rs" in low:
+        return "INR"
+    if previous and previous.get("currency"):
+        return str(previous.get("currency")).upper()
+    return "INR"
 
 
 @lru_cache(maxsize=1)
@@ -154,12 +199,14 @@ def _country_name(code_or_name: str | None) -> str:
     return val
 
 
-def _city_from_airport(code: str, record: dict[str, Any], default: str = "") -> str:
+def _city_from_airport(code: str, record: dict[str, Any] | None = None, default: str = "") -> str:
     """Extract clean city name without leaking airport suffix."""
-    if default and len(default) >= 3 and not default.isupper():
-        return default
     if code in CITY_TO_NAME:
         return CITY_TO_NAME[code]
+    if default and len(default) >= 3 and not default.isupper() and default.upper() != code.upper():
+        return default
+    if record is None:
+        record = _airport_record(code)
     city = str(record.get("city") or "").strip()
     if city:
         return city
@@ -205,8 +252,10 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     if "," in raw:
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         if len(parts) >= 2:
-            sub_code, sub_city, sub_country = _resolve_place(parts[0])
             hint_country = _country_name(parts[1]) or parts[1].title()
+            if parts[0].upper() == "GOA" and (hint_country == "Italy" or "ital" in parts[1].lower()):
+                return "GOA", "Genoa", "Italy"
+            sub_code, sub_city, sub_country = _resolve_place(parts[0])
             if sub_code:
                 return sub_code, sub_city, (sub_country or hint_country)
             elif sub_city:
@@ -217,12 +266,25 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     if not value or value in STOP_WORDS:
         return None, None, None
 
-    # 3. Prioritize city alias before 3-letter airport codes so "goa" resolves to GOI (India) rather than Genoa (Italy)
+    # Documented Genoa/Goa Resolution Policy:
+    # - "goa" / "goa india" -> GOI (Goa, India)
+    # - "genoa" / "genova" -> GOA (Genoa, Italy)
+    # - Literal ambiguous 3-letter "GOA": By policy in TrustTrip's travel context,
+    #   "GOA" without an Italian qualifier resolves to Goa, India (GOI) to preserve
+    #   domestic and international route stability. Explicit Genoa Cristoforo Colombo
+    #   is resolved via "Genoa", "Genova", or "GOA (Italy)".
+    if value in {"goa", "goa india"} or (raw.upper() == "GOA" and not ("italy" in raw.lower() or "italia" in raw.lower())):
+        return "GOI", "Goa", "India"
+    if value in {"genoa", "genova"} or (raw.upper() == "GOA" and ("italy" in raw.lower() or "italia" in raw.lower())):
+        a = _airport_record("GOA")
+        return "GOA", "Genoa", _country_name(a.get("country")) or "Italy"
+
+    # 3. Prioritize city alias before 3-letter airport codes
     if value in CITY_TO_IATA:
         code = CITY_TO_IATA[value]
         a = _airport_record(code)
         city = _city_from_airport(code, a, raw.title())
-        fallback_country = {"DXB": "United Arab Emirates", "BKK": "Thailand", "SIN": "Singapore", "HND": "Japan", "NRT": "Japan", "LHR": "United Kingdom", "CDG": "France", "JFK": "United States", "EWR": "United States", "LAX": "United States", "SFO": "United States", "YYZ": "Canada", "YVR": "Canada", "SYD": "Australia", "MEL": "Australia", "FRA": "Germany", "AMS": "Netherlands", "DOH": "Qatar", "RUH": "Saudi Arabia", "JED": "Saudi Arabia", "IST": "Turkey", "HKG": "Hong Kong", "ICN": "South Korea", "PEK": "China", "DAC": "Bangladesh", "KTM": "Nepal", "KIX": "Japan"}
+        fallback_country = {"DXB": "United Arab Emirates", "BKK": "Thailand", "SIN": "Singapore", "HND": "Japan", "NRT": "Japan", "LHR": "United Kingdom", "CDG": "France", "JFK": "United States", "EWR": "United States", "LAX": "United States", "SFO": "United States", "YYZ": "Canada", "YVR": "Canada", "SYD": "Australia", "MEL": "Australia", "FRA": "Germany", "AMS": "Netherlands", "DOH": "Qatar", "RUH": "Saudi Arabia", "JED": "Saudi Arabia", "IST": "Turkey", "HKG": "Hong Kong", "ICN": "South Korea", "PEK": "China", "DAC": "Bangladesh", "KTM": "Nepal", "KIX": "Japan", "GOA": "Italy"}
         country = _country_name(a.get("country")) or fallback_country.get(code) or ("India" if code in {
             "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR","UDR"
         } else None)
@@ -324,22 +386,110 @@ def _resolve_airport(value: str) -> tuple[str | None, str | None]:
 
 
 def _find_date_range(text: str) -> tuple[str | None, str | None]:
-    patterns = [
+    patterns_with_year = [
         r"(?:from|between)\s+(\d{1,2}[\-/]\d{1,2}[\-/]20\d{2}|20\d{2}[\-/]\d{1,2}[\-/]\d{1,2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})\s+(?:to|until|through|and)\s+(\d{1,2}[\-/]\d{1,2}[\-/]20\d{2}|20\d{2}[\-/]\d{1,2}[\-/]\d{1,2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})",
         r"(\d{1,2}[\-/]\d{1,2}[\-/]20\d{2}|20\d{2}[\-/]\d{1,2}[\-/]\d{1,2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})\s*(?:to|-)\s*(\d{1,2}[\-/]\d{1,2}[\-/]20\d{2}|20\d{2}[\-/]\d{1,2}[\-/]\d{1,2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})",
     ]
-    def parse(v):
-        v=v.replace(",", "")
+    def parse_with_year(v):
+        v = v.replace(",", "")
         for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"):
-            try: return datetime.strptime(v, fmt).date().isoformat()
-            except ValueError: pass
+            try:
+                return datetime.strptime(v, fmt).date().isoformat()
+            except ValueError:
+                pass
         return None
-    for pattern in patterns:
-        m=re.search(pattern, text, flags=re.I)
+    for pattern in patterns_with_year:
+        m = re.search(pattern, text, flags=re.I)
         if m:
-            a,b=parse(m.group(1)),parse(m.group(2))
-            if a and b: return a,b
-    return None,None
+            a, b = parse_with_year(m.group(1)), parse_with_year(m.group(2))
+            if a and b:
+                return a, b
+
+    # Yearless named month ranges: "Oct 14 to Oct 24", "Oct 14 - Oct 24", "Oct 14 to 24", "October 14 to October 24"
+    m_month_first = re.search(
+        r"(?:from\s+)?([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\s*(?:to|-|until|through)\s*(?:([A-Za-z]{3,9})\s+)?(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(20\d{2}))?",
+        text,
+        re.I,
+    )
+    if m_month_first:
+        m1_name, d1_str, m2_name, d2_str, yr_str = m_month_first.groups()
+        m1_key = m1_name.lower()
+        if m1_key in MONTH_MAP:
+            mo1 = MONTH_MAP[m1_key]
+            d1 = int(d1_str)
+            mo2 = MONTH_MAP[m2_name.lower()] if m2_name and m2_name.lower() in MONTH_MAP else mo1
+            d2 = int(d2_str)
+            base_yr = int(yr_str) if yr_str else None
+            start_iso = _resolve_year_for_date(mo1, d1, base_yr)
+            start_date_obj = date.fromisoformat(start_iso)
+            ret_yr = start_date_obj.year + 1 if mo2 < mo1 else start_date_obj.year
+            end_iso = _resolve_year_for_date(mo2, d2, ret_yr)
+            return start_iso, end_iso
+
+    # Day-first named month ranges: "14 Oct to 24 Oct", "14 October - 24 October"
+    m_day_first = re.search(
+        r"(?:from\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\s*(?:to|-|until|through)\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})(?:,?\s*(20\d{2}))?",
+        text,
+        re.I,
+    )
+    if m_day_first:
+        d1_str, m1_name, d2_str, m2_name, yr_str = m_day_first.groups()
+        if m1_name.lower() in MONTH_MAP and m2_name.lower() in MONTH_MAP:
+            mo1 = MONTH_MAP[m1_name.lower()]
+            mo2 = MONTH_MAP[m2_name.lower()]
+            d1 = int(d1_str)
+            d2 = int(d2_str)
+            base_yr = int(yr_str) if yr_str else None
+            start_iso = _resolve_year_for_date(mo1, d1, base_yr)
+            start_date_obj = date.fromisoformat(start_iso)
+            ret_yr = start_date_obj.year + 1 if mo2 < mo1 else start_date_obj.year
+            end_iso = _resolve_year_for_date(mo2, d2, ret_yr)
+            return start_iso, end_iso
+
+    # Day-first with single month at end: "14 to 24 Oct", "14-24 October"
+    m_day_single = re.search(
+        r"(?:from\s+)?\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:to|-|until|through)\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})(?:,?\s*(20\d{2}))?",
+        text,
+        re.I,
+    )
+    if m_day_single:
+        d1_str, d2_str, m_name, yr_str = m_day_single.groups()
+        if m_name.lower() in MONTH_MAP:
+            mo = MONTH_MAP[m_name.lower()]
+            d1 = int(d1_str)
+            d2 = int(d2_str)
+            base_yr = int(yr_str) if yr_str else None
+            start_iso = _resolve_year_for_date(mo, d1, base_yr)
+            start_date_obj = date.fromisoformat(start_iso)
+            ret_yr = start_date_obj.year + 1 if d2 < d1 else start_date_obj.year
+            end_iso = _resolve_year_for_date(mo, d2, ret_yr)
+            return start_iso, end_iso
+
+    # Numeric day/month or month/day ranges without year: "14/10 to 24/10", "14-10 to 24-10"
+    m_num = re.search(
+        r"(?:from\s+)?(\d{1,2})[\-/](\d{1,2})\s*(?:to|-|until|through)\s*(\d{1,2})[\-/](\d{1,2})",
+        text,
+        re.I,
+    )
+    if m_num:
+        n1, n2, n3, n4 = map(int, m_num.groups())
+        if n2 <= 12 and n4 <= 12:
+            d1, mo1, d2, mo2 = n1, n2, n3, n4
+        elif n1 <= 12 and n3 <= 12:
+            mo1, d1, mo2, d2 = n1, n2, n3, n4
+        else:
+            return None, None
+        start_iso = _resolve_year_for_date(mo1, d1)
+        start_date_obj = date.fromisoformat(start_iso)
+        ret_yr = start_date_obj.year + 1 if mo2 < mo1 else start_date_obj.year
+        end_iso = _resolve_year_for_date(mo2, d2, ret_yr)
+        return start_iso, end_iso
+
+    return None, None
+
+
+ROUTE_DELIM = r"(?:,\s*(?:[A-Za-z]{3,9}\s+\d|\d{1,2}\s+[A-Za-z]{3,9}|\d{1,2}\s*(?:to|-)\s*\d{1,2}|\d{1,2}[\-/]\d{1,2}|\d+\s*(?:travelers?|travellers?|adults?|people|guests)|budget|₹|rs\.?|inr)|\s+(?:on|for|under|below|within|budget|with|including|starting|between|from\s+\d|\d{1,2}[\-/]\d{1,2})\b|$)"
+
 
 def _find_route(text: str) -> tuple[str | None, str | None]:
     low = text.lower()
@@ -355,12 +505,13 @@ def _find_route(text: str) -> tuple[str | None, str | None]:
         left = re.sub(r"^(?:please\s+)?plan(?:\s+a)?(?:\s+complete)?(?:\s+\d+\s*(?:day|days|night|nights))?(?:\s+trip)?\s*", "", left.strip(), flags=re.I)
         left = re.sub(r"^(?:a\s+)?trip\s+from\s+", "", left.strip(), flags=re.I)
         right = re.sub(r"\b(?:trip|tour|holiday|vacation)\b", "", right, flags=re.I).strip()
+        right = re.split(r",\s*(?:[A-Za-z]{3,9}\s+\d|\d{1,2}\s+[A-Za-z]{3,9}|\d{1,2}\s*(?:to|-)\s*\d{1,2}|\d{1,2}[\-/]\d{1,2}|\d+\s*(?:travelers?|travellers?|adults?|people|guests)|budget|₹|rs\.?|inr)", right, flags=re.I)[0]
         o, _, _ = _resolve_place(left.strip(" .,;:-"))
         d, _, _ = _resolve_place(right.strip(" .,;:-"))
         return o, d
 
     route = re.search(
-        r"\bfrom\s+(.+?)\s+to\s+(.+?)(?=\s+(?:on|for|under|below|within|budget|with|including|starting|between|from\s+\d|\d{1,2}[\-/]\d{1,2})\b|$)",
+        r"\bfrom\s+(.+?)\s+to\s+(.+?)(?=" + ROUTE_DELIM + r")",
         low,
     )
     if route:
@@ -368,7 +519,7 @@ def _find_route(text: str) -> tuple[str | None, str | None]:
         if o and d:
             return o, d
 
-    m = re.search(r"\b(.+?)\s+to\s+(.+?)(?=\s+(?:on|for|under|below|within|budget|with|including|starting|between)\b|$)", low)
+    m = re.search(r"\b(.+?)\s+to\s+(.+?)(?=" + ROUTE_DELIM + r")", low)
     if m:
         o, d = resolve_pair(m.group(1), m.group(2))
         if o and d:
@@ -409,7 +560,6 @@ def _find_trip_destination(text: str) -> tuple[str | None, str | None, str | Non
         m = re.search(pattern, low)
         if m:
             value = m.group(1).strip(" .,;:-")
-            # Remove leading planner phrases accidentally captured by the first pattern.
             value = re.sub(r"^(?:plan|a|complete|\d+\s*(?:day|days|night|nights))\s+", "", value).strip()
             if not value or value.lower() in STOP_WORDS or len(value) < 3:
                 continue
@@ -432,13 +582,14 @@ def _find_trip_destination(text: str) -> tuple[str | None, str | None, str | Non
 def _find_route_queries(text: str) -> tuple[str | None, str | None]:
     """Return raw endpoint phrases so country-level routes are still represented."""
     low = text.lower()
-    m = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+?)(?=\s+(?:on|for|under|below|within|budget|with|including|starting|between|from\s+\d|\d{1,2}[\-/]\d{1,2})\b|$)", low)
+    m = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+?)(?=" + ROUTE_DELIM + r")", low)
     if not m:
-        m = re.search(r"\b(.+?)\s+to\s+(.+?)(?=\s+(?:on|for|under|below|within|budget|with|including|starting|between)\b|$)", low)
+        m = re.search(r"\b(.+?)\s+to\s+(.+?)(?=" + ROUTE_DELIM + r")", low)
     if not m:
         return None, None
     left = re.sub(r"^(?:please\s+)?plan(?:\s+a)?(?:\s+complete)?(?:\s+\d+\s*(?:day|days|night|nights))?(?:\s+trip)?\s*", "", m.group(1).strip(), flags=re.I)
     right = re.sub(r"\b(?:trip|tour|holiday|vacation)\b", "", m.group(2), flags=re.I).strip()
+    right = re.split(r",\s*(?:[A-Za-z]{3,9}\s+\d|\d{1,2}\s+[A-Za-z]{3,9}|\d{1,2}\s*(?:to|-)\s*\d{1,2}|\d{1,2}[\-/]\d{1,2}|\d+\s*(?:travelers?|travellers?|adults?|people|guests)|budget|₹|rs\.?|inr)", right, flags=re.I)[0]
     return left.strip(" .,;:-"), right.strip(" .,;:-")
 
 
@@ -451,9 +602,9 @@ def _find_passengers(text: str, previous: dict[str, Any] | None = None) -> dict[
     infants = previous.get("infants", 0) or 0
 
     patterns = [
-        ("adults", r"(?:([0-9]+)\s*(?:adult|adults)|adult(?:s)?\s*[:=]?\s*([0-9]+))"),
-        ("children", r"(?:([0-9]+)\s*(?:child|children|kid|kids)|(?:child(?:ren)?|kids?)\s*[:=]?\s*([0-9]+))"),
-        ("infants", r"(?:([0-9]+)\s*(?:infant|infants|baby|babies)|(?:infant(?:s)?|bab(?:y|ies))\s*[:=]?\s*([0-9]+))"),
+        ("adults", r"(?:([0-9]+)\s*(?:adults?|travellers?|travelers?|people|persons?|guests?|pax)|(?:adults?|travellers?|travelers?|guests?)\s*[:=]?\s*([0-9]+))"),
+        ("children", r"(?:([0-9]+)\s*(?:children|child|kids?)|(?:children|child|kids?)\s*[:=]?\s*([0-9]+))"),
+        ("infants", r"(?:([0-9]+)\s*(?:infants?|babies|baby)|(?:infants?|bab(?:y|ies))\s*[:=]?\s*([0-9]+))"),
     ]
     for key, pattern in patterns:
         m = re.search(pattern, low)
@@ -465,18 +616,17 @@ def _find_passengers(text: str, previous: dict[str, Any] | None = None) -> dict[
                 elif key == "children": children = parsed
                 else: infants = parsed
 
-    # Common compact forms: "for 3 people", "for 5 travellers".
-    m = re.search(r"\bfor\s+(\d+)\s+(?:people|persons|passengers|travellers|travelers)\b", low)
-    if m and not any(re.search(pattern, low) for _, pattern in patterns):
+    # Common forms: "2 travelers", "for 3 people", "for 5 travellers", "party of 4"
+    m = re.search(r"\b(?:for\s+|party\s+of\s+)?(\d+)\s*(?:people|persons?|passengers?|travellers?|travelers?|guests?|adults?|pax)\b", low)
+    if m and not any(re.search(pattern, low) for key, pattern in patterns if key in ("children", "infants")):
         adults = max(1, int(m.group(1)))
 
     # Revision forms: "change it to 5 people", "make it 4 travellers".
-    m = re.search(r"\b(?:change|make|set)\b.*?\b(?:to|for)\s+(\d+)\s+(?:people|persons|passengers|travellers|travelers)\b", low)
+    m = re.search(r"\b(?:change|make|set)\b.*?\b(?:to|for)\s+(\d+)\s+(?:people|persons|passengers|travellers|travelers|guests|adults)\b", low)
     if m:
         adults = max(1, int(m.group(1)))
         children = 0
         infants = 0
-
     return {"adults": int(adults), "children": int(children), "infants": int(infants)}
 
 
@@ -579,7 +729,13 @@ def parse_trip_request(
 
     origin_query = (previous.get("origin_query") if is_canonical else None) or raw_origin or origin
     destination_query = (previous.get("destination_query") if is_canonical else None) or raw_destination or destination
-    origin_iata, origin_city, origin_country = _resolve_place(origin) if origin else (None, None, None)
+    if origin == "GOA" and (trip_origin_city == "Genoa" or (route_origin_info and route_origin_info[1] == "Genoa") or "genoa" in text.lower()):
+        origin_iata, origin_city, origin_country = "GOA", "Genoa", "Italy"
+    elif route_origin_info and route_origin_info[0] is not None and origin == route_origin_info[0]:
+        origin_iata, origin_city, origin_country = route_origin_info
+    else:
+        origin_iata, origin_city, origin_country = _resolve_place(origin) if origin else (None, None, None)
+
     if is_canonical and previous.get("origin_country"):
         origin_country = previous.get("origin_country")
     elif not origin_country:
@@ -589,7 +745,13 @@ def parse_trip_request(
     if origin_city and origin_country and origin_city.lower() == origin_country.lower():
         origin_city = None
 
-    destination_iata, destination_city, destination_country = _resolve_place(destination) if destination else (None, None, None)
+    if destination == "GOA" and (trip_destination_city == "Genoa" or (route_destination_info and route_destination_info[1] == "Genoa") or "genoa" in text.lower()):
+        destination_iata, destination_city, destination_country = "GOA", "Genoa", "Italy"
+    elif route_destination_info and route_destination_info[0] is not None and destination == route_destination_info[0]:
+        destination_iata, destination_city, destination_country = route_destination_info
+    else:
+        destination_iata, destination_city, destination_country = _resolve_place(destination) if destination else (None, None, None)
+
     origin = origin_iata or origin
     destination = destination_iata or destination
     if is_canonical and previous.get("destination_country"):
@@ -648,6 +810,7 @@ def parse_trip_request(
         "journey_scope": journey_scope,
         "duration_days": duration or 5,
         "budget_amount": budget,
+        "currency": _find_currency(text, previous),
         "departure_date": departure_date,
         "return_date": return_date,
         "travel_dates": (f"{departure_date} to {return_date}" if departure_date and return_date else (departure_date or "Flexible dates")),
@@ -806,11 +969,51 @@ def budget_from_live_data(
             cheapest_flight = None
     else:
         cheapest_flight = None
+    if hotel_offers is None and isinstance(hotel_text, list):
+        hotel_offers = hotel_text
+        hotel_text = ""
     hotel_offers = hotel_offers or []
-    hotel_prices = [float(o.get("price_inr")) for o in hotel_offers if o.get("price_inr") is not None and float(o.get("price_inr")) > 0]
-    if hotel_prices:
-        hotel_estimate = min(hotel_prices)
-        hotel_source = "live dual-provider hotel offer"
+    duration_days = max(1, int(constraints.get("duration_days") or 5))
+    trip_nights = max(1, duration_days - 1)
+
+    normalized_hotel_stays: list[float] = []
+    primary_pricing_basis = "unknown"
+
+    for o in hotel_offers:
+        basis = getattr(o, "pricing_basis", None) or (o.get("pricing_basis") if isinstance(o, dict) else None)
+        if hasattr(o, "nights") and hasattr(o, "price"):
+            price_val = float(o.price.inr_reference_amount) if getattr(o.price, "inr_reference_amount", None) is not None else float(o.price.total_amount)
+            if price_val > 0:
+                normalized_hotel_stays.append(price_val)
+                primary_pricing_basis = "full_stay"
+        elif isinstance(o, dict):
+            p_inr = o.get("price_inr") or o.get("price") or o.get("price_total") or o.get("total_amount")
+            if p_inr is not None and float(p_inr) > 0:
+                val = float(p_inr)
+                offer_nights = int(o.get("nights") or 0)
+                if basis == "per_night" or "night" in str(o.get("rate_type") or "").lower():
+                    stay_nights = offer_nights if offer_nights > 0 else trip_nights
+                    normalized_hotel_stays.append(val * stay_nights)
+                    primary_pricing_basis = "per_night"
+                elif basis == "full_stay" or offer_nights > 1 or o.get("total_price") is not None:
+                    normalized_hotel_stays.append(val)
+                    primary_pricing_basis = "full_stay"
+                else:
+                    # basis is missing, "unknown", or any other unrecognized value.
+                    # We do NOT invent a pricing interpretation — skip this offer entirely
+                    # so the budget falls back to the text-snippet estimate rather than
+                    # silently assuming a semantics we cannot verify.
+                    import logging as _logging
+                    _logging.getLogger("trusttrip.budget").warning(
+                        "Hotel offer '%s' has unrecognized pricing_basis=%r; "
+                        "skipping offer to avoid silent full_stay assumption.",
+                        o.get("id", "<unknown>"),
+                        basis,
+                    )
+
+    if normalized_hotel_stays:
+        hotel_estimate = min(normalized_hotel_stays)
+        hotel_source = f"live dual-provider hotel offer ({primary_pricing_basis})"
     else:
         hotel_text = _provider_text(hotel_text)
         snippet_prices = []
@@ -819,9 +1022,9 @@ def budget_from_live_data(
             if 500 <= value <= 100000:
                 snippet_prices.append(value)
         nightly = min(snippet_prices) if snippet_prices else 1800.0
-        nights = max(1, int(constraints.get("duration_days") or 5) - 1)
-        hotel_estimate = nightly * nights
-        hotel_source = "planning estimate" if not snippet_prices else "live search snippet"
+        hotel_estimate = nightly * trip_nights
+        primary_pricing_basis = "estimated_per_night" if snippet_prices else "unknown"
+        hotel_source = "planning estimate (fallback)" if not snippet_prices else "live search snippet (per-night estimate)"
     local = 1200.0 * max(1, int(constraints.get("duration_days") or 5))
     activities = 900.0 * max(1, int(constraints.get("duration_days") or 5))
     flight = cheapest_flight or 0.0
@@ -846,8 +1049,23 @@ def budget_from_live_data(
         "contingency": round(contingency, 2),
         "estimated_total": round(total, 2),
         "target_budget": target,
+        "flight_estimate_inr": round(flight, 2),
+        "hotel_estimate_inr": round(hotel_estimate, 2),
+        "local_transport_estimate_inr": round(local, 2),
+        "activities_estimate_inr": round(activities, 2),
+        "contingency_inr": round(contingency, 2),
+        "estimated_total_inr": round(total, 2),
+        "target_budget_inr": target,
+        "breakdown": {
+            "Flights": round(flight, 2),
+            "Accommodation": round(hotel_estimate, 2),
+            "Local Transit": round(local, 2),
+            "Activities": round(activities, 2),
+            "Contingency": round(contingency, 2),
+        },
         "within_budget": (target is None or total <= float(target)),
         "hotel_price_source": hotel_source,
+        "hotel_pricing_basis": primary_pricing_basis,
         "recommended_hotel_id": (next((o for o in hotel_offers if o.get("is_recommended")), hotel_offers[0] if hotel_offers else {}) or {}).get("id"),
         "recommended_hotel_price_inr": (next((o for o in hotel_offers if o.get("is_recommended")), hotel_offers[0] if hotel_offers else {}) or {}).get("price_inr"),
         "passenger_count": passenger_count,

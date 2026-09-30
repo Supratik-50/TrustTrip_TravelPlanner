@@ -172,14 +172,36 @@ async def travel_planner(
 
         # Identify target canonical trip if available
         target_trip_id = request_data.trip_id
-        if not target_trip_id and request_data.thread_id:
-            try:
-                from services.trip_store import TripStore
-                th = TripStore().get_thread(request_data.thread_id, current_user.id)
-                if th and th.get("trip_id"):
-                    target_trip_id = str(th["trip_id"])
-            except Exception:
-                pass
+        if request_data.thread_id:
+            from services.trip_store import TripStore
+            ts = TripStore()
+            th = ts.get_thread(request_data.thread_id, current_user.id)
+            if not th:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Thread '{request_data.thread_id}' not found or does not belong to the user.",
+                )
+            thread_trip_id = th.get("trip_id")
+            if target_trip_id and thread_trip_id and str(target_trip_id) != str(thread_trip_id):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "success": False,
+                        "error": f"Trip ID mismatch: thread bound to trip {thread_trip_id} but request specified trip {target_trip_id}",
+                    },
+                )
+            if not target_trip_id and thread_trip_id:
+                target_trip_id = str(thread_trip_id)
+
+        if target_trip_id:
+            from services.trip_store import TripStore
+            ts = TripStore()
+            trip_rec = ts.get_trip(target_trip_id, current_user.id)
+            if not trip_rec:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Trip '{target_trip_id}' not found or access denied.",
+                )
 
         result = run_travel_agent(
             user_input=user_message,
@@ -188,34 +210,63 @@ async def travel_planner(
             trip_id=target_trip_id,
         )
 
-        # If a canonical trip is bound, persist generated plan into trip metadata
-        if target_trip_id and (result.get("success") is not False):
-            try:
-                from services.trip_store import TripStore
-                from fastapi.encoders import jsonable_encoder
-                ts = TripStore()
-                trip_record = ts.get_trip(target_trip_id, current_user.id)
-                logger.info("Persisting plan for trip %s, found=%s", target_trip_id, bool(trip_record))
-                if trip_record:
-                    meta = trip_record.get("metadata") or {}
-                    if isinstance(meta, str):
-                        import json
-                        meta = json.loads(meta)
-                    meta = dict(meta)
-                    if result.get("plan_json"):
-                        meta["plan"] = jsonable_encoder(result.get("plan_json"))
-                    if result.get("answer") or result.get("itinerary"):
-                        meta["raw_plan"] = str(result.get("answer") or result.get("itinerary"))
-                    assigned_thread = result.get("thread_id") or request_data.thread_id
-                    if assigned_thread:
-                        meta["thread_id"] = str(assigned_thread)
-                    updated = ts.update_trip(target_trip_id, current_user.id, metadata=meta, status="planning")
-                    logger.info("Trip %s updated with plan: %s", target_trip_id, bool(updated))
-            except Exception as store_err:
-                logger.error("Failed to persist travel plan to trip metadata: %s", store_err, exc_info=True)
+        # Determine actual success
+        planner_success = result.get("success")
+        if planner_success is None:
+            if result.get("guardrail_allowed") is False or result.get("planning_blocked") is True or result.get("error"):
+                planner_success = False
+            else:
+                planner_success = True
 
         from fastapi.encoders import jsonable_encoder
         out_dict = dict(result)
+
+        if not planner_success:
+            err_msg = result.get("error") or result.get("guardrail_reason") or "Travel planning failed."
+            status_code = result.get("status_code", 422 if result.get("guardrail_allowed") is False else 500)
+            out_dict["success"] = False
+            out_dict["error"] = err_msg
+            return JSONResponse(
+                status_code=status_code,
+                content=jsonable_encoder(out_dict)
+            )
+
+        # If a canonical trip is bound and planner succeeded, persist generated plan into trip metadata.
+        # Persistence is REQUIRED when a canonical trip_id is present.
+        # A failure here must NOT be silently swallowed — the caller cannot distinguish
+        # "generated and persisted" from "generated only" if we return success=True on error.
+        if target_trip_id:
+            from services.trip_store import TripStore
+            ts = TripStore()
+            trip_record = ts.get_trip(target_trip_id, current_user.id)
+            logger.info("Persisting plan for trip %s, found=%s", target_trip_id, bool(trip_record))
+            if trip_record:
+                meta = trip_record.get("metadata") or {}
+                if isinstance(meta, str):
+                    import json
+                    meta = json.loads(meta)
+                meta = dict(meta)
+                if result.get("plan_json"):
+                    meta["plan"] = jsonable_encoder(result.get("plan_json"))
+                if result.get("answer") or result.get("itinerary"):
+                    meta["raw_plan"] = str(result.get("answer") or result.get("itinerary"))
+                assigned_thread = result.get("thread_id") or request_data.thread_id
+                if assigned_thread:
+                    meta["thread_id"] = str(assigned_thread)
+                try:
+                    updated = ts.update_trip(target_trip_id, current_user.id, metadata=meta, status="planning")
+                    logger.info("Trip %s updated with plan: %s", target_trip_id, bool(updated))
+                    if not updated:
+                        raise RuntimeError(
+                            f"Trip metadata persistence returned no record for trip {target_trip_id}."
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as store_err:
+                    raise RuntimeError(
+                        f"Failed to persist travel plan to trip {target_trip_id}: {store_err}"
+                    ) from store_err
+
         out_dict["success"] = True
         return JSONResponse(
             content=jsonable_encoder(out_dict)
@@ -226,12 +277,14 @@ async def travel_planner(
     except ValueError as v_exc:
         logger.error("Validation error in travel planner: %s", v_exc)
         return JSONResponse(
-            status_code=422,
+            status_code=400,
             content={
                 "success": False,
                 "error": str(v_exc),
             },
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Error processing travel request: %s", exc)
         return JSONResponse(

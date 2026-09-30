@@ -119,7 +119,7 @@ export const BookingReviewPanel: React.FC<BookingReviewPanelProps> = ({
                 <div className="text-xs text-[var(--text-muted)] font-mono flex items-center justify-between pt-1 border-t border-[var(--border)]/60">
                   <span>Departure: {trip.start_date}</span>
                   <span className="font-bold text-[var(--text-primary)] font-editorial text-sm">
-                    ${Number(flight.total_amount).toLocaleString()}
+                    {formatCurrency(Number(flight.total_amount), flight.currency || bookingCurrency)}
                   </span>
                 </div>
               </div>
@@ -161,7 +161,7 @@ export const BookingReviewPanel: React.FC<BookingReviewPanelProps> = ({
                 <div className="text-xs text-[var(--text-muted)] font-mono flex items-center justify-between pt-1 border-t border-[var(--border)]/60">
                   <span>{trip.start_date} — {trip.end_date}</span>
                   <span className="font-bold text-[var(--text-primary)] font-editorial text-sm">
-                    ${Number(hotel.total_amount).toLocaleString()}
+                    {formatCurrency(Number(hotel.total_amount), hotel.currency || bookingCurrency)}
                   </span>
                 </div>
               </div>
