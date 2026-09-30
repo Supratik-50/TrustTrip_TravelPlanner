@@ -29,6 +29,7 @@ CITY_TO_IATA = {
     "istanbul": "IST", "hong kong": "HKG", "seoul": "ICN", "beijing": "PEK",
     "dhaka": "DAC", "dubai": "DXB", "bangkok": "BKK", "singapore": "SIN",
     "kathmandu": "KTM", "tokyo": "HND", "london": "LHR", "paris": "CDG",
+    "kyoto": "KIX", "udaipur": "UDR",
 }
 
 CITY_TO_NAME = {
@@ -38,13 +39,13 @@ CITY_TO_NAME = {
     "BBI": "Bhubaneswar", "IXR": "Ranchi", "STV": "Surat", "ATQ": "Amritsar", "COK": "Kochi",
     "LKO": "Lucknow", "VNS": "Varanasi", "NAG": "Nagpur", "IDR": "Indore", "IXC": "Chandigarh",
     "CJB": "Coimbatore", "SXR": "Srinagar", "IXE": "Mangalore", "VTZ": "Visakhapatnam", "RAJ": "Rajkot",
-    "BDQ": "Vadodara", "BHO": "Bhopal", "DED": "Dehradun", "AGR": "Agra", "JFK": "New York",
+    "BDQ": "Vadodara", "BHO": "Bhopal", "DED": "Dehradun", "AGR": "Agra", "UDR": "Udaipur", "JFK": "New York",
     "EWR": "Newark", "LAX": "Los Angeles", "SFO": "San Francisco", "ORD": "Chicago", "YYZ": "Toronto",
     "YVR": "Vancouver", "SYD": "Sydney", "MEL": "Melbourne", "FRA": "Frankfurt", "AMS": "Amsterdam",
     "DOH": "Doha", "RUH": "Riyadh", "JED": "Jeddah", "IST": "Istanbul", "HKG": "Hong Kong",
     "ICN": "Seoul", "PEK": "Beijing", "DAC": "Dhaka", "DXB": "Dubai",
     "BKK": "Bangkok", "SIN": "Singapore", "KTM": "Kathmandu", "HND": "Tokyo", "NRT": "Tokyo",
-    "LHR": "London", "CDG": "Paris",
+    "LHR": "London", "CDG": "Paris", "KIX": "Kyoto",
 }
 
 
@@ -155,11 +156,13 @@ def _country_name(code_or_name: str | None) -> str:
 
 def _city_from_airport(code: str, record: dict[str, Any], default: str = "") -> str:
     """Extract clean city name without leaking airport suffix."""
+    if default and len(default) >= 3 and not default.isupper():
+        return default
+    if code in CITY_TO_NAME:
+        return CITY_TO_NAME[code]
     city = str(record.get("city") or "").strip()
     if city:
         return city
-    if code in CITY_TO_NAME:
-        return CITY_TO_NAME[code]
     name = str(record.get("name") or "").strip()
     for suffix in (" International Airport", " Airport", " Aerodrome", " Air Base", " Station"):
         if name.endswith(suffix):
@@ -177,14 +180,56 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     country metadata for planning and ask for a departure city when required.
     """
     raw = _clean(value)
+    if not raw:
+        return None, None, None
+
+    airports = _airport_catalog()
+
+    # 1. Handle explicit IATA code in parentheses, e.g. "Kolkata (CCU)" or "London (LHR)"
+    m_paren = re.search(r"\(([A-Za-z]{3})\)", raw)
+    if m_paren:
+        code_cand = m_paren.group(1).upper()
+        if code_cand in airports:
+            a = airports[code_cand]
+            city_prefix = raw[:m_paren.start()].strip()
+            city = city_prefix.title() if city_prefix else _city_from_airport(code_cand, a, code_cand)
+            country = _country_name(a.get("country"))
+            return code_cand, city, country
+        if code_cand in CITY_TO_NAME:
+            city_prefix = raw[:m_paren.start()].strip()
+            return code_cand, (city_prefix.title() if city_prefix else CITY_TO_NAME[code_cand]), ("India" if code_cand in {
+                "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR"
+            } else "")
+
+    # 2. Handle comma-separated place and country, e.g. "Goa, India" or "Paris, France"
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) >= 2:
+            sub_code, sub_city, sub_country = _resolve_place(parts[0])
+            hint_country = _country_name(parts[1]) or parts[1].title()
+            if sub_code:
+                return sub_code, sub_city, (sub_country or hint_country)
+            elif sub_city:
+                return None, sub_city, (sub_country or hint_country)
+
     value = raw.lower()
     STOP_WORDS = {"a", "an", "the", "my", "our", "this", "that", "trip", "tour", "plan", "days", "day", "night", "nights"}
     if not value or value in STOP_WORDS:
         return None, None, None
 
-    airports = _airport_catalog()
+    # 3. Prioritize city alias before 3-letter airport codes so "goa" resolves to GOI (India) rather than Genoa (Italy)
+    if value in CITY_TO_IATA:
+        code = CITY_TO_IATA[value]
+        a = _airport_record(code)
+        city = _city_from_airport(code, a, raw.title())
+        fallback_country = {"DXB": "United Arab Emirates", "BKK": "Thailand", "SIN": "Singapore", "HND": "Japan", "NRT": "Japan", "LHR": "United Kingdom", "CDG": "France", "JFK": "United States", "EWR": "United States", "LAX": "United States", "SFO": "United States", "YYZ": "Canada", "YVR": "Canada", "SYD": "Australia", "MEL": "Australia", "FRA": "Germany", "AMS": "Netherlands", "DOH": "Qatar", "RUH": "Saudi Arabia", "JED": "Saudi Arabia", "IST": "Turkey", "HKG": "Hong Kong", "ICN": "South Korea", "PEK": "China", "DAC": "Bangladesh", "KTM": "Nepal", "KIX": "Japan"}
+        country = _country_name(a.get("country")) or fallback_country.get(code) or ("India" if code in {
+            "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR","UDR"
+        } else None)
+        return code, city, country
 
-    if len(raw) == 3 and raw.upper() in airports:
+    # 4. Explicit 3-letter IATA code if not a known city collision (like GOA)
+    if len(raw) == 3 and raw.upper() in airports and raw.upper() not in {"GOA"}:
         code = raw.upper()
         a = airports[code]
         city = _city_from_airport(code, a, raw.title())
@@ -194,18 +239,8 @@ def _resolve_place(value: str) -> tuple[str | None, str | None, str | None]:
     if len(raw) == 3 and raw.upper() in CITY_TO_NAME:
         code = raw.upper()
         return code, CITY_TO_NAME[code], ("India" if code in {
-            "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR"
+            "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR","UDR"
         } else "")
-
-    if value in CITY_TO_IATA:
-        code = CITY_TO_IATA[value]
-        a = _airport_record(code)
-        city = _city_from_airport(code, a, raw.title())
-        fallback_country = {"DXB": "United Arab Emirates", "BKK": "Thailand", "SIN": "Singapore", "HND": "Japan", "NRT": "Japan", "LHR": "United Kingdom", "CDG": "France", "JFK": "United States", "EWR": "United States", "LAX": "United States", "SFO": "United States", "YYZ": "Canada", "YVR": "Canada", "SYD": "Australia", "MEL": "Australia", "FRA": "Germany", "AMS": "Netherlands", "DOH": "Qatar", "RUH": "Saudi Arabia", "JED": "Saudi Arabia", "IST": "Turkey", "HKG": "Hong Kong", "ICN": "South Korea", "PEK": "China", "DAC": "Bangladesh", "KTM": "Nepal"}
-        country = _country_name(a.get("country")) or fallback_country.get(code) or ("India" if code in {
-            "CCU","DEL","BOM","BLR","MAA","HYD","PNQ","AMD","JAI","GOI","GAU","PAT","BBI","IXR","STV","ATQ","COK","LKO","VNS","NAG","IDR","IXC","CJB","SXR","IXE","VTZ","RAJ","BDQ","BHO","DED","AGR"
-        } else None)
-        return code, city, country
 
     country_aliases = {
         "india":"India", "japan":"Japan", "thailand":"Thailand", "uae":"United Arab Emirates",
@@ -308,10 +343,12 @@ def _find_date_range(text: str) -> tuple[str | None, str | None]:
 
 def _find_route(text: str) -> tuple[str | None, str | None]:
     low = text.lower()
-    m = re.search(r"\b([a-z]{3})\s*(?:to|→|->)\s*([a-z]{3})\b", low)
+    m = re.search(r"\b([a-z]{3})\s+to\s+([a-z]{3})\b|\b([a-z]{3})\s*(?:→|->)\s*([a-z]{3})\b", low)
     if m:
-        a, _, _ = _resolve_place(m.group(1))
-        b, _, _ = _resolve_place(m.group(2))
+        c1 = m.group(1) or m.group(3)
+        c2 = m.group(2) or m.group(4)
+        a, _, _ = _resolve_place(c1)
+        b, _, _ = _resolve_place(c2)
         return a, b
 
     def resolve_pair(left: str, right: str):
@@ -483,7 +520,8 @@ def parse_trip_request(
     else:
         previous_dict = {}
 
-    previous = previous_dict if _is_follow_up_request(text) else {}
+    is_canonical = bool(previous_dict.get("_is_canonical") or previous_dict.get("trip_id"))
+    previous = previous_dict if (is_canonical or _is_follow_up_request(text)) else {}
     origin, destination = _find_route(text)
     raw_origin, raw_destination = _find_route_queries(text)
     route_origin_info = _resolve_place(raw_origin) if raw_origin else (None, None, None)
@@ -501,6 +539,24 @@ def parse_trip_request(
     range_start, range_end = _find_date_range(text)
     departure_date = range_start or _find_date(text)
     passengers = _find_passengers(text, previous)
+
+    if is_canonical:
+        # In an authoritative canonical trip, hard constraints (origin, destination, dates, duration, passengers, budget)
+        # come strictly from the authoritative canonical trip unless the user explicitly requested a change.
+        if previous.get("origin"):
+            origin = previous.get("origin")
+        if previous.get("destination"):
+            destination = previous.get("destination")
+        if previous.get("departure_date"):
+            departure_date = previous.get("departure_date")
+        if previous.get("return_date"):
+            range_end = previous.get("return_date")
+        if previous.get("duration_days"):
+            duration = previous.get("duration_days")
+        if previous.get("budget_amount") is not None:
+            budget = previous.get("budget_amount")
+        if previous.get("adults"):
+            passengers["adults"] = int(previous.get("adults"))
 
     if destination is None and trip_destination:
         destination = trip_destination
@@ -521,23 +577,27 @@ def parse_trip_request(
         except ValueError:
             pass
 
-    origin_query = raw_origin or origin
-    destination_query = raw_destination or destination
+    origin_query = (previous.get("origin_query") if is_canonical else None) or raw_origin or origin
+    destination_query = (previous.get("destination_query") if is_canonical else None) or raw_destination or destination
     origin_iata, origin_city, origin_country = _resolve_place(origin) if origin else (None, None, None)
-    if not origin_country:
+    if is_canonical and previous.get("origin_country"):
+        origin_country = previous.get("origin_country")
+    elif not origin_country:
         origin_country = route_origin_info[2] or trip_origin_country or previous.get("origin_country") or ""
     origin_country = _country_name(origin_country)
-    origin_city = origin_city or route_origin_info[1] or trip_origin_city or previous.get("origin_city")
+    origin_city = (previous.get("origin_city") if is_canonical else None) or origin_city or route_origin_info[1] or trip_origin_city
     if origin_city and origin_country and origin_city.lower() == origin_country.lower():
         origin_city = None
 
     destination_iata, destination_city, destination_country = _resolve_place(destination) if destination else (None, None, None)
-    origin = origin_iata
-    destination = destination_iata
-    if not destination_country:
+    origin = origin_iata or origin
+    destination = destination_iata or destination
+    if is_canonical and previous.get("destination_country"):
+        destination_country = previous.get("destination_country")
+    elif not destination_country:
         destination_country = route_destination_info[2] or trip_destination_country or previous.get("destination_country") or ""
     destination_country = _country_name(destination_country)
-    destination_city = destination_city or route_destination_info[1] or trip_destination_city or previous.get("destination_city")
+    destination_city = (previous.get("destination_city") if is_canonical else None) or destination_city or route_destination_info[1] or trip_destination_city
     if destination_city and destination_country and destination_city.lower() == destination_country.lower():
         destination_city = None
 

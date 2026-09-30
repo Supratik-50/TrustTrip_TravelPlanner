@@ -5,8 +5,11 @@ and delegating to LangGraph without polluting API routes or low-level agents.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 import uuid
+from datetime import date
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -16,7 +19,7 @@ from domain.compat import build_trip_request, trip_request_to_legacy
 from domain.research import TripIntent
 from domain.trip import TripRequest
 from services.intent_router import IntentDecision, IntentRouter
-from services.travel_planner import parse_trip_request
+from services.travel_planner import parse_trip_request, _resolve_place
 from services.trip_store import TripStore
 from services.search_session_store import SearchSessionStore
 from services.travel_intelligence.duffel_adapter import DuffelFlightAdapter
@@ -57,19 +60,34 @@ class PlannerService:
         """Execute universal travel planning request."""
         from backend import travel_graph, _serialize_result, _empty_constraints
 
-        # 1. Authorize thread and trip ownership
+        # 1. Authorize thread and trip ownership and resolve canonical trip
+        target_trip_id = trip_id
+        canonical_trip_record: dict[str, Any] | None = None
         if authenticated_user_id:
             if thread_id:
                 if not self.trip_store.verify_thread_ownership(thread_id, authenticated_user_id):
                     raise PermissionError(
                         f"Access denied: Thread '{thread_id}' does not belong to the authenticated user."
                     )
+                if not target_trip_id:
+                    th = self.trip_store.get_thread(thread_id, authenticated_user_id)
+                    if th and th.get("trip_id"):
+                        target_trip_id = str(th["trip_id"])
             else:
                 created = self.trip_store.create_thread(
                     user_id=authenticated_user_id,
                     trip_id=trip_id,
                 )
                 thread_id = str(created["id"])
+                if not target_trip_id and created.get("trip_id"):
+                    target_trip_id = str(created["trip_id"])
+
+            if target_trip_id:
+                canonical_trip_record = self.trip_store.get_trip(target_trip_id, authenticated_user_id)
+                if not canonical_trip_record:
+                    raise PermissionError(
+                        f"Access denied: Trip '{target_trip_id}' does not exist or does not belong to the user."
+                    )
         else:
             if not thread_id:
                 thread_id = f"user_{uuid.uuid4().hex}"
@@ -92,6 +110,80 @@ class PlannerService:
                 )
             except Exception:
                 existing_trip = None
+
+        has_canonical_constraints = bool(
+            canonical_trip_record
+            and (canonical_trip_record.get("destination") or canonical_trip_record.get("origin"))
+        )
+        canonical_constraints: dict[str, Any] | None = None
+        if has_canonical_constraints and canonical_trip_record:
+            origin_raw = canonical_trip_record.get("origin") or ""
+            dest_raw = canonical_trip_record.get("destination") or ""
+            meta = canonical_trip_record.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            meta = dict(meta)
+
+            start_date = meta.get("start_date") or meta.get("departure_date")
+            end_date = meta.get("end_date") or meta.get("return_date")
+            travelers_count = int(meta.get("travelers_count") or meta.get("passengers") or meta.get("adults") or 1)
+            budget_val = meta.get("budget") or meta.get("budget_amount")
+            currency_val = meta.get("currency") or "INR"
+            style_val = meta.get("travel_style") or meta.get("style") or ""
+            rev_num = canonical_trip_record.get("current_revision_number", 0)
+
+            orig_code, orig_city, orig_country = _resolve_place(origin_raw) if origin_raw else (None, None, None)
+            dest_code, dest_city, dest_country = _resolve_place(dest_raw) if dest_raw else (None, None, None)
+
+            duration_days = 5
+            if start_date and end_date:
+                try:
+                    d_start = date.fromisoformat(str(start_date)[:10])
+                    d_end = date.fromisoformat(str(end_date)[:10])
+                    calc_dur = (d_end - d_start).days + 1
+                    if calc_dur > 0:
+                        duration_days = calc_dur
+                except Exception:
+                    pass
+            elif meta.get("duration_days"):
+                duration_days = int(meta["duration_days"])
+
+            canonical_constraints = {
+                "origin": orig_code,
+                "origin_query": origin_raw,
+                "origin_city": orig_city or origin_raw,
+                "origin_country": orig_country or "",
+                "destination": dest_code,
+                "destination_query": dest_raw,
+                "destination_city": dest_city or dest_raw,
+                "destination_country": dest_country or "",
+                "departure_date": str(start_date) if start_date else None,
+                "return_date": str(end_date) if end_date else None,
+                "duration_days": duration_days,
+                "adults": travelers_count,
+                "budget_amount": float(budget_val) if budget_val is not None else None,
+                "currency": currency_val,
+                "travel_style": style_val,
+                "_is_canonical": True,
+                "trip_id": str(canonical_trip_record["id"]),
+            }
+
+            authoritative_canonical_trip = build_trip_request(
+                canonical_constraints,
+                trip_id=canonical_trip_record["id"],
+                user_id=authenticated_user_id,
+                thread_id=thread_id,
+                original_query=user_input,
+                intent=TripIntent.FOLLOW_UP,
+                revision=rev_num,
+            )
+
+            # Active canonical trip anchors existing_trip if not yet initialized
+            if not existing_trip or str(getattr(existing_trip, "trip_id", "")) != str(canonical_trip_record["id"]):
+                existing_trip = authoritative_canonical_trip
 
         # 3. Intent Routing
         decision: IntentDecision = self.intent_router.classify_intent(
@@ -196,7 +288,50 @@ class PlannerService:
             return serialized
 
         # 6. Resolve Canonical TripRequest for Planning
-        if decision.intent == TripIntent.NEW_TRIP or not existing_trip:
+        if has_canonical_constraints and canonical_constraints and canonical_trip_record:
+            # Planning inside an authoritative canonical trip.
+            # User preferences enrich the itinerary, but hard trip constraints (origin, destination, dates, travelers, budget)
+            # are strictly preserved unless the user explicitly requested a change.
+            if decision.changes and decision.changes.changed_fields:
+                canonical_trip = apply_trip_change_set(existing_trip, decision.changes)
+                canonical_trip = canonical_trip.model_copy(update={
+                    "intent": TripIntent.FOLLOW_UP,
+                    "original_query": user_input,
+                    "revision": existing_trip.revision + 1,
+                })
+            else:
+                prev_legacy = trip_request_to_legacy(existing_trip)
+                prev_legacy["_is_canonical"] = True
+                parsed = parse_trip_request(user_input, previous=prev_legacy)
+
+                # Authoritative canonical trip constraints ALWAYS WIN over arbitrary prompt text
+                parsed["origin"] = canonical_constraints.get("origin")
+                parsed["origin_city"] = canonical_constraints.get("origin_city")
+                parsed["origin_country"] = canonical_constraints.get("origin_country")
+                parsed["origin_query"] = canonical_constraints.get("origin_query")
+                parsed["destination"] = canonical_constraints.get("destination")
+                parsed["destination_city"] = canonical_constraints.get("destination_city")
+                parsed["destination_country"] = canonical_constraints.get("destination_country")
+                parsed["destination_query"] = canonical_constraints.get("destination_query")
+                parsed["departure_date"] = canonical_constraints.get("departure_date")
+                parsed["return_date"] = canonical_constraints.get("return_date")
+                parsed["duration_days"] = canonical_constraints.get("duration_days")
+                parsed["adults"] = canonical_constraints.get("adults")
+                if canonical_constraints.get("budget_amount") is not None:
+                    parsed["budget_amount"] = canonical_constraints.get("budget_amount")
+                parsed["currency"] = canonical_constraints.get("currency")
+                parsed["_is_canonical"] = True
+
+                canonical_trip = build_trip_request(
+                    parsed,
+                    trip_id=existing_trip.trip_id,
+                    thread_id=thread_id,
+                    user_id=authenticated_user_id,
+                    original_query=user_input,
+                    intent=TripIntent.FOLLOW_UP,
+                    revision=existing_trip.revision + (1 if existing_state else 0),
+                )
+        elif decision.intent == TripIntent.NEW_TRIP or not existing_trip:
             # Standalone new trip: completely clean context, no previous route/passenger/budget leakage
             raw_constraints = parse_trip_request(user_input, previous={})
             canonical_trip = build_trip_request(
@@ -217,7 +352,6 @@ class PlannerService:
                     "revision": existing_trip.revision + 1,
                 })
             else:
-                # Ambiguous refinement: re-parse with existing legacy projection as fallback
                 prev_legacy = trip_request_to_legacy(existing_trip)
                 parsed = parse_trip_request(user_input, previous=prev_legacy)
                 canonical_trip = build_trip_request(
@@ -232,6 +366,9 @@ class PlannerService:
 
         # 7. Generate compatibility projection for downstream specialist agents
         compatibility_constraints = trip_request_to_legacy(canonical_trip)
+        if canonical_constraints:
+            compatibility_constraints["_is_canonical"] = True
+            compatibility_constraints["trip_id"] = str(canonical_trip_record["id"])
 
         # 8. Execute LangGraph Orchestrator
         initial_state = {
@@ -288,6 +425,33 @@ class PlannerService:
                  else (o.model_dump(mode="json") if hasattr(o, "model_dump") else o))
                 for o in serialized["live_hotel_offers"]
             ]
+        # 10. Consistency validation: verify that the generated plan matches the canonical trip
+        if has_canonical_constraints and canonical_trip_record and canonical_constraints:
+            expected_dest = str(canonical_trip_record.get("destination") or "").lower()
+            expected_city = str(canonical_constraints.get("destination_city") or "").lower()
+            plan_json = serialized.get("plan_json") or {}
+            plan_dest = str(plan_json.get("destination") or compatibility_constraints.get("destination_city") or compatibility_constraints.get("destination") or "").lower()
+            plan_dest_airport = str(plan_json.get("destination_airport") or "").lower()
+
+            expected_dest_clean = re.sub(r"[,\-.]", " ", f"{expected_dest} {expected_city}").split()
+            plan_dest_clean = re.sub(r"[,\-.]", " ", plan_dest).split()
+            dest_code = str(canonical_constraints.get("destination") or "").lower()
+
+            is_dest_matching = (
+                not plan_dest
+                or any(word in plan_dest for word in expected_dest_clean if len(word) >= 3)
+                or any(word in expected_dest_clean for word in plan_dest_clean if len(word) >= 3)
+                or (dest_code and dest_code in (plan_dest_airport, plan_dest))
+                or (expected_city and (expected_city in plan_dest or plan_dest in expected_city))
+            )
+            if not is_dest_matching:
+                logger.error(
+                    "Consistency failure: generated destination '%s' does not match canonical trip destination '%s'",
+                    plan_dest, expected_dest,
+                )
+                raise ValueError(
+                    f"Consistency violation: Plan destination '{plan_dest}' does not match canonical trip destination '{canonical_trip_record.get('destination')}'."
+                )
 
         return serialized
 

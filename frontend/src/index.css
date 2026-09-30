@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --background: #F6F2EA;
+    --surface: #FFFFFF;
+    --surface-elevated: #FDFBF7;
+    --text-primary: #18242B;
+    --text-secondary: #586870;
+    --border: #E5DEC9;
+    --border-subtle: #EFEAD9;
+    --primary: #176B63;
+    --primary-hover: #12564F;
+    --primary-soft: #E9EEF0;
+    --sand: #DCCDB5;
+    --sand-light: #F0E8D9;
+    --terracotta: #C96F52;
+    --coral: #C96F52;
+    --sunset: #E7A07F;
+    --ocean: #2C7A78;
+    --status-success: #267E67;
+    --status-warning: #BA8021;
+    --status-danger: #C04B4B;
+
+    /* Legacy mapping */
+    --bg-primary: var(--background);
+    --travel-teal: var(--primary);
+    --travel-teal-hover: var(--primary-hover);
+    --sky-tint: var(--primary-soft);
+    --warm-sand: var(--sand);
+    --coral-accent: var(--coral);
+  }
+
+  .dark {
+    --background: #111716;
+    --surface: #19211F;
+    --surface-elevated: #202A27;
+    --text-primary: #F3EFE6;
+    --text-secondary: #B6C0BC;
+    --border: #2B3835;
+    --border-subtle: #202A28;
+    --primary: #4AA69B;
+    --primary-hover: #59B8AC;
+    --primary-soft: #1D3834;
+    --sand: #695E4F;
+    --sand-light: #2A251E;
+    --terracotta: #DA8066;
+    --coral: #DA8066;
+    --sunset: #E29B7F;
+    --ocean: #3E9491;
+    --status-success: #35B08C;
+    --status-warning: #E0A030;
+    --status-danger: #E26363;
+
+    /* Legacy mapping */
+    --bg-primary: var(--background);
+    --travel-teal: var(--primary);
+    --travel-teal-hover: var(--primary-hover);
+    --sky-tint: var(--primary-soft);
+    --warm-sand: var(--sand);
+    --coral-accent: var(--coral);
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: var(--background);
+    color: var(--text-primary);
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+
+  .font-editorial {
+    font-family: 'Fraunces', Georgia, serif;
+  }
+
+  /* Custom horizontal scroll bar styling for destination rails */
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}

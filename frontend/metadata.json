@@ -1,0 +1,6 @@
+{
+  "name": "TrustTrip TravelPlanner",
+  "description": "Intelligent travel planning, flights, hotels, revisions, and booking platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

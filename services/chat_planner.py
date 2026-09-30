@@ -103,7 +103,7 @@ def _groq_model() -> str:
 
 
 def _gemini_model() -> str:
-    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    return os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 def _compact_flight(o: dict[str, Any]) -> dict[str, Any]:
@@ -484,23 +484,37 @@ def enforce_complete_canonical_invariants(
         ctx = dict(canonical_context)
 
     # 1. HARD REJECT: Origin, Destination & Airport Identifiers
-    orig_origin = ctx.get("origin") or ctx.get("origin_city")
-    if orig_origin:
-        if plan.origin is not None and plan.origin.strip().lower() != str(orig_origin).strip().lower():
-            raise CanonicalInvariantViolation(
-                f"Canonical origin tampering detected: expected '{orig_origin}', got '{plan.origin}'"
-            )
-        elif plan.origin is None:
-            plan.origin = str(orig_origin)
+    valid_origins = {
+        str(ctx.get("origin") or "").strip().lower(),
+        str(ctx.get("origin_city") or "").strip().lower(),
+        str(ctx.get("origin_query") or "").strip().lower(),
+        str(ctx.get("origin_airport") or "").strip().lower(),
+    } - {""}
+    if valid_origins:
+        if plan.origin is not None:
+            p_orig = plan.origin.strip().lower()
+            if not any(v in p_orig or p_orig in v for v in valid_origins):
+                raise CanonicalInvariantViolation(
+                    f"Canonical origin tampering detected: expected one of {valid_origins}, got '{plan.origin}'"
+                )
+        else:
+            plan.origin = str(ctx.get("origin_city") or ctx.get("origin"))
 
-    orig_dest = ctx.get("destination") or ctx.get("destination_city")
-    if orig_dest:
-        if plan.destination is not None and plan.destination.strip().lower() != str(orig_dest).strip().lower():
-            raise CanonicalInvariantViolation(
-                f"Canonical destination tampering detected: expected '{orig_dest}', got '{plan.destination}'"
-            )
-        elif plan.destination is None:
-            plan.destination = str(orig_dest)
+    valid_dests = {
+        str(ctx.get("destination") or "").strip().lower(),
+        str(ctx.get("destination_city") or "").strip().lower(),
+        str(ctx.get("destination_query") or "").strip().lower(),
+        str(ctx.get("destination_airport") or "").strip().lower(),
+    } - {""}
+    if valid_dests:
+        if plan.destination is not None:
+            p_dest = plan.destination.strip().lower()
+            if not any(v in p_dest or p_dest in v for v in valid_dests):
+                raise CanonicalInvariantViolation(
+                    f"Canonical destination tampering detected: expected one of {valid_dests}, got '{plan.destination}'"
+                )
+        else:
+            plan.destination = str(ctx.get("destination_city") or ctx.get("destination"))
 
     origin_code = ctx.get("origin_airport") or ctx.get("origin_code")
     if origin_code:

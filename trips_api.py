@@ -208,6 +208,17 @@ async def create_trip_thread(
         thread_id=request.thread_id,
         metadata=request.metadata,
     )
+    # Persist thread_id in trip metadata
+    try:
+        meta = trip.get("metadata") or {}
+        if isinstance(meta, str):
+            import json
+            meta = json.loads(meta)
+        meta = dict(meta)
+        meta["thread_id"] = str(thread["id"])
+        trip_store.update_trip(trip_id, current_user.id, metadata=meta)
+    except Exception:
+        pass
     return {"success": True, "thread": thread}
 
 

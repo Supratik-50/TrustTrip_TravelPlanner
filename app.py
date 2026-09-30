@@ -131,6 +131,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 class TravelRequest(BaseModel):
     message: str
     thread_id: str | None = None
+    trip_id: str | None = None
 
 
 class TravelPlanPDFRequest(BaseModel):
@@ -169,21 +170,68 @@ async def travel_planner(
                 },
             )
 
+        # Identify target canonical trip if available
+        target_trip_id = request_data.trip_id
+        if not target_trip_id and request_data.thread_id:
+            try:
+                from services.trip_store import TripStore
+                th = TripStore().get_thread(request_data.thread_id, current_user.id)
+                if th and th.get("trip_id"):
+                    target_trip_id = str(th["trip_id"])
+            except Exception:
+                pass
+
         result = run_travel_agent(
             user_input=user_message,
             thread_id=request_data.thread_id,
             authenticated_user_id=str(current_user.id),
+            trip_id=target_trip_id,
         )
 
+        # If a canonical trip is bound, persist generated plan into trip metadata
+        if target_trip_id and (result.get("success") is not False):
+            try:
+                from services.trip_store import TripStore
+                from fastapi.encoders import jsonable_encoder
+                ts = TripStore()
+                trip_record = ts.get_trip(target_trip_id, current_user.id)
+                logger.info("Persisting plan for trip %s, found=%s", target_trip_id, bool(trip_record))
+                if trip_record:
+                    meta = trip_record.get("metadata") or {}
+                    if isinstance(meta, str):
+                        import json
+                        meta = json.loads(meta)
+                    meta = dict(meta)
+                    if result.get("plan_json"):
+                        meta["plan"] = jsonable_encoder(result.get("plan_json"))
+                    if result.get("answer") or result.get("itinerary"):
+                        meta["raw_plan"] = str(result.get("answer") or result.get("itinerary"))
+                    assigned_thread = result.get("thread_id") or request_data.thread_id
+                    if assigned_thread:
+                        meta["thread_id"] = str(assigned_thread)
+                    updated = ts.update_trip(target_trip_id, current_user.id, metadata=meta, status="planning")
+                    logger.info("Trip %s updated with plan: %s", target_trip_id, bool(updated))
+            except Exception as store_err:
+                logger.error("Failed to persist travel plan to trip metadata: %s", store_err, exc_info=True)
+
+        from fastapi.encoders import jsonable_encoder
+        out_dict = dict(result)
+        out_dict["success"] = True
         return JSONResponse(
-            content={
-                "success": True,
-                **result,
-            }
+            content=jsonable_encoder(out_dict)
         )
 
     except PermissionError as p_exc:
         raise HTTPException(status_code=403, detail=str(p_exc))
+    except ValueError as v_exc:
+        logger.error("Validation error in travel planner: %s", v_exc)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error": str(v_exc),
+            },
+        )
     except Exception as exc:
         logger.exception("Error processing travel request: %s", exc)
         return JSONResponse(

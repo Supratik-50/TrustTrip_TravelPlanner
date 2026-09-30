@@ -850,6 +850,19 @@ class TripStore:
 
         actual_thread_id = thread_id or f"user_{uuid.uuid4().hex}"
 
+        # Link thread_id to the trip's metadata
+        try:
+            trip_obj = self.get_trip(actual_trip_id, user_id)
+            if trip_obj:
+                existing_meta = trip_obj.get("metadata") or {}
+                if isinstance(existing_meta, str):
+                    existing_meta = json.loads(existing_meta)
+                existing_meta = dict(existing_meta)
+                existing_meta["thread_id"] = actual_thread_id
+                self.update_trip(actual_trip_id, user_id, metadata=existing_meta)
+        except Exception:
+            pass
+
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             record = {
                 "id": actual_thread_id,

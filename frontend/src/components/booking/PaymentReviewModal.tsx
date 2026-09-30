@@ -1,0 +1,304 @@
+import React, { useState } from 'react';
+import {
+  X,
+  CreditCard,
+  ShieldCheck,
+  Building2,
+  Lock,
+  ArrowRight,
+  CheckCircle2,
+  AlertTriangle,
+  RefreshCw,
+  Wallet,
+} from 'lucide-react';
+import { TravelerContactInfo } from '../../types/bookingFrontend';
+import { Button } from '../common/Button';
+import { formatCurrency } from '../../lib/currency';
+
+interface PaymentReviewModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  hotelName: string;
+  roomName: string;
+  startDate: string;
+  endDate: string;
+  guestsCount: number;
+  roomAmount: number;
+  taxesAmount: number;
+  currency?: string;
+  contact: TravelerContactInfo;
+  onProcessPayment: (
+    method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
+    contact: TravelerContactInfo
+  ) => Promise<void>;
+}
+
+export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
+  isOpen,
+  onClose,
+  hotelName,
+  roomName,
+  startDate,
+  endDate,
+  guestsCount,
+  roomAmount,
+  taxesAmount,
+  currency = 'USD',
+  contact,
+  onProcessPayment,
+}) => {
+  const [paymentMethod, setPaymentMethod] = useState<'card' | 'upi' | 'netbanking' | 'pay_at_property'>('card');
+  const [processingState, setProcessingState] = useState<'idle' | 'processing' | 'success' | 'failed'>('idle');
+  const [simulateFailure, setSimulateFailure] = useState(false);
+
+  if (!isOpen) return null;
+
+  const grandTotal = roomAmount + taxesAmount;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setProcessingState('processing');
+
+    try {
+      if (simulateFailure) {
+        await new Promise((r) => setTimeout(r, 1200));
+        setProcessingState('failed');
+        return;
+      }
+
+      await onProcessPayment(paymentMethod, contact);
+      setProcessingState('success');
+      setTimeout(() => {
+        onClose();
+      }, 1000);
+    } catch {
+      setProcessingState('failed');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 overflow-y-auto flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+      <div className="relative w-full max-w-lg bg-[var(--surface)] border border-[var(--border)] rounded-3xl shadow-2xl p-6 sm:p-8 space-y-6 animate-in fade-in zoom-in-95 duration-200">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 border-b border-[var(--border)] pb-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <Lock className="w-3.5 h-3.5 text-[var(--primary)]" />
+              <span className="text-xs font-mono uppercase tracking-wider text-[var(--primary)] font-bold">
+                SECURE STAY CONFIRMATION
+              </span>
+            </div>
+            <h3 className="text-xl sm:text-2xl font-bold font-editorial text-[var(--text-primary)]">
+              Payment & Guarantee
+            </h3>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-8 h-8 rounded-full border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--surface-muted)] flex items-center justify-center transition-colors cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* PROCESSING ANIMATION */}
+        {processingState === 'processing' && (
+          <div className="py-12 text-center space-y-3">
+            <div className="w-12 h-12 rounded-full bg-[var(--primary-soft)] text-[var(--primary)] mx-auto flex items-center justify-center animate-spin">
+              <RefreshCw className="w-6 h-6" />
+            </div>
+            <div className="font-editorial text-xl font-bold text-[var(--text-primary)]">
+              Confirming your stay...
+            </div>
+            <p className="text-xs text-[var(--text-secondary)] font-light">
+              Connecting to verified property reservation ledger and locking room rate.
+            </p>
+          </div>
+        )}
+
+        {/* SUCCESS STATE */}
+        {processingState === 'success' && (
+          <div className="py-12 text-center space-y-3">
+            <div className="w-12 h-12 rounded-full bg-[var(--status-success)]/10 text-[var(--status-success)] mx-auto flex items-center justify-center">
+              <CheckCircle2 className="w-6 h-6" />
+            </div>
+            <div className="font-editorial text-xl font-bold text-[var(--status-success)]">
+              Payment Confirmed!
+            </div>
+            <p className="text-xs text-[var(--text-secondary)] font-light">
+              Stay reservation confirmed with property. Handing over confirmed voucher.
+            </p>
+          </div>
+        )}
+
+        {/* FAILED STATE */}
+        {processingState === 'failed' && (
+          <div className="space-y-4 py-4">
+            <div className="p-4 rounded-2xl bg-[var(--status-danger)]/10 border border-[var(--status-danger)]/30 text-xs space-y-2">
+              <div className="flex items-center gap-1.5 font-bold font-mono text-[var(--status-danger)]">
+                <AlertTriangle className="w-4 h-4" />
+                We couldn't complete the payment
+              </div>
+              <p className="text-[var(--text-primary)] leading-relaxed">
+                The simulated transaction could not be completed by the banking network. No funds
+                were charged.
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <Button
+                variant="outline"
+                size="md"
+                onClick={() => {
+                  setSimulateFailure(false);
+                  setProcessingState('idle');
+                }}
+              >
+                Try again
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* NORMAL PAYMENT FORM */}
+        {processingState === 'idle' && (
+          <form onSubmit={handleSubmit} className="space-y-5">
+            {/* Stay Summary */}
+            <div className="p-4 rounded-2xl bg-[var(--surface-muted)] border border-[var(--border)] space-y-2 text-xs">
+              <div className="flex justify-between items-center text-[var(--text-secondary)]">
+                <span>Property:</span>
+                <span className="font-semibold text-[var(--text-primary)]">{hotelName}</span>
+              </div>
+              <div className="flex justify-between items-center text-[var(--text-secondary)]">
+                <span>Room Type:</span>
+                <span className="font-mono text-[var(--text-primary)]">{roomName}</span>
+              </div>
+              <div className="flex justify-between items-center text-[var(--text-secondary)]">
+                <span>Dates:</span>
+                <span className="font-mono text-[var(--text-primary)]">
+                  {startDate} — {endDate} ({guestsCount} guests)
+                </span>
+              </div>
+              <div className="pt-2 border-t border-[var(--border)]/60 flex justify-between items-center text-[var(--text-secondary)]">
+                <span>Room Charges:</span>
+                <span className="font-mono text-[var(--text-primary)]">
+                  {formatCurrency(roomAmount, currency)}
+                </span>
+              </div>
+              <div className="flex justify-between items-center text-[var(--text-secondary)]">
+                <span>Taxes & Tourism Fees:</span>
+                <span className="font-mono text-[var(--text-primary)]">
+                  {formatCurrency(taxesAmount, currency)}
+                </span>
+              </div>
+              <div className="pt-2 border-t border-[var(--border)]/60 flex justify-between items-baseline font-bold text-sm">
+                <span className="text-[var(--text-primary)]">Total:</span>
+                <span className="text-lg font-editorial text-[var(--primary)] font-bold">
+                  {formatCurrency(grandTotal, currency)}
+                </span>
+              </div>
+            </div>
+
+            {/* Payment Method Selector */}
+            <div className="space-y-2">
+              <label className="text-xs font-semibold uppercase tracking-wider font-mono text-[var(--text-secondary)] block">
+                Payment Method Preference
+              </label>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPaymentMethod('card')}
+                  className={`p-3 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                    paymentMethod === 'card'
+                      ? 'border-[var(--primary)] bg-[var(--primary-soft)]/20 font-semibold text-[var(--primary)]'
+                      : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <CreditCard className="w-4 h-4 mb-1" />
+                  Credit / Debit Card
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setPaymentMethod('upi')}
+                  className={`p-3 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                    paymentMethod === 'upi'
+                      ? 'border-[var(--primary)] bg-[var(--primary-soft)]/20 font-semibold text-[var(--primary)]'
+                      : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <Wallet className="w-4 h-4 mb-1" />
+                  UPI / Instant Transfer
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setPaymentMethod('netbanking')}
+                  className={`p-3 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                    paymentMethod === 'netbanking'
+                      ? 'border-[var(--primary)] bg-[var(--primary-soft)]/20 font-semibold text-[var(--primary)]'
+                      : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <Building2 className="w-4 h-4 mb-1" />
+                  Net Banking
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setPaymentMethod('pay_at_property')}
+                  className={`p-3 rounded-xl border text-left text-xs transition-all cursor-pointer ${
+                    paymentMethod === 'pay_at_property'
+                      ? 'border-[var(--primary)] bg-[var(--primary-soft)]/20 font-semibold text-[var(--primary)]'
+                      : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <ShieldCheck className="w-4 h-4 mb-1" />
+                  Pay At Property
+                </button>
+              </div>
+            </div>
+
+            {/* Zero card data guarantee note */}
+            <div className="text-[11px] text-[var(--text-muted)] flex items-center gap-1.5 font-light">
+              <ShieldCheck className="w-3.5 h-3.5 text-[var(--primary)] shrink-0" />
+              <span>Simulated prototype boundary. In production, Razorpay handles credentials with zero sensitive card storage.</span>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+              <Button variant="outline" size="md" onClick={onClose} className="w-full sm:w-auto">
+                Cancel
+              </Button>
+
+              <Button
+                type="submit"
+                variant="primary"
+                size="md"
+                rightIcon={<ArrowRight className="w-4 h-4" />}
+                className="w-full sm:w-auto shadow-xs"
+              >
+                Confirm & Pay (${grandTotal.toLocaleString()})
+              </Button>
+            </div>
+
+            {/* Developer Testing Toggle */}
+            <div className="pt-2 text-right">
+              <label className="inline-flex items-center gap-1.5 text-[10px] font-mono text-[var(--text-muted)] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={simulateFailure}
+                  onChange={(e) => setSimulateFailure(e.target.checked)}
+                  className="rounded text-[var(--primary)] focus:ring-0"
+                />
+                Simulate network payment failure
+              </label>
+            </div>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+};
