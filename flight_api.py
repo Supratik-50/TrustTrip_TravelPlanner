@@ -27,11 +27,37 @@ from domain.user import UserResponse
 from services.flight_service import FlightService
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
 from services.flight_booking_service import FlightBookingService, FareChangedException, OfferWithdrawnException
+from domain.flight_booking import (
+    FlightBookingSelectionRequest,
+    FlightBookingSelectionResponse,
+    FlightBookingRevalidationRequest,
+    FlightBookingRevalidationResponse,
+    FlightBookingApprovalRequest,
+    FlightBookingApprovalResponse,
+    FlightBookingConfirmationRequest,
+    FlightBookingConfirmationResponse,
+    FlightBookingException,
+    BookingNotFoundError,
+    BookingPermissionError,
+    TripMismatchError,
+    OfferStaleError,
+    ApprovalRequiredError,
+    FinalConfirmationRequiredError,
+    PriceChangedError,
+    OfferUnavailableError,
+    DuplicateBookingError,
+    ProviderBookingError,
+)
 from services.flight_search_service import search_flights_for_trip
 from services.travel_intelligence.orchestrator import TravelIntelligenceOrchestrator
 from services.trip_store import TripStore, resolve_current_revision
 
 router = APIRouter(prefix="/api/flights", tags=["flights"])
+
+
+def _booking_service() -> FlightBookingService:
+    return FlightBookingService()
+
 
 
 @router.post("/select-booking", response_model=FlightBookingDestination)
@@ -351,3 +377,187 @@ async def pay_hold_order(request: HoldPaymentRequest):
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except FlightProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ============================================================================
+# SECTION 5B FLIGHT BOOKING VERTICAL SLICE
+# ============================================================================
+
+@router.post("/booking/select", response_model=FlightBookingSelectionResponse, status_code=201)
+@router.post("/select", response_model=FlightBookingSelectionResponse, status_code=201)
+async def select_flight_offer(
+    req: FlightBookingSelectionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    service: FlightBookingService = Depends(_booking_service),
+):
+    """Select an existing persisted flight offer and initialize a booking intent."""
+    try:
+        return await service.select_offer(
+            user_id=current_user.id,
+            trip_id=req.trip_id,
+            offer_id=req.offer_id,
+            passengers=req.passengers,
+        )
+    except BookingPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except BookingNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except TripMismatchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except OfferStaleError as exc:
+        raise HTTPException(status_code=410, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("Flight booking selection failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Flight selection failed due to an internal error.")
+
+
+@router.post("/booking/{booking_id}/revalidate", response_model=FlightBookingRevalidationResponse)
+@router.post("/booking/revalidate", response_model=FlightBookingRevalidationResponse)
+async def revalidate_flight_booking(
+    booking_id: str | None = None,
+    req: FlightBookingRevalidationRequest | None = None,
+    current_user: UserResponse = Depends(get_current_user),
+    service: FlightBookingService = Depends(_booking_service),
+):
+    """Revalidate live provider price and availability before human approval and booking."""
+    target_id = booking_id or (req.booking_id if req else None)
+    if not target_id:
+        raise HTTPException(status_code=400, detail="booking_id is required for revalidation.")
+    accepted_price = req.accepted_price if req else None
+    try:
+        return await service.revalidate_offer(
+            user_id=current_user.id,
+            booking_id=target_id,
+            accepted_price=accepted_price,
+        )
+    except BookingPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except BookingNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PriceChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Fare has changed",
+                "message": exc.message,
+                "original_price": exc.details.get("original_price"),
+                "new_price": exc.details.get("new_price"),
+                "currency": exc.details.get("currency"),
+            },
+        )
+    except OfferUnavailableError as exc:
+        raise HTTPException(status_code=410, detail=str(exc))
+    except FlightProviderTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except FlightBookingException as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except Exception as exc:
+        logger.error("Flight booking revalidation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Revalidation failed due to an internal error.")
+
+
+@router.post("/booking/{booking_id}/approve", response_model=FlightBookingApprovalResponse)
+@router.post("/booking/approve", response_model=FlightBookingApprovalResponse)
+async def approve_flight_booking(
+    booking_id: str | None = None,
+    req: FlightBookingApprovalRequest | None = None,
+    current_user: UserResponse = Depends(get_current_user),
+    service: FlightBookingService = Depends(_booking_service),
+):
+    """Record explicit Human-in-the-loop (HITL) approval for a revalidated booking intent."""
+    target_id = booking_id or (req.booking_id if req else None)
+    if not target_id:
+        raise HTTPException(status_code=400, detail="booking_id is required for approval.")
+    approved = req.approved if req else True
+    notes = req.notes if req else None
+    try:
+        return await service.record_approval(
+            user_id=current_user.id,
+            booking_id=target_id,
+            approved=approved,
+            notes=notes,
+        )
+    except BookingPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except BookingNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except FlightBookingException as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except Exception as exc:
+        logger.error("Flight booking approval failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Approval recording failed due to an internal error.")
+
+
+@router.post("/booking/{booking_id}/confirm", response_model=FlightBookingConfirmationResponse)
+@router.post("/booking/confirm", response_model=FlightBookingConfirmationResponse)
+async def confirm_flight_booking(
+    booking_id: str | None = None,
+    req: FlightBookingConfirmationRequest | None = None,
+    current_user: UserResponse = Depends(get_current_user),
+    service: FlightBookingService = Depends(_booking_service),
+):
+    """Confirm booking with provider after revalidation and human approval."""
+    target_id = booking_id or (req.booking_id if req else None)
+    if not target_id:
+        raise HTTPException(status_code=400, detail="booking_id is required for confirmation.")
+    final_confirmation = req.final_confirmation if req else False
+    payment = req.payment if req else None
+    payment_mode = req.payment_mode if req else "auto"
+    try:
+        return await service.confirm_booking(
+            user_id=current_user.id,
+            booking_id=target_id,
+            final_confirmation=final_confirmation,
+            payment=payment,
+            payment_mode=payment_mode,
+        )
+    except BookingPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except BookingNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except DuplicateBookingError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc), "duplicate_attempt": True})
+    except ApprovalRequiredError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc), "approval_required": True})
+    except FinalConfirmationRequiredError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc), "requires_final_confirmation": True})
+    except PriceChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Fare has changed",
+                "message": exc.message,
+                "original_price": exc.details.get("original_price"),
+                "new_price": exc.details.get("new_price"),
+                "currency": exc.details.get("currency"),
+            },
+        )
+    except OfferUnavailableError as exc:
+        raise HTTPException(status_code=410, detail=str(exc))
+    except ProviderBookingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except FlightBookingException as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except Exception as exc:
+        logger.error("Flight booking confirmation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Confirmation failed due to an internal error.")
+
+
+@router.get("/booking/{booking_id}")
+async def get_flight_booking(
+    booking_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    service: FlightBookingService = Depends(_booking_service),
+):
+    """Query authoritative flight booking status."""
+    try:
+        return await service.get_booking(user_id=current_user.id, booking_id=booking_id)
+    except BookingPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except BookingNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error("Get flight booking failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve booking.")
