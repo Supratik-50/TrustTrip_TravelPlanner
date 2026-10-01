@@ -13,14 +13,20 @@ export type JourneyApprovalStatus = 'pending_review' | 'approved' | 'rejected';
 
 export type FlightVerificationState =
   | 'idle'
+  | 'available'
+  | 'empty'
   | 'verifying'
   | 'ready'
   | 'price_changed'
+  | 'stale'
   | 'unavailable'
   | 'expired'
-  | 'failed'
+  | 'awaiting_approval'
+  | 'booking_in_progress'
   | 'handed_off'
-  | 'confirmed';
+  | 'confirmed'
+  | 'completed'
+  | 'failed';
 
 export type HotelBookingState =
   | 'idle'
@@ -154,4 +160,13 @@ export interface IBookingService {
   ): Promise<HotelConfirmationRecord>;
   requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id: string; message: string }>;
   downloadTravelPlanPdf(tripId: string): Promise<void>;
+
+  // Section 5B / 5C Authoritative Contracts
+  selectFlightOffer(tripId: string, offerId: string, passengers: any[]): Promise<any>;
+  revalidateFlightContract(bookingId: string, acceptedPrice?: number): Promise<any>;
+  approveFlightBooking(bookingId: string, notes?: string): Promise<any>;
+  confirmFlightBooking(bookingId: string): Promise<any>;
+  getFlightBooking(bookingId: string): Promise<any>;
+  getActiveBookingId(tripId: string): string | undefined;
+  setActiveBookingId(tripId: string, bookingId: string): void;
 }

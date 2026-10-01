@@ -67,9 +67,20 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   const [hotelState, setHotelState] = useState<HotelBookingState | 'idle' | 'preparing' | 'payment_required' | 'confirmed'>('idle');
   const [hotelConfirmation, setHotelConfirmation] = useState<HotelConfirmationRecord | undefined>(undefined);
 
+  // Section 5B/5C Authoritative Booking State
+  const [bookingId, setBookingId] = useState<string | undefined>(undefined);
+  const [isFlightApproved, setIsFlightApproved] = useState(false);
+  const [isFinalConfirmationChecked, setIsFinalConfirmationChecked] = useState(false);
+  const [bookingReference, setBookingReference] = useState<string | undefined>(undefined);
+  const [orderId, setOrderId] = useState<string | undefined>(undefined);
+  const [pnr, setPnr] = useState<string | undefined>(undefined);
+  const [eTicket, setETicket] = useState<string | undefined>(undefined);
+  const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
+
   // Price change / verification details
   const [priceChange, setPriceChange] = useState<FlightPriceChangeNotice | undefined>(undefined);
   const [verifiedFlightAmount, setVerifiedFlightAmount] = useState<number>(860);
+  const [verifiedCurrency, setVerifiedCurrency] = useState<string>('USD');
   const [approvalConflict, setApprovalConflict] = useState<string | null>(null);
 
   // Modals & Handoff
@@ -138,36 +149,296 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     }
   };
 
-  // Handle Flight Verification
+  // Section 5B / 5C: Handle Flight Verification & Revalidation
   const handleVerifyFlight = async () => {
     setFlightState('verifying');
+    setIsFinalConfirmationChecked(false);
+    setErrorMessage(undefined);
     try {
-      const res = await bookingService.verifyFlight(trip.trip_id, selectedFlight?.id || 'fl_off_101');
+      const offerId = selectedFlight?.offer_id || selectedFlight?.id || 'fl_off_101';
+      let bId = bookingId || bookingService.getActiveBookingId(trip.trip_id);
+
+      // Select offer if no booking intent exists yet
+      if (!bId) {
+        try {
+          const sel = await bookingService.selectFlightOffer(trip.trip_id, offerId, [
+            {
+              given_name: contact.first_name || 'Traveler',
+              family_name: contact.last_name || 'User',
+              born_on: '1990-01-01',
+              title: 'mr',
+              gender: 'm',
+              email: contact.email || 'traveler@trusttrip.com',
+              phone_number: contact.phone || '+1234567890',
+            },
+          ]);
+          if (sel?.booking_id) {
+            const activeBId = String(sel.booking_id);
+            bId = activeBId;
+            setBookingId(activeBId);
+            bookingService.setActiveBookingId(trip.trip_id, activeBId);
+          }
+        } catch (selErr: any) {
+          if (selErr.statusCode === 410) {
+            setFlightState('stale');
+            setIsFlightApproved(false);
+            setIsFinalConfirmationChecked(false);
+            notify('The selected flight snapshot is stale or expired.', 'error', 'Offer Stale');
+            return;
+          }
+          if (selErr.statusCode === 404) {
+            setFlightState('unavailable');
+            setIsFlightApproved(false);
+            setIsFinalConfirmationChecked(false);
+            notify('Offer not found or unavailable.', 'error', 'Unavailable');
+            return;
+          }
+        }
+      }
+
+      if (bId) {
+        try {
+          const reval = await bookingService.revalidateFlightContract(bId);
+          setVerifiedFlightAmount(reval.current_price);
+          setVerifiedCurrency(reval.currency);
+
+          if (reval.price_changed) {
+            setFlightState('price_changed');
+            setIsFlightApproved(false);
+            setIsFinalConfirmationChecked(false);
+            setPriceChange({
+              previous_amount: reval.original_price,
+              current_amount: reval.current_price,
+              currency: reval.currency,
+              reason: 'Airline supplier updated fare classes during revalidation.',
+              change_timestamp: new Date().toISOString(),
+            });
+            notify('Flight fare adjusted by carrier. Please review before approving.', 'warning', 'Fare Changed');
+          } else {
+            setFlightState('awaiting_approval');
+            setIsFlightApproved(false);
+            setIsFinalConfirmationChecked(false);
+            notify('Flight availability revalidated. Awaiting human approval.', 'info', 'Awaiting Approval');
+          }
+          return;
+        } catch (revalErr: any) {
+          if (revalErr.statusCode === 409) {
+            const d = revalErr.detail || {};
+            setFlightState('price_changed');
+            setIsFlightApproved(false);
+            setIsFinalConfirmationChecked(false);
+            setPriceChange({
+              previous_amount: Number(d.original_price || verifiedFlightAmount),
+              current_amount: Number(d.new_price || verifiedFlightAmount),
+              currency: d.currency || 'USD',
+              reason: d.message || 'Carrier fare adjusted.',
+              change_timestamp: new Date().toISOString(),
+            });
+            notify('Fare has updated. Please review price adjustment.', 'warning', 'Fare Updated');
+            return;
+          }
+          if (revalErr.statusCode === 410) {
+            setFlightState('unavailable');
+            setIsFlightApproved(false);
+            setIsFinalConfirmationChecked(false);
+            notify('The selected flight is no longer available from the supplier.', 'error', 'Inventory Closed');
+            return;
+          }
+          if (revalErr.statusCode >= 500) {
+            setFlightState('failed');
+            setIsFinalConfirmationChecked(false);
+            setErrorMessage(revalErr.message || 'Upstream provider error during revalidation.');
+            notify('Supplier communication error. Please retry.', 'error');
+            return;
+          }
+        }
+      }
+
+      // Fallback to legacy verifyFlight
+      const res = await bookingService.verifyFlight(trip.trip_id, offerId);
       setFlightState(res.state);
       setVerifiedFlightAmount(res.current_amount);
+      setIsFinalConfirmationChecked(false);
       if (res.price_change) {
         setPriceChange(res.price_change);
+        setIsFlightApproved(false);
         notify('Carrier fare has updated. Please review price adjustment.', 'warning', 'Fare Updated');
       } else if (res.state === 'unavailable') {
+        setIsFlightApproved(false);
         notify('This flight is no longer available.', 'error', 'Inventory Closed');
       } else {
-        notify('Flight seats verified and fare hold locked for 20 minutes.', 'success', 'Flight Ready');
+        notify('Flight seats verified. Awaiting human approval.', 'success', 'Flight Ready');
       }
-    } catch {
+    } catch (err: any) {
       setFlightState('failed');
+      setIsFinalConfirmationChecked(false);
+      setErrorMessage(err.message || 'Unable to verify flight availability.');
       notify('Unable to verify flight availability. Please retry.', 'error');
     }
   };
 
-  // Accept Price Change
+  // Section 5B / 5C: Accept Price Change (resets approval and re-enters HITL flow)
   const handleAcceptPriceChange = async () => {
-    await bookingService.acceptPriceChange(trip.trip_id, selectedFlight?.id || 'fl_off_101');
-    setPriceChange(undefined);
-    setFlightState('ready');
-    notify('Updated carrier fare accepted. Ready for secure checkout.', 'info', 'Price Accepted');
+    if (!priceChange) return;
+    try {
+      const bId = bookingId || bookingService.getActiveBookingId(trip.trip_id);
+      if (bId) {
+        const reval = await bookingService.revalidateFlightContract(bId, priceChange.current_amount);
+        setVerifiedFlightAmount(reval.current_price);
+        setVerifiedCurrency(reval.currency);
+      }
+      setPriceChange(undefined);
+      // Safety rule: price change clears approval, and resets final confirmation checkbox
+      setIsFlightApproved(false);
+      setIsFinalConfirmationChecked(false);
+      setFlightState('awaiting_approval');
+      notify('Updated price accepted. Please provide human approval before confirmation.', 'info', 'Price Accepted');
+    } catch (err: any) {
+      notify(err.message || 'Failed to accept price change.', 'error');
+    }
   };
 
-  // External Checkout Simulation
+  // Section 5B / 5C: Record Explicit Human-In-The-Loop Approval
+  const handleApproveFlight = async () => {
+    let bId = bookingId || bookingService.getActiveBookingId(trip.trip_id);
+    if (!bId) {
+      const offerId = selectedFlight?.offer_id || selectedFlight?.id || 'fl_off_101';
+      const sel = await bookingService.selectFlightOffer(trip.trip_id, offerId, [
+        {
+          given_name: contact.first_name || 'Traveler',
+          family_name: contact.last_name || 'User',
+          born_on: '1990-01-01',
+          title: 'mr',
+          gender: 'm',
+          email: contact.email || 'traveler@trusttrip.com',
+          phone_number: contact.phone || '+1234567890',
+        },
+      ]);
+      if (sel?.booking_id) {
+        const activeBId = String(sel.booking_id);
+        bId = activeBId;
+        setBookingId(activeBId);
+        bookingService.setActiveBookingId(trip.trip_id, activeBId);
+        await bookingService.revalidateFlightContract(activeBId);
+      }
+    }
+
+    if (!bId) {
+      notify('Unable to establish flight booking for approval.', 'error');
+      return;
+    }
+
+    try {
+      await bookingService.approveFlightBooking(bId, 'Human approval recorded in traveler workspace');
+      setIsFlightApproved(true);
+      // ISSUE 2 FIX: Fresh approval must NOT automatically check final confirmation
+      setIsFinalConfirmationChecked(false);
+      setFlightState('ready');
+      notify('Human approval recorded. Please review and confirm the current fare before booking.', 'success', 'Flight Approved');
+    } catch (err: any) {
+      notify(err.message || 'Unable to record approval.', 'error');
+    }
+  };
+
+  // Section 5B / 5C: Execute Final Confirmation (Never automatic)
+  const handleConfirmFlightBooking = async () => {
+    if (!isFlightApproved) {
+      notify('Human approval is required before confirmation.', 'warning', 'Approval Required');
+      return;
+    }
+    if (!isFinalConfirmationChecked) {
+      notify('Please confirm the current fare before booking.', 'warning', 'Confirmation Required');
+      return;
+    }
+
+    const bId = bookingId || bookingService.getActiveBookingId(trip.trip_id);
+    if (!bId) {
+      notify('No active booking intent found to confirm.', 'error');
+      return;
+    }
+
+    setFlightState('booking_in_progress');
+    try {
+      const res = await bookingService.confirmFlightBooking(bId);
+      setBookingReference(res.booking_reference || undefined);
+      setOrderId(res.order_id || undefined);
+      setPnr(res.pnr || undefined);
+      setETicket(res.e_ticket || undefined);
+      setFlightState('confirmed');
+
+      // ISSUE 1 FIX: Truthful confirmation record without fabricated random fallback numbers
+      const confRecord: FlightConfirmationRecord = {
+        booking_reference: res.booking_reference || 'Not provided',
+        ticket_number: res.e_ticket || res.pnr || undefined,
+        carrier_code: selectedFlight?.carrier_code || 'TT',
+        carrier_name: selectedFlight?.carrier_name || 'Airline Partner',
+        flight_number: selectedFlight?.slices?.[0]?.segments?.[0]?.flight_number || 'FL-100',
+        origin_code: selectedFlight?.slices?.[0]?.origin || trip.origin || 'ORIG',
+        origin_city: trip.origin?.split('(')[0]?.trim() || 'Origin',
+        destination_code: selectedFlight?.slices?.[0]?.destination || trip.destination || 'DEST',
+        destination_city: trip.destination?.split('(')[0]?.trim() || 'Destination',
+        departure_time: selectedFlight?.slices?.[0]?.departure_time || trip.start_date || new Date().toISOString(),
+        arrival_time: selectedFlight?.slices?.[0]?.arrival_time || trip.end_date || new Date().toISOString(),
+        cabin_class: selectedFlight?.cabin_class || 'Economy',
+        travelers_count: trip.travelers_count || 1,
+        confirmed_at: new Date().toISOString(),
+        status: 'ticketed',
+      };
+      setFlightConfirmation(confRecord);
+
+      // Save confirmed state
+      const s = getStoredBookingState(trip.trip_id);
+      s.flightState = 'confirmed';
+      s.flightConfirmation = confRecord;
+      saveStoredBookingState(trip.trip_id, s);
+
+      notify(`Flight confirmed and ticketed! Reference: ${res.booking_reference}`, 'success', 'Booking Confirmed');
+
+      if (hotelState === 'confirmed') {
+        setCurrentStage('confirmed');
+      } else {
+        setCurrentStage('hotel_stage');
+      }
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        if (err.detail?.duplicate_attempt) {
+          setFlightState('confirmed');
+          notify('Booking was already confirmed.', 'info', 'Already Confirmed');
+          return;
+        }
+        // Price changed during confirmation
+        const d = err.detail || {};
+        setFlightState('price_changed');
+        setIsFlightApproved(false);
+        setPriceChange({
+          previous_amount: Number(d.original_price || verifiedFlightAmount),
+          current_amount: Number(d.new_price || verifiedFlightAmount),
+          currency: d.currency || 'USD',
+          reason: d.message || 'Fare updated right before confirmation.',
+          change_timestamp: new Date().toISOString(),
+        });
+        notify('Carrier fare adjusted before ticketing. Human re-approval is required.', 'warning', 'Fare Changed');
+        return;
+      }
+      if (err.statusCode === 400 && err.detail?.approval_required) {
+        setFlightState('awaiting_approval');
+        setIsFlightApproved(false);
+        notify('Human approval is required before booking can be completed.', 'error', 'Approval Required');
+        return;
+      }
+      if (err.statusCode === 410) {
+        setFlightState('unavailable');
+        notify('This offer is no longer available from the carrier.', 'error', 'Unavailable');
+        return;
+      }
+
+      setFlightState('failed');
+      setErrorMessage(err.message || 'Flight supplier booking failed.');
+      notify(err.message || 'Flight booking failed.', 'error', 'Booking Error');
+    }
+  };
+
+  // External Checkout Simulation (Legacy fallback)
   const handleCompleteCheckoutHandoff = async () => {
     const confirmRec = await bookingService.confirmFlightHandoffReturn(trip.trip_id, 'token_123');
     setFlightConfirmation(confirmRec);
@@ -219,6 +490,8 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   const handleResetSimulation = () => {
     clearStoredBookingState(trip.trip_id);
     setIsPlanApproved(false);
+    setIsFlightApproved(false);
+    setIsFinalConfirmationChecked(false);
     setApprovedAt(undefined);
     setFlightState('idle');
     setFlightConfirmation(undefined);
@@ -357,13 +630,25 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
                 flight={selectedFlight}
                 origin={trip.origin}
                 destination={trip.destination}
-                travelersCount={trip.travelers_count || 2}
+                travelersCount={trip.travelers_count || 1}
                 verificationState={flightState}
                 priceChange={priceChange}
                 currentAmount={verifiedFlightAmount}
+                currency={verifiedCurrency}
                 confirmation={flightConfirmation}
+                isApproved={isFlightApproved}
+                bookingId={bookingId}
+                bookingReference={bookingReference}
+                orderId={orderId}
+                pnr={pnr}
+                eTicket={eTicket}
+                errorMessage={errorMessage}
+                finalConfirmationChecked={isFinalConfirmationChecked}
+                onFinalConfirmationChange={setIsFinalConfirmationChecked}
                 onVerify={handleVerifyFlight}
                 onAcceptPriceChange={handleAcceptPriceChange}
+                onApproveFlight={handleApproveFlight}
+                onConfirmBooking={handleConfirmFlightBooking}
                 onSelectOtherFlight={() => onNavigateTab('flights')}
                 onStartCheckoutHandoff={() => setIsHandoffModalOpen(true)}
                 onSimulatePriceChange={handleTriggerPriceChange}

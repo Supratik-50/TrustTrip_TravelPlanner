@@ -20,6 +20,7 @@ import { TripDetail } from '../../types/trip';
 import { FlightOffer, FlightSearchRequest } from '../../types/flight';
 import { HotelOffer, HotelSearchRequest, HotelRoom } from '../../types/hotel';
 import { api } from '../../lib/apiClient';
+import { bookingService } from '../../services/bookingService';
 import { useNotification } from '../../context/NotificationContext';
 import { TripHero } from '../travel/TripHero';
 import { PlanningWorkspace } from '../planner/PlanningWorkspace';
@@ -69,6 +70,8 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   // In-trip Flight search state
   const [flightOffers, setFlightOffers] = useState<FlightOffer[]>([]);
   const [isSearchingFlights, setIsSearchingFlights] = useState(false);
+  const [flightSearchError, setFlightSearchError] = useState<string | null>(null);
+  const [flightAvailabilityState, setFlightAvailabilityState] = useState<'available' | 'empty' | 'unavailable' | 'idle'>('idle');
   const [flightSortBy, setFlightSortBy] = useState<FlightSortOption>('recommended');
   const [flightStopsFilter, setFlightStopsFilter] = useState<FlightStopsFilter>('all');
   const [flightRefundableOnly, setFlightRefundableOnly] = useState(false);
@@ -116,21 +119,35 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   const handleSearchFlights = useCallback(
     async (request: FlightSearchRequest) => {
       setIsSearchingFlights(true);
+      setFlightSearchError(null);
       try {
-        const results = await api.searchFlights(request);
+        const payload: FlightSearchRequest = {
+          ...request,
+          trip_id: tripId,
+        };
+        const results = await api.searchFlights(payload);
         setFlightOffers(results);
+        if (results.length === 0) {
+          setFlightAvailabilityState('empty');
+        } else {
+          setFlightAvailabilityState('available');
+        }
       } catch (err: any) {
-        notify(err.message || 'Unable to load flights.', 'error', 'Flight Search Notice');
+        const msg = err.message || 'Unable to load flights.';
+        setFlightSearchError(msg);
+        setFlightAvailabilityState('unavailable');
+        notify(msg, 'error', 'Flight Search Notice');
       } finally {
         setIsSearchingFlights(false);
       }
     },
-    [notify]
+    [tripId, notify]
   );
 
   useEffect(() => {
     if (activeTab === 'flights' && flightOffers.length === 0 && trip) {
       handleSearchFlights({
+        trip_id: trip.trip_id,
         origin: trip.origin || 'San Francisco (SFO)',
         destination: trip.destination || 'Osaka / Kyoto (KIX)',
         departure_date: trip.start_date || '2026-10-14',
@@ -173,13 +190,31 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
     if (!trip) return;
     setIsSelectingFlight(true);
     try {
+      const offerId = offer.offer_id || offer.id;
       const updated = await api.selectTripOffer(trip.trip_id, {
         offer_type: 'flight',
-        offer_id: offer.id,
-        snapshot_id: offer.snapshot_id || `fl_snap_${offer.id}`,
+        offer_id: offerId,
+        snapshot_id: offer.snapshot_id || offerId,
         metadata: offer,
       });
       setTrip(updated);
+
+      // Pre-initialize Section 5B booking intent on the backend
+      try {
+        await bookingService.selectFlightOffer(trip.trip_id, offerId, [
+          {
+            given_name: 'Traveler',
+            family_name: 'User',
+            born_on: '1990-01-01',
+            title: 'mr',
+            gender: 'm',
+            email: 'traveler@trusttrip.com',
+          },
+        ]);
+      } catch {
+        // Soft catch if already initialized
+      }
+
       notify(
         `Selected ${offer.carrier_name} (${offer.slices[0]?.origin} ➔ ${offer.slices[0]?.destination}). Canonical snapshot locked.`,
         'success',
@@ -692,6 +727,53 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
                   tripContext={{ tripId: trip.trip_id, destinationName: trip.destination }}
                 />
               ))}
+            </div>
+          )}
+
+          {/* EMPTY STATE */}
+          {!isSearchingFlights && !flightSearchError && flightOffers.length === 0 && (
+            <div className="py-16 text-center bg-[var(--surface)] rounded-3xl border border-dashed border-[var(--border)] space-y-3">
+              <div className="w-12 h-12 rounded-full bg-[var(--surface-muted)] text-[var(--text-muted)] mx-auto flex items-center justify-center">
+                <Plane className="w-6 h-6 rotate-45" />
+              </div>
+              <h4 className="text-lg font-bold font-editorial text-[var(--text-primary)]">
+                No flights found for this route
+              </h4>
+              <p className="text-xs text-[var(--text-secondary)] max-w-md mx-auto">
+                The carrier partners returned no matching flights for {trip.origin} → {trip.destination} on these dates. Try adjusting departure or return dates.
+              </p>
+            </div>
+          )}
+
+          {/* UNAVAILABLE / ERROR STATE */}
+          {!isSearchingFlights && flightSearchError && (
+            <div className="py-16 text-center bg-[var(--surface)] rounded-3xl border border-[var(--status-danger)]/30 space-y-3">
+              <div className="w-12 h-12 rounded-full bg-[var(--status-danger)]/10 text-[var(--status-danger)] mx-auto flex items-center justify-center">
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <h4 className="text-lg font-bold font-editorial text-[var(--text-primary)]">
+                Flight search unavailable
+              </h4>
+              <p className="text-xs text-[var(--text-secondary)] max-w-md mx-auto">
+                {flightSearchError}
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  handleSearchFlights({
+                    trip_id: trip.trip_id,
+                    origin: trip.origin,
+                    destination: trip.destination,
+                    departure_date: trip.start_date,
+                    return_date: trip.end_date,
+                    passengers: trip.travelers_count || 1,
+                  })
+                }
+                leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
+              >
+                Retry Search
+              </Button>
             </div>
           )}
         </div>

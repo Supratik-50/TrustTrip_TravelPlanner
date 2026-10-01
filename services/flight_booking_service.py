@@ -770,8 +770,12 @@ class FlightBookingService:
         completed_intent = copy.deepcopy(intent)
         completed_intent["status"] = BookingStatus.COMPLETED.value
         completed_intent["provider_reference"] = str(booking_ref)
+        pnr_val = booking_res.get("pnr")
+        eticket_val = booking_res.get("e_ticket")
         completed_intent["metadata"]["booking_reference"] = str(booking_ref)
         completed_intent["metadata"]["order_id"] = str(order_id) if order_id else None
+        completed_intent["metadata"]["pnr"] = str(pnr_val) if pnr_val else None
+        completed_intent["metadata"]["e_ticket"] = str(eticket_val) if eticket_val else None
         completed_intent["metadata"]["completed_at"] = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -798,8 +802,8 @@ class FlightBookingService:
             order_id=str(order_id) if order_id else None,
             price=expected_amount,
             currency=currency,
-            pnr=booking_res.get("pnr") or str(booking_ref),
-            e_ticket=booking_res.get("e_ticket"),
+            pnr=str(pnr_val) if pnr_val else None,
+            e_ticket=str(eticket_val) if eticket_val else None,
             message="Flight booking confirmed successfully.",
         )
 
@@ -823,6 +827,8 @@ class FlightBookingService:
             "passenger_count": meta.get("passenger_count", 1),
             "booking_reference": meta.get("booking_reference"),
             "order_id": meta.get("order_id"),
+            "pnr": meta.get("pnr"),
+            "e_ticket": meta.get("e_ticket"),
             "created_at": intent["created_at"].isoformat() if hasattr(intent["created_at"], "isoformat") else str(intent["created_at"]),
         }
 

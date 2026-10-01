@@ -235,6 +235,8 @@ class FlightBookingConfirmationResponse(BaseModel):
     status: str  # "COMPLETED", "FAILED", "PRICE_CHANGED", "UNAVAILABLE"
     booking_reference: str | None = None
     order_id: str | None = None
+    pnr: str | None = None
+    e_ticket: str | None = None
     price: float | None = None
     currency: str | None = None
     message: str | None = None

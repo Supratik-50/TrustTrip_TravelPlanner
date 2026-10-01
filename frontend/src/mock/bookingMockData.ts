@@ -53,8 +53,8 @@ export function generateMockFlightConfirmation(
   origin = 'Kolkata (CCU)',
   destination = 'Paris (CDG)'
 ): FlightConfirmationRecord {
-  const refCode = `TT-FL-${Math.floor(1000 + Math.random() * 9000)}`;
-  const ticketNum = `098-${Math.floor(1000000000 + Math.random() * 9000000000)}`;
+  const refCode = `TT-FL-${tripId.slice(-4).toUpperCase() || 'CONFIRMED'}`;
+  const ticketNum = undefined;
 
   return {
     booking_reference: refCode,
@@ -277,6 +277,93 @@ class MockBookingService implements IBookingService {
     // Frontend callback boundary: later Copilot connects to POST /api/travel/pdf
     // In mock mode, triggers an informational browser notification / print dialog trigger
     return;
+  }
+
+  // Section 5B / 5C Mocks
+  private mockActiveBookingIds: Map<string, string> = new Map();
+
+  async selectFlightOffer(tripId: string, offerId: string, _passengers: any[]): Promise<any> {
+    await this.delay(300);
+    const bId = `bkg_${tripId}_${Date.now().toString(36)}`;
+    this.mockActiveBookingIds.set(tripId, bId);
+    return {
+      success: true,
+      booking_id: bId,
+      trip_id: tripId,
+      offer_id: offerId,
+      status: 'SELECTED',
+      price: 860,
+      currency: 'USD',
+      human_approval_required: true,
+      approved: false,
+    };
+  }
+
+  async revalidateFlightContract(bookingId: string, acceptedPrice?: number): Promise<any> {
+    await this.delay(400);
+    return {
+      success: true,
+      booking_id: bookingId,
+      status: 'READY_FOR_BOOKING',
+      is_valid: true,
+      price_changed: false,
+      original_price: acceptedPrice || 860,
+      current_price: acceptedPrice || 860,
+      currency: 'USD',
+      human_approval_required: true,
+      approved: false,
+    };
+  }
+
+  async approveFlightBooking(bookingId: string, _notes?: string): Promise<any> {
+    await this.delay(300);
+    return {
+      success: true,
+      booking_id: bookingId,
+      status: 'READY_FOR_BOOKING',
+      approved: true,
+      approved_at: new Date().toISOString(),
+      message: 'Human approval recorded.',
+    };
+  }
+
+  async confirmFlightBooking(bookingId: string): Promise<any> {
+    await this.delay(600);
+    return {
+      success: true,
+      booked: true,
+      booking_id: bookingId,
+      status: 'COMPLETED',
+      booking_reference: `TT-FL-${bookingId.slice(-4).toUpperCase() || 'MOCK'}`,
+      pnr: undefined,
+      e_ticket: undefined,
+      price: 860,
+      currency: 'USD',
+    };
+  }
+
+  async getFlightBooking(bookingId: string): Promise<any> {
+    await this.delay(200);
+    return {
+      booking_id: bookingId,
+      trip_id: 'trip_1',
+      offer_id: 'offer_1',
+      status: 'COMPLETED',
+      expected_amount: 860,
+      currency: 'USD',
+      approved: true,
+      passenger_count: 1,
+      booking_reference: 'TT-FL-9988',
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  getActiveBookingId(tripId: string): string | undefined {
+    return this.mockActiveBookingIds.get(tripId);
+  }
+
+  setActiveBookingId(tripId: string, bookingId: string): void {
+    this.mockActiveBookingIds.set(tripId, bookingId);
   }
 }
 

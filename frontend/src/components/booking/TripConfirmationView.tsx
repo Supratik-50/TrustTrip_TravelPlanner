@@ -175,13 +175,13 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
             <div className="flex justify-between items-center">
               <span className="text-[var(--text-muted)]">Booking Reference:</span>
               <span className="font-mono font-bold text-[var(--primary)] text-sm">
-                {flightConfirmation?.booking_reference || 'TRAVEL123'}
+                {flightConfirmation?.booking_reference || 'Not provided'}
               </span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-[var(--text-muted)]">Electronic Ticket:</span>
+              <span className="text-[var(--text-muted)]">Electronic Ticket / PNR:</span>
               <span className="font-mono text-[var(--text-primary)]">
-                {flightConfirmation?.ticket_number || '098-4421890312'}
+                {flightConfirmation?.ticket_number || 'Not provided by provider'}
               </span>
             </div>
             <div className="flex justify-between items-center">

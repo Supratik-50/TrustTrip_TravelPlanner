@@ -12,7 +12,20 @@ import {
   TripRevision,
   CreateRevisionRequest,
 } from '../types/trip';
-import { FlightOffer, FlightSearchRequest, BookingIntent } from '../types/flight';
+import {
+  FlightOffer,
+  FlightSearchRequest,
+  BookingIntent,
+  NormalizedFlightOffer,
+  FlightSearchResponse,
+  FlightBookingSelectionRequest,
+  FlightBookingSelectionResponse,
+  FlightBookingRevalidationResponse,
+  FlightBookingApprovalResponse,
+  FlightBookingConfirmationResponse,
+  FlightBookingDetails,
+  toFlightOffer,
+} from '../types/flight';
 import {
   HotelOffer,
   HotelSearchRequest,
@@ -668,7 +681,7 @@ export class ApiClient {
         body.destination || 'KIX',
         body.departure_date || '2026-10-14',
         body.return_date,
-        body.cabin_class,
+        body.cabin_class as any,
         body.passengers || 1
       );
       return {
@@ -868,7 +881,7 @@ export class ApiClient {
         type: 'flight',
         status: 'confirmed',
         confirmation_reference: `TT-FL-${bookingId.slice(-4).toUpperCase() || '8924'}`,
-        ticket_number: `098-${Math.floor(1000000000 + Math.random() * 9000000000)}`,
+        ticket_number: undefined,
         confirmed_at: new Date().toISOString(),
         total_amount: '860',
         currency: 'USD',
@@ -1171,9 +1184,28 @@ export class ApiClient {
   }
 
   // --- Flight Canonical Endpoints (Part 3) ---
+  // --- Flight Canonical Endpoints (Section 5A / Section 5B / 5C) ---
   async searchFlights(request: FlightSearchRequest): Promise<FlightOffer[]> {
     try {
-      const response = await this.request<{ offers?: FlightOffer[] } | FlightOffer[]>(
+      // 1. If trip_id is provided, use the authoritative Section 5A contract
+      if (request.trip_id) {
+        const response = await this.request<FlightSearchResponse>('/api/flights/search', {
+          method: 'POST',
+          body: JSON.stringify({
+            trip_id: request.trip_id,
+            cabin_class: request.cabin_class || 'economy',
+            max_connections: request.max_connections ?? 2,
+          }),
+        });
+
+        if (response?.offers && Array.isArray(response.offers)) {
+          return response.offers.map((off) => toFlightOffer(off));
+        }
+        return [];
+      }
+
+      // 2. Fallback to flexible search for standalone search queries without a trip_id
+      const response = await this.request<{ offers?: (FlightOffer | NormalizedFlightOffer)[] } | FlightOffer[]>(
         '/api/flights/search-flexible',
         {
           method: 'POST',
@@ -1183,7 +1215,8 @@ export class ApiClient {
       if (Array.isArray(response)) {
         return response;
       }
-      return response?.offers || [];
+      const rawOffers = response?.offers || [];
+      return rawOffers.map((o: any) => (o.offer_id ? toFlightOffer(o) : o));
     } catch (err: any) {
       if (err.code === 'NETWORK_ERROR' || err.status === 400 || err.status === 404 || err.status === 422 || err.status === 500) {
         const mock = this.handleMockFallback<{ offers: FlightOffer[] }>(
@@ -1197,6 +1230,25 @@ export class ApiClient {
       }
       throw err;
     }
+  }
+
+  /**
+   * Section 5A Canonical Flight Search for a specific Trip.
+   * Returns authoritative FlightSearchResponse including availability_state ('available' | 'empty' | 'unavailable' | 'error').
+   */
+  async searchFlightsForTrip(
+    tripId: string,
+    options?: { cabin_class?: string; max_connections?: number }
+  ): Promise<FlightSearchResponse> {
+    const payload = {
+      trip_id: tripId,
+      cabin_class: options?.cabin_class || 'economy',
+      max_connections: options?.max_connections ?? 2,
+    };
+    return await this.request<FlightSearchResponse>('/api/flights/search', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   }
 
   // --- Canonical Offer Selection (Part 3) ---
@@ -1292,6 +1344,98 @@ export class ApiClient {
       }
       throw err;
     }
+  }
+
+  // --- Section 5B & 5C Authoritative Flight Booking Endpoints ---
+
+  /**
+   * Select a persisted flight offer snapshot and initialize a booking intent.
+   * POST /api/flights/booking/select
+   */
+  async selectFlightBooking(
+    request: FlightBookingSelectionRequest
+  ): Promise<FlightBookingSelectionResponse> {
+    return await this.request<FlightBookingSelectionResponse>('/api/flights/booking/select', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /**
+   * Revalidate live provider price and availability.
+   * POST /api/flights/booking/{booking_id}/revalidate
+   */
+  async revalidateFlight(
+    bookingId: string,
+    acceptedPrice?: number
+  ): Promise<FlightBookingRevalidationResponse> {
+    return await this.request<FlightBookingRevalidationResponse>(
+      `/api/flights/booking/${bookingId}/revalidate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          booking_id: bookingId,
+          ...(acceptedPrice !== undefined ? { accepted_price: acceptedPrice } : {}),
+        }),
+      }
+    );
+  }
+
+  /**
+   * Record explicit Human-In-The-Loop (HITL) approval for a revalidated booking.
+   * POST /api/flights/booking/{booking_id}/approve
+   */
+  async approveFlight(
+    bookingId: string,
+    options?: { approved?: boolean; notes?: string }
+  ): Promise<FlightBookingApprovalResponse> {
+    return await this.request<FlightBookingApprovalResponse>(
+      `/api/flights/booking/${bookingId}/approve`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          booking_id: bookingId,
+          approved: options?.approved ?? true,
+          ...(options?.notes ? { notes: options.notes } : {}),
+        }),
+      }
+    );
+  }
+
+  /**
+   * Confirm booking with provider after revalidation and human approval.
+   * POST /api/flights/booking/{booking_id}/confirm
+   */
+  async confirmFlightBooking(
+    bookingId: string,
+    options?: {
+      final_confirmation?: boolean;
+      payment?: Record<string, any>;
+      payment_mode?: string;
+    }
+  ): Promise<FlightBookingConfirmationResponse> {
+    return await this.request<FlightBookingConfirmationResponse>(
+      `/api/flights/booking/${bookingId}/confirm`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          booking_id: bookingId,
+          final_confirmation: options?.final_confirmation ?? true,
+          ...(options?.payment ? { payment: options.payment } : {}),
+          payment_mode: options?.payment_mode || 'auto',
+        }),
+      }
+    );
+  }
+
+  /**
+   * Query authoritative flight booking status.
+   * GET /api/flights/booking/{booking_id}
+   */
+  async getFlightBooking(bookingId: string): Promise<FlightBookingDetails> {
+    return await this.request<FlightBookingDetails>(`/api/flights/booking/${bookingId}`, {
+      method: 'GET',
+    });
   }
 
   // --- Part 4: Research Canonical Endpoints ---
