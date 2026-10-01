@@ -434,6 +434,35 @@ class FlightBookingService:
         expected_amount = float(intent["expected_amount"])
         currency = str(intent["currency"]).upper()
 
+        # Check staleness / expiration
+        now = datetime.now(timezone.utc)
+        expires_at = intent.get("expires_at")
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at)
+            except Exception:
+                expires_at = None
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        snapshot_expires_at = snapshot.expires_at
+        if snapshot_expires_at and snapshot_expires_at.tzinfo is None:
+            snapshot_expires_at = snapshot_expires_at.replace(tzinfo=timezone.utc)
+
+        if (expires_at and expires_at < now) or (snapshot_expires_at and snapshot_expires_at < now):
+            intent["status"] = BookingStatus.EXPIRED.value
+            intent["metadata"]["approved"] = False
+            intent["metadata"]["approved_at"] = None
+            self._save_intent(intent)
+            raise OfferStaleError("The flight offer snapshot or intent has expired.")
+
+        if snapshot.availability == AvailabilityStatus.UNAVAILABLE:
+            intent["status"] = BookingStatus.UNAVAILABLE.value
+            intent["metadata"]["approved"] = False
+            intent["metadata"]["approved_at"] = None
+            self._save_intent(intent)
+            raise OfferUnavailableError("The underlying flight offer snapshot is marked unavailable.")
+
         # Query provider abstraction
         try:
             provider_offer = await asyncio.to_thread(self.flight_service.recheck, raw_provider_offer_id)
@@ -537,6 +566,7 @@ class FlightBookingService:
         now_iso = datetime.now(timezone.utc).isoformat()
         intent["metadata"]["approved"] = approved
         intent["metadata"]["approved_at"] = now_iso
+        intent["metadata"]["approved_price"] = float(intent["expected_amount"])
         if notes:
             intent["metadata"]["approval_notes"] = notes
 
@@ -605,7 +635,12 @@ class FlightBookingService:
         if not final_confirmation:
             raise FinalConfirmationRequiredError("Final user confirmation is required before booking.")
 
-        # 4. Immediate pre-booking revalidation
+        # 4. Trip ownership and relationship validation
+        trip = self.trip_store.get_trip(str(intent["trip_id"]), str(user_id))
+        if not trip:
+            raise BookingNotFoundError(f"Trip '{intent['trip_id']}' not found.")
+
+        # 5. Immediate pre-booking revalidation & staleness verification
         snapshot_id = intent["selected_offer_snapshot_id"]
         snapshot = self.store.get_snapshot(snapshot_id, user_id)
         if not snapshot:
@@ -615,9 +650,52 @@ class FlightBookingService:
             self._save_intent(intent)
             raise OfferUnavailableError(f"Snapshot '{snapshot_id}' not found.")
 
+        # Check staleness / expiration of intent and snapshot
+        now = datetime.now(timezone.utc)
+        expires_at = intent.get("expires_at")
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at)
+            except Exception:
+                expires_at = None
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        snapshot_expires_at = snapshot.expires_at
+        if snapshot_expires_at and snapshot_expires_at.tzinfo is None:
+            snapshot_expires_at = snapshot_expires_at.replace(tzinfo=timezone.utc)
+
+        if (expires_at and expires_at < now) or (snapshot_expires_at and snapshot_expires_at < now):
+            intent["status"] = BookingStatus.EXPIRED.value
+            intent["metadata"]["approved"] = False
+            intent["metadata"]["approved_at"] = None
+            self._save_intent(intent)
+            raise OfferStaleError(f"The flight booking intent or underlying offer snapshot has expired.")
+
+        if snapshot.availability == AvailabilityStatus.UNAVAILABLE:
+            intent["status"] = BookingStatus.UNAVAILABLE.value
+            intent["metadata"]["approved"] = False
+            intent["metadata"]["approved_at"] = None
+            self._save_intent(intent)
+            raise OfferUnavailableError(f"The underlying flight offer snapshot is marked unavailable.")
+
         raw_provider_offer_id = snapshot.provider_offer_id
         expected_amount = float(intent["expected_amount"])
         currency = str(intent["currency"]).upper()
+
+        # Enforce approved price binding consistency
+        approved_price = intent.get("metadata", {}).get("approved_price")
+        if approved_price is not None and abs(float(approved_price) - expected_amount) > 0.01:
+            intent["status"] = BookingStatus.PRICE_CHANGED.value
+            intent["metadata"]["approved"] = False
+            intent["metadata"]["approved_at"] = None
+            self._save_intent(intent)
+            raise PriceChangedError(
+                original_price=float(approved_price),
+                new_price=expected_amount,
+                currency=currency,
+                message=f"Fare has changed since approval from {approved_price} to {expected_amount}. Fresh approval required.",
+            )
 
         try:
             latest_offer = await asyncio.to_thread(self.flight_service.recheck, raw_provider_offer_id)
