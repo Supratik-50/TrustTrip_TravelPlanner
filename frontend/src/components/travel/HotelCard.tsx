@@ -32,7 +32,7 @@ export const HotelCard: React.FC<HotelCardProps> = ({
   onSelect,
   isSelecting = false,
   onPlanTripWithHotel,
-  nightsCount = 5,
+  nightsCount,
 }) => {
   const [selectedRoomId, setSelectedRoomId] = useState<string>(
     hotel.rooms?.[0]?.id || ''
@@ -43,13 +43,31 @@ export const HotelCard: React.FC<HotelCardProps> = ({
   const selectedRoom =
     hotel.rooms?.find((r) => r.id === selectedRoomId) || hotel.rooms?.[0];
 
-  const effectiveTotal = selectedRoom
-    ? selectedRoom.price_per_night * nightsCount
+  const stayNights = nightsCount ?? hotel.nights ?? null;
+
+  const effectiveTotal = selectedRoom?.total_price != null
+    ? selectedRoom.total_price
+    : selectedRoom?.price_per_night != null && stayNights != null
+    ? selectedRoom.price_per_night * stayNights
     : hotel.total_amount;
 
-  const effectiveNightly = selectedRoom
+  const effectiveNightly = selectedRoom?.price_per_night != null
     ? selectedRoom.price_per_night
-    : Math.round(hotel.total_amount / (nightsCount || 1));
+    : (hotel.total_amount != null && stayNights != null && stayNights > 0
+      ? Math.round(hotel.total_amount / stayNights)
+      : null);
+
+  const hasBreakfast = Boolean(
+    (hotel.board_name && hotel.board_name.toLowerCase().includes('breakfast')) ||
+    (hotel.amenities && hotel.amenities.some((a) => a.toLowerCase().includes('breakfast'))) ||
+    (selectedRoom?.description && selectedRoom.description.toLowerCase().includes('breakfast')) ||
+    (selectedRoom?.amenities && selectedRoom.amenities.some((a) => a.toLowerCase().includes('breakfast')))
+  );
+
+  const hasWifi = Boolean(
+    (hotel.amenities && hotel.amenities.some((a) => a.toLowerCase().includes('wifi') || a.toLowerCase().includes('wi-fi'))) ||
+    (selectedRoom?.amenities && selectedRoom.amenities.some((a) => a.toLowerCase().includes('wifi') || a.toLowerCase().includes('wi-fi')))
+  );
 
   return (
     <div
@@ -81,25 +99,29 @@ export const HotelCard: React.FC<HotelCardProps> = ({
             </div>
           )}
 
-          {/* Star rating pill overlay */}
-          <div className="absolute top-3 left-3 bg-black/60 backdrop-blur-md text-white px-2.5 py-1 rounded-full text-xs flex items-center gap-1 shadow-xs">
-            <div className="flex items-center text-amber-400">
-              {Array.from({ length: hotel.stars || 4 }).map((_, i) => (
-                <Star key={i} className="w-3 h-3 fill-current" />
-              ))}
+          {/* Star rating pill overlay - ONLY render when provider stars data exists */}
+          {hotel.stars != null && hotel.stars > 0 && (
+            <div data-testid="hotel-stars" className="absolute top-3 left-3 bg-black/60 backdrop-blur-md text-white px-2.5 py-1 rounded-full text-xs flex items-center gap-1 shadow-xs">
+              <div className="flex items-center text-amber-400">
+                {Array.from({ length: hotel.stars }).map((_, i) => (
+                  <Star key={i} className="w-3 h-3 fill-current" />
+                ))}
+              </div>
+              <span className="font-semibold ml-0.5">{hotel.stars}-Star Stay</span>
             </div>
-            <span className="font-semibold ml-0.5">{hotel.stars}-Star Stay</span>
-          </div>
+          )}
 
-          {/* Review Score Badge overlay */}
-          <div className="absolute bottom-3 right-3 bg-[var(--surface)]/95 backdrop-blur-md px-2.5 py-1 rounded-xl shadow-md border border-[var(--border)] flex items-center gap-2">
-            <span className="text-xs font-bold text-[var(--text-primary)]">
-              {hotel.rating >= 9.5 ? 'Exceptional' : hotel.rating >= 9.0 ? 'Superb' : 'Fabulous'}
-            </span>
-            <span className="px-1.5 py-0.5 rounded-lg bg-[var(--primary)] text-white text-xs font-bold font-mono">
-              {hotel.rating.toFixed(1)}
-            </span>
-          </div>
+          {/* Review Score Badge overlay - ONLY render when provider rating exists */}
+          {hotel.rating != null && (
+            <div data-testid="hotel-rating" className="absolute bottom-3 right-3 bg-[var(--surface)]/95 backdrop-blur-md px-2.5 py-1 rounded-xl shadow-md border border-[var(--border)] flex items-center gap-2">
+              <span className="text-xs font-bold text-[var(--text-primary)]">
+                {hotel.rating >= 9.5 ? 'Exceptional' : hotel.rating >= 9.0 ? 'Superb' : hotel.rating >= 8.0 ? 'Fabulous' : 'Good'}
+              </span>
+              <span className="px-1.5 py-0.5 rounded-lg bg-[var(--primary)] text-white text-xs font-bold font-mono">
+                {Number(hotel.rating).toFixed(1)}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Right: Property Details & Room Options (7 cols) */}
@@ -127,18 +149,24 @@ export const HotelCard: React.FC<HotelCardProps> = ({
 
             {/* Cancellation Policy and Badges */}
             <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
-              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[var(--status-success)]/10 text-[var(--status-success)] border border-[var(--status-success)]/20">
-                <ShieldCheck className="w-3 h-3" />
-                {hotel.cancellation_policy}
-              </span>
-              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[var(--surface-muted)] text-[var(--text-secondary)] border border-[var(--border)]">
-                <Coffee className="w-3 h-3 text-[var(--primary)]" />
-                Breakfast Included
-              </span>
-              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[var(--surface-muted)] text-[var(--text-secondary)] border border-[var(--border)]">
-                <Wifi className="w-3 h-3 text-[var(--primary)]" />
-                Complimentary Wi-Fi
-              </span>
+              {hotel.cancellation_policy && (
+                <span data-testid="badge-cancellation" className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[var(--status-success)]/10 text-[var(--status-success)] border border-[var(--status-success)]/20">
+                  <ShieldCheck className="w-3 h-3" />
+                  {hotel.cancellation_policy}
+                </span>
+              )}
+              {hasBreakfast && (
+                <span data-testid="badge-breakfast" className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[var(--surface-muted)] text-[var(--text-secondary)] border border-[var(--border)]">
+                  <Coffee className="w-3 h-3 text-[var(--primary)]" />
+                  Breakfast Included
+                </span>
+              )}
+              {hasWifi && (
+                <span data-testid="badge-wifi" className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[var(--surface-muted)] text-[var(--text-secondary)] border border-[var(--border)]">
+                  <Wifi className="w-3 h-3 text-[var(--primary)]" />
+                  Complimentary Wi-Fi
+                </span>
+              )}
             </div>
           </div>
 
@@ -150,28 +178,38 @@ export const HotelCard: React.FC<HotelCardProps> = ({
                   <span className="font-semibold text-[var(--text-primary)] block text-sm">
                     {selectedRoom.name}
                   </span>
-                  <p className="text-[11px] text-[var(--text-secondary)] line-clamp-2 mt-0.5">
-                    {selectedRoom.description}
-                  </p>
+                  {selectedRoom.description && (
+                    <p className="text-[11px] text-[var(--text-secondary)] line-clamp-2 mt-0.5">
+                      {selectedRoom.description}
+                    </p>
+                  )}
                 </div>
-                <div className="text-right shrink-0">
-                  <span className="font-bold text-sm text-[var(--primary)] font-mono">
-                    ${selectedRoom.price_per_night}
-                  </span>
-                  <span className="text-[10px] text-[var(--text-muted)] block">/ night</span>
-                </div>
+                {selectedRoom.price_per_night != null && (
+                  <div className="text-right shrink-0">
+                    <span className="font-bold text-sm text-[var(--primary)] font-mono">
+                      {formatCurrency(selectedRoom.price_per_night, hotel.currency)}
+                    </span>
+                    <span className="text-[10px] text-[var(--text-muted)] block">/ night</span>
+                  </div>
+                )}
               </div>
 
-              <div className="flex flex-wrap items-center gap-3 pt-1 text-[11px] text-[var(--text-secondary)]">
-                <span className="flex items-center gap-1">
-                  <Bed className="w-3 h-3 text-[var(--primary)]" />
-                  {selectedRoom.beds}
-                </span>
-                <span className="flex items-center gap-1">
-                  <Users className="w-3 h-3 text-[var(--primary)]" />
-                  Up to {selectedRoom.capacity} Guests
-                </span>
-              </div>
+              {(selectedRoom.beds || selectedRoom.capacity != null) && (
+                <div className="flex flex-wrap items-center gap-3 pt-1 text-[11px] text-[var(--text-secondary)]">
+                  {selectedRoom.beds && (
+                    <span className="flex items-center gap-1">
+                      <Bed className="w-3 h-3 text-[var(--primary)]" />
+                      {selectedRoom.beds}
+                    </span>
+                  )}
+                  {selectedRoom.capacity != null && (
+                    <span className="flex items-center gap-1">
+                      <Users className="w-3 h-3 text-[var(--primary)]" />
+                      Up to {selectedRoom.capacity} Guests
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -209,16 +247,22 @@ export const HotelCard: React.FC<HotelCardProps> = ({
                         <div className="font-semibold text-[var(--text-primary)]">
                           {room.name}
                         </div>
-                        <div className="text-[11px] text-[var(--text-muted)] flex items-center gap-2">
-                          <span>{room.beds}</span> • <span>Max {room.capacity} guests</span>
+                        {(room.beds || room.capacity != null) && (
+                          <div className="text-[11px] text-[var(--text-muted)] flex items-center gap-2">
+                            {room.beds && <span>{room.beds}</span>}
+                            {room.beds && room.capacity != null && <span>•</span>}
+                            {room.capacity != null && <span>Max {room.capacity} guests</span>}
+                          </div>
+                        )}
+                      </div>
+                      {room.price_per_night != null && (
+                        <div className="text-right shrink-0">
+                          <span className="font-bold text-sm text-[var(--text-primary)] font-mono">
+                            {formatCurrency(room.price_per_night, hotel.currency)}
+                          </span>
+                          <span className="text-[10px] text-[var(--text-muted)] block">/ night</span>
                         </div>
-                      </div>
-                      <div className="text-right shrink-0">
-                        <span className="font-bold text-sm text-[var(--text-primary)] font-mono">
-                          {formatCurrency(room.price_per_night, hotel.currency)}
-                        </span>
-                        <span className="text-[10px] text-[var(--text-muted)] block">/ night</span>
-                      </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -237,9 +281,11 @@ export const HotelCard: React.FC<HotelCardProps> = ({
                   total
                 </span>
               </div>
-              <p className="text-[11px] text-[var(--text-muted)]">
-                {formatCurrency(effectiveNightly, hotel.currency)} / night for {nightsCount} {nightsCount === 1 ? 'night' : 'nights'} stay
-              </p>
+              {effectiveNightly != null && stayNights != null && (
+                <p className="text-[11px] text-[var(--text-muted)]">
+                  {formatCurrency(effectiveNightly, hotel.currency)} / night for {stayNights} {stayNights === 1 ? 'night' : 'nights'} stay
+                </p>
+              )}
             </div>
 
             <div className="flex items-center gap-2.5">

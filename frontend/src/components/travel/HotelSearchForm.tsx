@@ -10,15 +10,17 @@ interface HotelSearchFormProps {
   initialGuests?: number;
   onSearch: (request: HotelSearchRequest) => void;
   isLoading?: boolean;
+  disabled?: boolean;
 }
 
 export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
-  initialCity = 'Kyoto, Japan',
-  initialCheckIn = '2026-10-14',
-  initialCheckOut = '2026-10-24',
-  initialGuests = 2,
+  initialCity = '',
+  initialCheckIn = '',
+  initialCheckOut = '',
+  initialGuests = 1,
   onSearch,
   isLoading = false,
+  disabled = false,
 }) => {
   const [city, setCity] = useState(initialCity);
   const [checkIn, setCheckIn] = useState(initialCheckIn);
@@ -56,7 +58,8 @@ export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
               type="text"
               value={city}
               onChange={(e) => setCity(e.target.value)}
-              placeholder="e.g. Kyoto, Japan"
+              disabled={disabled}
+              placeholder="Enter a destination"
               required
               className="w-full px-4 py-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)] text-sm focus:border-[var(--primary)] focus:ring-1 focus:ring-[var(--primary)] outline-hidden transition-all"
             />
@@ -72,6 +75,7 @@ export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
               type="date"
               value={checkIn}
               onChange={(e) => setCheckIn(e.target.value)}
+              disabled={disabled}
               required
               className="w-full px-3 py-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)] text-sm focus:border-[var(--primary)] focus:ring-1 focus:ring-[var(--primary)] outline-hidden transition-all"
             />
@@ -87,6 +91,7 @@ export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
               type="date"
               value={checkOut}
               onChange={(e) => setCheckOut(e.target.value)}
+              disabled={disabled}
               required
               className="w-full px-3 py-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)] text-sm focus:border-[var(--primary)] focus:ring-1 focus:ring-[var(--primary)] outline-hidden transition-all"
             />
@@ -99,6 +104,7 @@ export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
               variant="primary"
               size="md"
               isLoading={isLoading}
+              disabled={disabled}
               className="w-full h-[42px] px-0 flex items-center justify-center"
               title="Search Stays"
             >
@@ -119,6 +125,7 @@ export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
                 key={idx}
                 type="button"
                 onClick={() => setCity(c.city)}
+                disabled={disabled}
                 className="px-2.5 py-1 rounded-lg bg-[var(--surface-muted)] hover:bg-[var(--primary-soft)] hover:text-[var(--primary)] text-[11px] font-medium transition-colors"
               >
                 {c.label}
@@ -133,6 +140,7 @@ export const HotelSearchForm: React.FC<HotelSearchFormProps> = ({
               aria-label="Guests count"
               value={guests}
               onChange={(e) => setGuests(Number(e.target.value))}
+              disabled={disabled}
               className="font-medium text-[var(--text-primary)] bg-transparent focus:outline-hidden cursor-pointer"
             >
               {[1, 2, 3, 4, 5, 6].map((n) => (

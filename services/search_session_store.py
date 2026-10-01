@@ -571,6 +571,7 @@ class SearchSessionStore:
         self,
         snapshot_id: UUID | str,
         user_id: UUID | str,
+        conn: psycopg.Connection | None = None,
     ) -> dict[str, Any] | None:
         """Privileged backend retrieval of decrypted raw supplier payload."""
         sid_str = str(snapshot_id)
@@ -586,16 +587,23 @@ class SearchSessionStore:
             blob = record.get("raw_payload_encrypted")
             return decrypt_payload(blob, self._key) if blob else None
 
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT s.raw_payload_encrypted
-                FROM offer_snapshots s
-                JOIN search_sessions ss ON s.session_id = ss.id
-                WHERE s.id = %s AND ss.user_id = %s
-                """,
-                (sid_str, uid_str),
-            ).fetchone()
+        query = """
+            SELECT s.raw_payload_encrypted
+            FROM offer_snapshots s
+            JOIN search_sessions ss ON s.session_id = ss.id
+            WHERE s.id = %s AND ss.user_id = %s
+        """
+        params = (sid_str, uid_str)
+
+        if conn is not None:
+            row = conn.execute(query, params).fetchone()
+            if not row or not row["raw_payload_encrypted"]:
+                return None
+            blob = bytes(row["raw_payload_encrypted"])
+            return decrypt_payload(blob, self._key)
+
+        with self._connect() as local_conn:
+            row = local_conn.execute(query, params).fetchone()
             if not row or not row["raw_payload_encrypted"]:
                 return None
             blob = bytes(row["raw_payload_encrypted"])

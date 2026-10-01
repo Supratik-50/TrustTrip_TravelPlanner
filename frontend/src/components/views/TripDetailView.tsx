@@ -81,6 +81,7 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   // In-trip Hotel search state
   const [hotelOffers, setHotelOffers] = useState<HotelOffer[]>([]);
   const [isSearchingHotels, setIsSearchingHotels] = useState(false);
+  const [hotelSearchError, setHotelSearchError] = useState<string | null>(null);
   const [hotelSortBy, setHotelSortBy] = useState<HotelSortOption>('rating');
   const [hotelStarFilter, setHotelStarFilter] = useState<HotelStarFilter>('all');
   const [hotelFreeCancellation, setHotelFreeCancellation] = useState(false);
@@ -158,30 +159,62 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
     }
   }, [activeTab, flightOffers.length, trip, handleSearchFlights]);
 
-  // Perform initial search for hotels when user switches to hotels tab
+  // Perform search for hotels using canonical trip data
   const handleSearchHotels = useCallback(
-    async (request: HotelSearchRequest) => {
+    async (_request?: Partial<HotelSearchRequest>) => {
+      if (
+        !tripId ||
+        !trip?.destination ||
+        !trip?.start_date ||
+        !trip?.end_date ||
+        trip?.travelers_count == null ||
+        Number(trip.travelers_count) < 1
+      ) {
+        setHotelSearchError('Missing canonical trip details for accommodation search.');
+        return;
+      }
+
       setIsSearchingHotels(true);
+      setHotelSearchError(null);
       try {
-        const results = await api.searchHotels(request);
+        const payload: HotelSearchRequest = {
+          trip_id: tripId,
+          destination: trip.destination,
+          city: trip.destination,
+          checkin: trip.start_date,
+          checkout: trip.end_date,
+          check_in_date: trip.start_date,
+          check_out_date: trip.end_date,
+          adults: Number(trip.travelers_count),
+          guests: Number(trip.travelers_count),
+        };
+        const results = await api.searchHotels(payload);
         setHotelOffers(results);
       } catch (err: any) {
-        notify(err.message || 'Unable to load stays.', 'error', 'Hotel Search Notice');
+        const msg = err.message || 'Unable to load stays.';
+        setHotelSearchError(msg);
+        notify(msg, 'error', 'Hotel Search Notice');
       } finally {
         setIsSearchingHotels(false);
       }
     },
-    [notify]
+    [tripId, trip, notify]
   );
 
   useEffect(() => {
     if (activeTab === 'hotels' && hotelOffers.length === 0 && trip) {
-      handleSearchHotels({
-        city: trip.destination || 'Kyoto, Japan',
-        check_in_date: trip.start_date || '2026-10-14',
-        check_out_date: trip.end_date || '2026-10-24',
-        guests: trip.travelers_count || 2,
-      });
+      if (
+        !trip.trip_id ||
+        !trip.destination ||
+        !trip.start_date ||
+        !trip.end_date ||
+        trip.travelers_count == null ||
+        trip.travelers_count < 1
+      ) {
+        return;
+      }
+
+      handleSearchHotels();
     }
   }, [activeTab, hotelOffers.length, trip, handleSearchHotels]);
 
@@ -232,18 +265,29 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
     if (!trip) return;
     setIsSelectingHotel(true);
     try {
+      const snapId = hotel.snapshot_id || hotel.id;
       const updated = await api.selectTripOffer(trip.trip_id, {
         offer_type: 'hotel',
-        offer_id: hotel.id,
-        snapshot_id: hotel.id,
+        offer_id: snapId,
+        snapshot_id: snapId,
+        room_id: selectedRoom?.id,
         metadata: {
           ...hotel,
-          selected_room: selectedRoom,
+          selected_room: selectedRoom ? {
+            id: selectedRoom.id,
+            name: selectedRoom.name,
+            description: selectedRoom.description,
+            price_per_night: selectedRoom.price_per_night,
+            total_price: selectedRoom.total_price,
+            currency: selectedRoom.currency,
+            capacity: selectedRoom.capacity,
+            beds: selectedRoom.beds,
+          } : undefined,
         },
       });
       setTrip(updated);
       notify(
-        `Selected ${hotel.name}. Stay preferences linked to trip workspace.`,
+        `Selected ${hotel.name || hotel.hotel_name}. Stay preferences linked to trip workspace.`,
         'success',
         'Stay Selected'
       );
@@ -314,7 +358,7 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   }
 
   const selectedFlight = trip.selected_flight_offer as FlightOffer | undefined;
-  const selectedHotel = trip.selected_hotel_offer as HotelOffer | undefined;
+  const selectedHotel = (trip.selected_hotel_offer || (trip.metadata as any)?.selected_hotel) as HotelOffer | undefined;
 
   // Filtered flights for in-trip tab
   const availableCarriers = Array.from(new Set(flightOffers.map((o) => o.carrier_name)));
@@ -340,18 +384,18 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   // Filtered hotels for in-trip tab
   const filteredHotelOffers = hotelOffers
     .filter((h) => {
-      if (hotelStarFilter === '4plus' && h.stars < 4) return false;
-      if (hotelStarFilter === '5only' && h.stars < 5) return false;
-      if (hotelFreeCancellation && !h.cancellation_policy.toLowerCase().includes('free')) {
+      if (hotelStarFilter === '4plus' && (h.stars == null || h.stars < 4)) return false;
+      if (hotelStarFilter === '5only' && (h.stars == null || h.stars < 5)) return false;
+      if (hotelFreeCancellation && !h.cancellation_policy?.toLowerCase().includes('free')) {
         return false;
       }
       return true;
     })
     .sort((a, b) => {
-      if (hotelSortBy === 'rating') return b.rating - a.rating;
+      if (hotelSortBy === 'rating') return (b.rating ?? 0) - (a.rating ?? 0);
       if (hotelSortBy === 'price_low') return a.total_amount - b.total_amount;
       if (hotelSortBy === 'price_high') return b.total_amount - a.total_amount;
-      if (hotelSortBy === 'stars_high') return b.stars - a.stars;
+      if (hotelSortBy === 'stars_high') return (b.stars ?? 0) - (a.stars ?? 0);
       return 0;
     });
 
@@ -359,6 +403,15 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   const committedFlight = selectedFlight ? Number(selectedFlight.total_amount) : 0;
   const committedHotel = selectedHotel ? Number(selectedHotel.total_amount) : 0;
   const totalCommitted = committedFlight + committedHotel;
+
+  // Canonical trip night count
+  const canonicalNights = React.useMemo(() => {
+    if (!trip?.start_date || !trip?.end_date) return undefined;
+    const start = new Date(trip.start_date.split('T')[0]);
+    const end = new Date(trip.end_date.split('T')[0]);
+    const diff = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+    return diff > 0 ? diff : undefined;
+  }, [trip?.start_date, trip?.end_date]);
 
   return (
     <div className="space-y-8 pb-16">
@@ -446,7 +499,9 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
                 {selectedHotel.name}
               </div>
               <div className="text-xs text-[var(--text-secondary)] font-mono flex items-center justify-between mt-1">
-                <span>{selectedHotel.stars}-Star Stay</span>
+                {selectedHotel.stars != null && selectedHotel.stars > 0 ? (
+                  <span data-testid="stay-stars-label">{selectedHotel.stars}-Star Stay</span>
+                ) : null}
                 <span className="font-bold text-[var(--text-primary)]">
                   {formatCurrency(selectedHotel.total_amount, selectedHotel.currency)}
                 </span>
@@ -787,7 +842,7 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
               Curated Accommodations in {trip.destination}
             </h3>
             <p className="text-xs sm:text-sm text-[var(--text-secondary)] font-light">
-              Check-in: {trip.start_date} • Check-out: {trip.end_date} • {trip.travelers_count || 1} Guests
+              Check-in: {trip.start_date} • Check-out: {trip.end_date}{trip.travelers_count ? ` • ${trip.travelers_count} Guests` : ''}
             </p>
           </div>
 
@@ -795,7 +850,7 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
             initialCity={trip.destination}
             initialCheckIn={trip.start_date}
             initialCheckOut={trip.end_date}
-            initialGuests={trip.travelers_count || 2}
+            initialGuests={trip.travelers_count}
             onSearch={handleSearchHotels}
             isLoading={isSearchingHotels}
           />
@@ -829,11 +884,68 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
                 <HotelCard
                   key={hotel.id}
                   hotel={hotel}
-                  isSelected={selectedHotel?.id === hotel.id}
+                  nightsCount={canonicalNights || hotel.nights}
+                  isSelected={
+                    selectedHotel?.id === hotel.id ||
+                    selectedHotel?.snapshot_id === hotel.id ||
+                    (Boolean(hotel.snapshot_id) && selectedHotel?.id === hotel.snapshot_id) ||
+                    (Boolean(hotel.snapshot_id) && selectedHotel?.snapshot_id === hotel.snapshot_id)
+                  }
                   onSelect={handleSelectHotelOffer}
                   isSelecting={isSelectingHotel}
                 />
               ))}
+            </div>
+          )}
+
+          {/* EMPTY STATE */}
+          {!isSearchingHotels && !hotelSearchError && hotelOffers.length === 0 && (
+            <div className="py-16 text-center bg-[var(--surface)] rounded-3xl border border-dashed border-[var(--border)] space-y-3">
+              <div className="w-12 h-12 rounded-full bg-[var(--surface-muted)] text-[var(--text-muted)] mx-auto flex items-center justify-center">
+                <Building2 className="w-6 h-6" />
+              </div>
+              <h4 className="text-lg font-bold font-editorial text-[var(--text-primary)]">
+                No accommodations found for these dates
+              </h4>
+              <p className="text-xs text-[var(--text-secondary)] max-w-md mx-auto">
+                No matching properties were returned for {trip.destination} on {trip.start_date} to {trip.end_date}. Try adjusting travel dates or filters.
+              </p>
+            </div>
+          )}
+
+          {/* ERROR STATE */}
+          {!isSearchingHotels && hotelSearchError && (
+            <div className="py-16 text-center bg-[var(--surface)] rounded-3xl border border-[var(--status-danger)]/30 space-y-3">
+              <div className="w-12 h-12 rounded-full bg-[var(--status-danger)]/10 text-[var(--status-danger)] mx-auto flex items-center justify-center">
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <h4 className="text-lg font-bold font-editorial text-[var(--text-primary)]">
+                Hotel search unavailable
+              </h4>
+              <p className="text-xs text-[var(--text-secondary)] max-w-md mx-auto">
+                {hotelSearchError}
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (
+                    !trip.trip_id ||
+                    !trip.destination ||
+                    !trip.start_date ||
+                    !trip.end_date ||
+                    trip.travelers_count == null ||
+                    trip.travelers_count < 1
+                  ) {
+                    setHotelSearchError('Missing canonical trip details for accommodation search.');
+                    return;
+                  }
+                  handleSearchHotels();
+                }}
+                leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
+              >
+                Retry Search
+              </Button>
             </div>
           )}
         </div>

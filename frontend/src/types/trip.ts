@@ -52,6 +52,7 @@ export interface TripSummary {
   budget?: number;
   currency?: string;
   preferences?: string[];
+  metadata?: Record<string, any>;
   created_at: string;
   updated_at: string;
 }
@@ -106,6 +107,7 @@ export interface TripOfferSelection {
   offer_type: 'flight' | 'hotel';
   offer_id: string;
   snapshot_id?: string;
+  room_id?: string;
   metadata?: any;
 }
 

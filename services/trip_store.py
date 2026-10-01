@@ -462,6 +462,79 @@ class TripStore:
                             slices[1]["departure_date"] = ret_date
                         canonical_tr_dict["slices"] = slices
                         meta["canonical_trip_request"] = canonical_tr_dict
+                elif req.offer_type == "hotel":
+                    price_val = None
+                    currency_val = "USD"
+                    price_inr_val = None
+                    if hasattr(norm_offer, "price"):
+                        price_val = float(norm_offer.price.total_amount)
+                        currency_val = str(norm_offer.price.currency)
+                        if getattr(norm_offer.price, "inr_reference_amount", None) is not None:
+                            price_inr_val = float(norm_offer.price.inr_reference_amount)
+                    elif isinstance(norm_offer, dict):
+                        price_val = float(norm_offer.get("price") or norm_offer.get("total_amount") or 0)
+                        currency_val = str(norm_offer.get("currency", "USD"))
+                        price_inr_val = float(norm_offer["price_inr"]) if norm_offer.get("price_inr") is not None else None
+
+                    hotel_name = getattr(norm_offer, "hotel_name", None) or (norm_offer.get("hotel_name") or norm_offer.get("name") if isinstance(norm_offer, dict) else "Hotel")
+                    meta["selected_hotel"] = {
+                        "id": str(req.snapshot_id),
+                        "snapshot_id": str(req.snapshot_id),
+                        "hotel_name": hotel_name,
+                        "name": hotel_name,
+                        "price": price_val,
+                        "total_amount": price_val,
+                        "currency": currency_val,
+                        "price_inr": price_inr_val,
+                        "room_name": getattr(norm_offer, "room_name", None) or (norm_offer.get("room_name") if isinstance(norm_offer, dict) else None),
+                    }
+
+                    # Room selection validation and persistence (Micro-Remediation G, Issue 3)
+                    room_id_raw = getattr(req, "room_id", None)
+                    if not room_id_raw and getattr(req, "metadata", None) and isinstance(req.metadata, dict):
+                        sel_room_meta = req.metadata.get("selected_room")
+                        if isinstance(sel_room_meta, dict):
+                            room_id_raw = sel_room_meta.get("id") or sel_room_meta.get("room_id")
+                        elif isinstance(sel_room_meta, str):
+                            room_id_raw = sel_room_meta
+
+                    if room_id_raw is not None:
+                        room_id_str = str(room_id_raw).strip()
+                        try:
+                            val_room_uuid = uuid.UUID(room_id_str)
+                        except (ValueError, TypeError):
+                            raise OfferSelectionError(
+                                400,
+                                f"Invalid room identifier '{room_id_str}': room id must be a valid TrustTrip UUID, not a provider identifier.",
+                            )
+
+                        raw_payload = snap_store.get_raw_payload(req.snapshot_id, user_id)
+                        internal_rooms = (raw_payload or {}).get("_internal_rooms") or []
+                        matching_room = next((r for r in internal_rooms if str(r.get("id")) == str(val_room_uuid)), None)
+                        if not matching_room:
+                            raise OfferSelectionError(
+                                400,
+                                f"Room '{val_room_uuid}' does not exist in the selected hotel snapshot.",
+                            )
+
+                        persisted_room = {
+                            "id": str(matching_room["id"]),
+                            "room_id": str(matching_room["id"]),
+                            "name": matching_room.get("name"),
+                            "description": matching_room.get("description"),
+                            "price_per_night": matching_room.get("price_per_night"),
+                            "total_price": matching_room.get("total_price"),
+                            "currency": matching_room.get("currency"),
+                            "capacity": matching_room.get("capacity"),
+                            "beds": matching_room.get("beds"),
+                            "amenities": matching_room.get("amenities"),
+                        }
+                        meta["selected_room"] = persisted_room
+                        meta["selected_hotel"]["selected_room"] = persisted_room
+                        if persisted_room.get("name"):
+                            meta["selected_hotel"]["room_name"] = persisted_room["name"]
+                        if persisted_room.get("total_price") is not None:
+                            meta["selected_hotel"]["room_price"] = persisted_room["total_price"]
 
                 t["metadata"] = meta
                 t["updated_at"] = now
@@ -561,6 +634,79 @@ class TripStore:
                             slices[1]["departure_date"] = ret_date
                         canonical_tr_dict["slices"] = slices
                         meta["canonical_trip_request"] = canonical_tr_dict
+                elif req.offer_type == "hotel":
+                    price_val = None
+                    currency_val = "USD"
+                    price_inr_val = None
+                    if hasattr(norm_offer, "price"):
+                        price_val = float(norm_offer.price.total_amount)
+                        currency_val = str(norm_offer.price.currency)
+                        if getattr(norm_offer.price, "inr_reference_amount", None) is not None:
+                            price_inr_val = float(norm_offer.price.inr_reference_amount)
+                    elif isinstance(norm_offer, dict):
+                        price_val = float(norm_offer.get("price") or norm_offer.get("total_amount") or 0)
+                        currency_val = str(norm_offer.get("currency", "USD"))
+                        price_inr_val = float(norm_offer["price_inr"]) if norm_offer.get("price_inr") is not None else None
+
+                    hotel_name = getattr(norm_offer, "hotel_name", None) or (norm_offer.get("hotel_name") or norm_offer.get("name") if isinstance(norm_offer, dict) else "Hotel")
+                    meta["selected_hotel"] = {
+                        "id": str(req.snapshot_id),
+                        "snapshot_id": str(req.snapshot_id),
+                        "hotel_name": hotel_name,
+                        "name": hotel_name,
+                        "price": price_val,
+                        "total_amount": price_val,
+                        "currency": currency_val,
+                        "price_inr": price_inr_val,
+                        "room_name": getattr(norm_offer, "room_name", None) or (norm_offer.get("room_name") if isinstance(norm_offer, dict) else None),
+                    }
+
+                    # Room selection validation and persistence (Micro-Remediation G, Issue 3)
+                    room_id_raw = getattr(req, "room_id", None)
+                    if not room_id_raw and getattr(req, "metadata", None) and isinstance(req.metadata, dict):
+                        sel_room_meta = req.metadata.get("selected_room")
+                        if isinstance(sel_room_meta, dict):
+                            room_id_raw = sel_room_meta.get("id") or sel_room_meta.get("room_id")
+                        elif isinstance(sel_room_meta, str):
+                            room_id_raw = sel_room_meta
+
+                    if room_id_raw is not None:
+                        room_id_str = str(room_id_raw).strip()
+                        try:
+                            val_room_uuid = uuid.UUID(room_id_str)
+                        except (ValueError, TypeError):
+                            raise OfferSelectionError(
+                                400,
+                                f"Invalid room identifier '{room_id_str}': room id must be a valid TrustTrip UUID, not a provider identifier.",
+                            )
+
+                        raw_payload = snap_store.get_raw_payload(req.snapshot_id, user_id, conn=conn)
+                        internal_rooms = (raw_payload or {}).get("_internal_rooms") or []
+                        matching_room = next((r for r in internal_rooms if str(r.get("id")) == str(val_room_uuid)), None)
+                        if not matching_room:
+                            raise OfferSelectionError(
+                                400,
+                                f"Room '{val_room_uuid}' does not exist in the selected hotel snapshot.",
+                            )
+
+                        persisted_room = {
+                            "id": str(matching_room["id"]),
+                            "room_id": str(matching_room["id"]),
+                            "name": matching_room.get("name"),
+                            "description": matching_room.get("description"),
+                            "price_per_night": matching_room.get("price_per_night"),
+                            "total_price": matching_room.get("total_price"),
+                            "currency": matching_room.get("currency"),
+                            "capacity": matching_room.get("capacity"),
+                            "beds": matching_room.get("beds"),
+                            "amenities": matching_room.get("amenities"),
+                        }
+                        meta["selected_room"] = persisted_room
+                        meta["selected_hotel"]["selected_room"] = persisted_room
+                        if persisted_room.get("name"):
+                            meta["selected_hotel"]["room_name"] = persisted_room["name"]
+                        if persisted_room.get("total_price") is not None:
+                            meta["selected_hotel"]["room_price"] = persisted_room["total_price"]
 
                 # 6. Update trip inside the SAME transaction
                 updated_row = conn.execute(

@@ -164,9 +164,9 @@ class HotelOfferView(BaseModel):
     address: str = ""
     star_rating: float | None = None
     review_score: float | None = None
-    room_name: str
-    board_type: str
-    refundable: bool
+    room_name: str | None = None
+    board_type: str | None = None
+    refundable: bool | None = None
     cancellation_deadline: datetime | None = None
     price: PriceBreakdown
     nightly_price: Decimal
@@ -249,9 +249,9 @@ class HotelOffer(BaseModel):
     address: str = ""
     star_rating: float | None = None
     review_score: float | None = None
-    room_name: str
-    board_type: str
-    refundable: bool
+    room_name: str | None = None
+    board_type: str | None = None
+    refundable: bool | None = None
     cancellation_deadline: datetime | None = None
     price: PriceBreakdown
     nightly_price: Decimal

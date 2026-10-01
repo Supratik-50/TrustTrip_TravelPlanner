@@ -1,38 +1,69 @@
 export interface HotelRoom {
   id: string;
   name: string;
-  description: string;
-  price_per_night: number;
-  total_price: number;
-  currency: string;
-  beds: string;
-  capacity: number;
-  amenities: string[];
+  description?: string | null;
+  price_per_night?: number | null;
+  total_price?: number | null;
+  currency?: string;
+  beds?: string | null;
+  capacity?: number | null;
+  amenities?: string[];
 }
 
 export interface HotelOffer {
   id: string;
-  hotel_id: string;
+  snapshot_id?: string;
+  hotel_id?: string;
   name: string;
-  stars: number;
+  hotel_name?: string;
+  stars?: number | null;
   address: string;
   city: string;
-  rating: number;
-  review_count: number;
+  destination?: string;
+  rating?: number | null;
+  review_count?: number | null;
   image_url?: string;
   rooms: HotelRoom[];
   total_amount: number;
+  price?: number;
   currency: string;
-  cancellation_policy: string;
+  price_inr?: number;
+  exchange_rate?: number;
+  nightly_price?: number;
+  nights?: number;
+  rooms_count?: number;
+  adults_count?: number;
+  checkin?: string;
+  checkout?: string;
+  check_in_date?: string;
+  check_out_date?: string;
+  availability?: string;
+  cancellation_policy?: string | null;
+  refundable?: boolean | null;
+  room_name?: string | null;
+  board_name?: string | null;
+  amenities?: string[];
+  is_recommended?: boolean;
+  recommendation_rank?: number;
+  provider?: string;
 }
 
 export interface HotelSearchRequest {
-  city: string;
-  check_in_date: string;
-  check_out_date: string;
-  guests: number;
+  trip_id?: string;
+  destination?: string;
+  city?: string;
+  checkin?: string;
+  checkout?: string;
+  check_in_date?: string;
+  check_out_date?: string;
+  guests?: number;
+  adults?: number;
+  children?: number;
   rooms_count?: number;
+  rooms?: number;
   min_stars?: number;
+  budget_inr?: number;
+  cheaper_mode?: boolean;
 }
 
 export interface HotelPrebookRequest {

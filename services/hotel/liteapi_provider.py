@@ -75,24 +75,51 @@ class LiteAPIProvider:
             amount, room, rate, total = min(rates, key=lambda x: x[0])
             cancellation = rate.get("cancellationPolicies") or {}
             offer_id = rate.get("offerId") or room.get("offerId")
+
+            # hotel_name: only emit if provider explicitly supplies it
+            raw_hotel_name = hotel.get("name") or item.get("hotelName")
+            hotel_name = str(raw_hotel_name).strip() if raw_hotel_name and str(raw_hotel_name).strip() else None
+
+            # room_name: only emit if provider explicitly supplies it
+            raw_room_name = rate.get("name") or room.get("name")
+            room_name = str(raw_room_name).strip() if raw_room_name and str(raw_room_name).strip() else None
+
+            # meal_plan / board_name: only emit if provider explicitly supplies it
+            raw_board = rate.get("boardName")
+            board_name = str(raw_board).strip() if raw_board and str(raw_board).strip() else None
+
+            # refundable: only emit when cancellation tag is EXPLICITLY known (RFN = refundable, NRF = non-refundable)
+            refundable_tag = cancellation.get("refundableTag") if isinstance(cancellation, dict) else None
+            if refundable_tag == "RFN":
+                refundable = True
+            elif refundable_tag == "NRF":
+                refundable = False
+            else:
+                # Missing or unknown tag — do NOT infer
+                refundable = None
+
+            # currency: only emit if provider explicitly supplies it — never default to USD
+            raw_currency = total.get("currency")
+            currency = str(raw_currency).strip().upper() if raw_currency and str(raw_currency).strip() else None
+
             offers.append({
                 "id": f"liteapi:{offer_id}",
                 "provider": self.name,
                 "provider_offer_id": offer_id,
                 "bookable": bool(offer_id),
                 "hotel_id": hotel_id,
-                "hotel_name": hotel.get("name") or item.get("hotelName") or "Hotel",
+                "hotel_name": hotel_name,
                 "photo": hotel.get("main_photo") or hotel.get("mainPhoto") or "",
                 "address": hotel.get("address") or hotel.get("formattedAddress") or "",
                 "rating": hotel.get("rating"),
                 "stars": hotel.get("stars") or hotel.get("starRating"),
                 "tags": hotel.get("tags") or [],
-                "room_name": rate.get("name") or room.get("name") or "Room",
-                "board_name": rate.get("boardName") or "Room Only",
+                "room_name": room_name,
+                "board_name": board_name,
                 "cancellation": cancellation,
-                "refundable": cancellation.get("refundableTag") == "RFN",
+                "refundable": refundable,
                 "price": amount,
-                "currency": str(total.get("currency") or request.get("currency", "USD")).upper(),
+                "currency": currency,
                 "rooms": rooms,
                 "adults": int(request.get("adults", 1)),
                 "children": int(request.get("children", 0)),

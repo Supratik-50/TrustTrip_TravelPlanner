@@ -147,6 +147,12 @@ async def get_trip(
             status_code=404,
             detail="Trip not found or does not belong to you.",
         )
+    meta = trip.get("metadata") or {}
+    if isinstance(meta, dict):
+        if meta.get("selected_hotel"):
+            trip["selected_hotel_offer"] = meta["selected_hotel"]
+        if meta.get("selected_flight"):
+            trip["selected_flight_offer"] = meta["selected_flight"]
     return {"success": True, "trip": trip}
 
 
@@ -448,6 +454,9 @@ async def cancellation_confirm(
 class OfferSelectionRequest(BaseModel):
     offer_type: str = Field(pattern="^(flight|hotel)$")
     snapshot_id: UUID
+    offer_id: str | None = None
+    room_id: UUID | str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class TripRevisionRequest(BaseModel):

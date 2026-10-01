@@ -38,13 +38,28 @@ export const HotelsView: React.FC = () => {
   } | null>(null);
   const [isAttachModalOpen, setIsAttachModalOpen] = useState(false);
   const [isAttaching, setIsAttaching] = useState(false);
+  const [selectedTripId, setSelectedTripId] = useState('');
+  const selectedTrip = userTrips.find((trip) => trip.trip_id === selectedTripId);
 
   const handleSearch = useCallback(
     async (request: HotelSearchRequest) => {
+      if (!selectedTrip) {
+        setHotels([]);
+        setError('Select a trip before searching for hotels.');
+        return;
+      }
+
       setIsLoading(true);
       setError(null);
       try {
-        const results = await api.searchHotels(request);
+        const results = await api.searchHotels({
+          ...request,
+          trip_id: selectedTrip.trip_id,
+          destination: selectedTrip.destination,
+          checkin: selectedTrip.start_date,
+          checkout: selectedTrip.end_date,
+          adults: selectedTrip.travelers_count,
+        });
         setHotels(results);
       } catch (err: any) {
         const msg = err.message || 'Unable to retrieve hotel listings.';
@@ -54,17 +69,36 @@ export const HotelsView: React.FC = () => {
         setIsLoading(false);
       }
     },
-    [notify]
+    [notify, selectedTrip]
   );
 
   useEffect(() => {
-    handleSearch({
-      city: 'Kyoto, Japan',
-      check_in_date: '2026-10-14',
-      check_out_date: '2026-10-24',
-      guests: 2,
-    });
-  }, [handleSearch]);
+    if (!isAuthenticated) {
+      setUserTrips([]);
+      setSelectedTripId('');
+      return;
+    }
+
+    let isActive = true;
+    api.getTrips()
+      .then((trips) => {
+        if (!isActive) return;
+        setUserTrips(trips);
+        setSelectedTripId((current) =>
+          trips.some((trip) => trip.trip_id === current) ? current : ''
+        );
+      })
+      .catch((err: any) => {
+        if (!isActive) return;
+        const msg = err.message || 'Unable to load trips.';
+        setError(msg);
+        notify(msg, 'error', 'Trip Loading Error');
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [isAuthenticated, notify]);
 
   // In Section 2: Trips attachment data integration will occur in Section 3.
   // trips are defaulted to empty array for now.
@@ -83,9 +117,19 @@ export const HotelsView: React.FC = () => {
         offer_type: 'hotel',
         offer_id: selectedHotelToAttach.hotel.id,
         snapshot_id: selectedHotelToAttach.hotel.id,
+        room_id: selectedHotelToAttach.room?.id,
         metadata: {
           ...selectedHotelToAttach.hotel,
-          selected_room: selectedHotelToAttach.room,
+          selected_room: selectedHotelToAttach.room ? {
+            id: selectedHotelToAttach.room.id,
+            name: selectedHotelToAttach.room.name,
+            description: selectedHotelToAttach.room.description,
+            price_per_night: selectedHotelToAttach.room.price_per_night,
+            total_price: selectedHotelToAttach.room.total_price,
+            currency: selectedHotelToAttach.room.currency,
+            capacity: selectedHotelToAttach.room.capacity,
+            beds: selectedHotelToAttach.room.beds,
+          } : undefined,
         },
       });
 
@@ -114,21 +158,21 @@ export const HotelsView: React.FC = () => {
   // Filtered and sorted hotels
   const filteredHotels = hotels
     .filter((h) => {
-      if (starFilter === '4plus' && h.stars < 4) return false;
-      if (starFilter === '5only' && h.stars < 5) return false;
+      if (starFilter === '4plus' && (h.stars == null || h.stars < 4)) return false;
+      if (starFilter === '5only' && (h.stars == null || h.stars < 5)) return false;
       if (
         freeCancellationOnly &&
-        !h.cancellation_policy.toLowerCase().includes('free')
+        !h.cancellation_policy?.toLowerCase().includes('free')
       ) {
         return false;
       }
       return true;
     })
     .sort((a, b) => {
-      if (sortBy === 'rating') return b.rating - a.rating;
+      if (sortBy === 'rating') return (b.rating ?? 0) - (a.rating ?? 0);
       if (sortBy === 'price_low') return a.total_amount - b.total_amount;
       if (sortBy === 'price_high') return b.total_amount - a.total_amount;
-      if (sortBy === 'stars_high') return b.stars - a.stars;
+      if (sortBy === 'stars_high') return (b.stars ?? 0) - (a.stars ?? 0);
       return 0;
     });
 
@@ -154,7 +198,41 @@ export const HotelsView: React.FC = () => {
       </div>
 
       {/* Hotel Search Form */}
-      <HotelSearchForm onSearch={handleSearch} isLoading={isLoading} />
+      <div className="space-y-3">
+        <label className="block text-sm font-medium text-[var(--text-primary)]" htmlFor="hotel-trip">
+          Search within trip
+        </label>
+        <select
+          id="hotel-trip"
+          value={selectedTripId}
+          onChange={(event) => {
+            setSelectedTripId(event.target.value);
+            setHotels([]);
+            setError(null);
+          }}
+          className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
+          disabled={isLoading || userTrips.length === 0}
+        >
+          <option value="">
+            {userTrips.length === 0 ? 'No trips available' : 'Select a trip'}
+          </option>
+          {userTrips.map((trip) => (
+            <option key={trip.trip_id} value={trip.trip_id}>
+              {trip.title || trip.destination}
+            </option>
+          ))}
+        </select>
+        <HotelSearchForm
+          key={selectedTripId || 'no-trip'}
+          initialCity={selectedTrip?.destination || ''}
+          initialCheckIn={selectedTrip?.start_date || ''}
+          initialCheckOut={selectedTrip?.end_date || ''}
+          initialGuests={selectedTrip?.travelers_count || 1}
+          onSearch={handleSearch}
+          isLoading={isLoading}
+          disabled={!selectedTripId}
+        />
+      </div>
 
       {/* Filter and Sort Controls */}
       {hotels.length > 0 && (
@@ -201,14 +279,8 @@ export const HotelsView: React.FC = () => {
           <Button
             variant="outline"
             size="sm"
-            onClick={() =>
-              handleSearch({
-                city: 'Kyoto, Japan',
-                check_in_date: '2026-10-14',
-                check_out_date: '2026-10-24',
-                guests: 2,
-              })
-            }
+            onClick={() => selectedTripId && handleSearch({ trip_id: selectedTripId })}
+            disabled={!selectedTripId}
             leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
           >
             Retry Search
@@ -223,6 +295,7 @@ export const HotelsView: React.FC = () => {
             <HotelCard
               key={hotel.id}
               hotel={hotel}
+              nightsCount={hotel.nights}
               onPlanTripWithHotel={handlePlanTripWithHotel}
               onSelect={
                 isAuthenticated
