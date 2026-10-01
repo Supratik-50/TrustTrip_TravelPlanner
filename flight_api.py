@@ -20,12 +20,14 @@ logger = logging.getLogger(__name__)
 
 from dependencies.auth import get_current_user
 from domain.booking import FlightHandoffRequest, FlightBookingDestination
+from domain.flight_search import FlightSearchResponse
 from domain.live_offer import FlexibleFlightSearchResponse
 from domain.search_criteria import FlexibleFlightSearchCriteria
 from domain.user import UserResponse
 from services.flight_service import FlightService
 from services.flight_provider import FlightProviderError, FlightProviderTimeout
 from services.flight_booking_service import FlightBookingService, FareChangedException, OfferWithdrawnException
+from services.flight_search_service import search_flights_for_trip
 from services.travel_intelligence.orchestrator import TravelIntelligenceOrchestrator
 from services.trip_store import TripStore, resolve_current_revision
 
@@ -122,7 +124,8 @@ class FlightSlice(BaseModel):
 
 
 class FlightSearchRequest(BaseModel):
-    slices: list[FlightSlice] = Field(min_length=1, max_length=2)
+    trip_id: str | None = None
+    slices: list[FlightSlice] | None = None
     adults: int = Field(default=1, ge=1, le=9)
     children: int = Field(default=0, ge=0, le=9)
     infants: int = Field(default=0, ge=0, le=9)
@@ -207,7 +210,44 @@ async def flight_config():
 
 
 @router.post("/search")
-async def search_flights(request: FlightSearchRequest):
+async def search_flights(
+    request: FlightSearchRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    service: FlightService = Depends(_service),
+):
+    """Execute canonical trip flight search adhering to Section 5A backend contract."""
+    if request.trip_id is not None:
+        trip_store = TripStore()
+        trip = trip_store.get_trip(request.trip_id, current_user.id)
+        if not trip:
+            # Check whether trip exists for a different user (unauthorized tenant)
+            tid_str = str(request.trip_id)
+            unowned = False
+            if trip_store.use_in_memory or not os.getenv("DATABASE_URL"):
+                unowned = tid_str in trip_store._memory_trips
+            else:
+                try:
+                    with trip_store._connect() as conn:
+                        row = conn.execute("SELECT user_id FROM trips WHERE id = %s", (tid_str,)).fetchone()
+                        unowned = bool(row)
+                except Exception:
+                    unowned = False
+            if unowned:
+                raise HTTPException(status_code=403, detail="Unauthorized: Trip does not belong to you.")
+            raise HTTPException(status_code=404, detail="Trip not found.")
+
+        return await search_flights_for_trip(
+            trip=trip,
+            user_id=current_user.id,
+            cabin_class=request.cabin_class,
+            max_connections=request.max_connections,
+            flight_service=service,
+        )
+
+    # Legacy slices flow if slices provided
+    if not request.slices:
+        raise HTTPException(status_code=400, detail="trip_id is required for flight search.")
+
     try:
         passengers = [{"type": "adult"}] * request.adults
         passengers += [{"type": "child"}] * request.children
@@ -218,11 +258,8 @@ async def search_flights(request: FlightSearchRequest):
             "cabin_class": request.cabin_class,
             "max_connections": request.max_connections,
         }
-        result = await asyncio.to_thread(_service().search, search_context)
+        result = await asyncio.to_thread(service.search, search_context)
         for offer in result.get("offers", []):
-            # Keep the original search criteria with each browser-visible offer.
-            # Do not place the offer object itself inside this payload because
-            # that would create a circular JSON structure.
             selected_snapshot = dict(offer)
             selected_snapshot.pop("search_context", None)
             offer["search_context"] = {**search_context, "selected_offer": selected_snapshot}
