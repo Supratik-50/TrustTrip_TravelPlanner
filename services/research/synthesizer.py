@@ -6,13 +6,14 @@ claim-level citation extraction, conflict isolation, and coverage validation.
 from __future__ import annotations
 
 import re
-from typing import Any
 from enum import Enum
+from uuid import uuid4
 from domain.research import (
     EvidenceStatus,
     ResearchCitation,
     ResearchConflict,
     ResearchEvidence,
+    ResearchFact,
 )
 from services.research.ports import LLMProviderPort
 from services.research.security import (
@@ -58,7 +59,7 @@ def verify_claim_support(sentence: str, evidence: ResearchEvidence) -> tuple[Cla
 
     Returns (SUPPORTED | INSUFFICIENT | CONTRADICTED, reason).
     """
-    clean_sent = re.sub(r"\[cite:\d+\]", "", sentence).strip()
+    clean_sent = re.sub(r"\[cite:[a-zA-Z0-9_\-]+\]", "", sentence).strip()
     evidence_text = f"{evidence.title} {evidence.snippet} {' '.join(evidence.claims)}".lower()
     clean_lower = clean_sent.lower()
 
@@ -123,17 +124,18 @@ class ResearchSynthesizer:
     def __init__(self, llm_provider: LLMProviderPort) -> None:
         self.llm_provider = llm_provider
 
-    async def synthesize_answer(
+    async def synthesize_answer_with_facts(
         self,
         query: str,
         evidence_list: list[ResearchEvidence],
         conflicts: list[ResearchConflict] | None = None,
         call_timeout: float = 20.0,
-    ) -> tuple[str, list[ResearchCitation], EvidenceStatus]:
-        """Synthesize a citation-grounded answer with claim-level validation."""
+    ) -> tuple[str, list[ResearchCitation], list[ResearchFact], EvidenceStatus]:
+        """Synthesize a citation-grounded answer with verified claim-level facts and citations."""
         if not evidence_list:
             return (
                 "Evidence not found / source unavailable.",
+                [],
                 [],
                 EvidenceStatus.NOT_FOUND,
             )
@@ -157,7 +159,7 @@ class ResearchSynthesizer:
             f"RETRIEVED EVIDENCE:\n{envelope}\n"
             f"{conflict_notice}\n"
             f"Provide a clear, fact-based synthesis answering the query. "
-            f"Include inline citations like [cite:1] for every factual statement."
+            f"Include inline citations like [cite:TOKEN] for every factual statement using each block's cite_token."
         )
 
         raw_answer = await self.llm_provider.synthesize(
@@ -168,9 +170,22 @@ class ResearchSynthesizer:
 
         clean_answer = sanitize_for_display(raw_answer)
 
-        # Conservative Claim Verification (Blocker 3 / Gate 2 Re-Audit)
+        # Build explicit citation token -> ResearchEvidence map (collision-safe full UUID provenance)
+        token_to_evidence: dict[str, ResearchEvidence] = {}
+        for ev in evidence_list:
+            canonical_token = str(ev.evidence_id).lower()
+            if canonical_token in token_to_evidence and token_to_evidence[canonical_token].evidence_id != ev.evidence_id:
+                # Collision / duplicate identity defense: fail-closed / do not overwrite
+                continue
+            token_to_evidence[canonical_token] = ev
+
+        CANONICAL_UUID_RE = re.compile(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        )
+
+        # Conservative Claim Verification
         citations_map: dict[str, ResearchCitation] = {}
-        # Split by punctuation or newlines so each claim/bullet is verified individually
+        facts_list: list[ResearchFact] = []
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", clean_answer) if s.strip()]
         validated_sentences: list[str] = []
         quarantined_claims: list[str] = []
@@ -178,8 +193,8 @@ class ResearchSynthesizer:
         has_unverified_claims = False
 
         for sent in sentences:
-            cites = re.findall(r"\[cite:(\d+)\]", sent)
-            if not cites:
+            all_cites = re.findall(r"\[cite:([^\]]+)\]", sent)
+            if not all_cites:
                 # Substantive statement without citation
                 words = sent.split()
                 is_substantive = len(words) > 4 and not any(
@@ -190,41 +205,49 @@ class ResearchSynthesizer:
                     sent = f"{sent} [unverified]"
                 validated_sentences.append(sent)
             else:
-                # Validate claim against each cited evidence
+                # Validate claim against each cited evidence via explicit canonical UUID token mapping
                 is_supported = True
                 is_contradicted = False
-                supported_evidences: list[tuple[int, ResearchEvidence]] = []
+                supported_evidences: list[tuple[str, ResearchEvidence]] = []
 
-                for c_tok in cites:
-                    idx = int(c_tok)
-                    if 1 <= idx <= len(evidence_list):
-                        ev = evidence_list[idx - 1]
-                        outcome, reason = verify_claim_support(sent, ev)
-                        if outcome == ClaimVerificationOutcome.CONTRADICTED:
-                            is_contradicted = True
-                            detected_conflicts.append(
-                                ResearchConflict(
-                                    topic=f"Contradiction in [cite:{idx}]",
-                                    claim_a=sent[:300],
-                                    claim_b=ev.snippet[:300],
-                                    resolution_summary=f"Claim contradicted by cited source: {reason}",
-                                )
-                            )
-                            break
-                        elif outcome == ClaimVerificationOutcome.SUPPORTED:
-                            supported_evidences.append((idx, ev))
-                        else:  # INSUFFICIENT
-                            is_supported = False
-                    else:
+                for c_tok in all_cites:
+                    # Enforce canonical full-UUID format: reject numeric, short, or malformed tokens
+                    if not CANONICAL_UUID_RE.match(c_tok):
                         is_supported = False
+                        break
+
+                    ev = token_to_evidence.get(c_tok.lower())
+                    if ev is None:
+                        # Unknown or unsupplied citation token: reject support
+                        is_supported = False
+                        break
+
+                    outcome, reason = verify_claim_support(sent, ev)
+                    if outcome == ClaimVerificationOutcome.CONTRADICTED:
+                        is_contradicted = True
+                        detected_conflicts.append(
+                            ResearchConflict(
+                                topic=f"Contradiction in [cite:{c_tok}]",
+                                claim_a=sent[:300],
+                                claim_b=ev.snippet[:300] if ev.snippet else "",
+                                resolution_summary=f"Claim contradicted by cited source: {reason}",
+                            )
+                        )
+                        break
+                    elif outcome == ClaimVerificationOutcome.SUPPORTED:
+                        supported_evidences.append((c_tok, ev))
+                    else:  # INSUFFICIENT
+                        is_supported = False
+                        break
 
                 if is_contradicted or not is_supported or not supported_evidences:
                     has_unverified_claims = True
                     quarantined_claims.append(sent)
                 else:
-                    # Claim verified as SUPPORTED: allow into verified answer content
-                    for idx, ev in supported_evidences:
-                        cite_key = f"[cite:{idx}]"
+                    # Claim verified as SUPPORTED: allow into verified answer content & create ResearchFact
+                    clean_claim = re.sub(r"\[cite:[^\]]+\]", "", sent).strip()
+                    for c_tok, ev in supported_evidences:
+                        cite_key = f"[cite:{ev.stable_token}]"
                         if cite_key not in citations_map:
                             citations_map[cite_key] = ResearchCitation(
                                 citation_id=cite_key,
@@ -234,12 +257,25 @@ class ResearchSynthesizer:
                                 canonical_url=ev.canonical_url,
                                 published_at=ev.published_at,
                                 retrieved_at=ev.retrieved_at,
-                                locator=ev.locator or f"Passage {idx}",
+                                locator=ev.locator or f"Passage {c_tok}",
                                 cited_claims=[sent[:300]],
+                                source_id=ev.source_id,
                             )
                         else:
                             if sent[:300] not in citations_map[cite_key].cited_claims:
                                 citations_map[cite_key].cited_claims.append(sent[:300])
+
+                        if clean_claim and not any(f.claim == clean_claim and f.evidence_id == ev.evidence_id for f in facts_list):
+                            facts_list.append(
+                                ResearchFact(
+                                    fact_id=uuid4(),
+                                    claim=clean_claim,
+                                    evidence_id=ev.evidence_id,
+                                    citation_id=cite_key,
+                                    source_id=ev.source_id,
+                                )
+                            )
+
                     validated_sentences.append(sent)
 
         final_answer = " ".join(validated_sentences)
@@ -256,7 +292,23 @@ class ResearchSynthesizer:
         else:
             status = EvidenceStatus.COMPLETE
 
-        return final_answer, citations_list, status
+        return final_answer, citations_list, facts_list, status
+
+    async def synthesize_answer(
+        self,
+        query: str,
+        evidence_list: list[ResearchEvidence],
+        conflicts: list[ResearchConflict] | None = None,
+        call_timeout: float = 20.0,
+    ) -> tuple[str, list[ResearchCitation], EvidenceStatus]:
+        """Synthesize a citation-grounded answer (backward-compatible 3-tuple return)."""
+        answer, citations, _, status = await self.synthesize_answer_with_facts(
+            query=query,
+            evidence_list=evidence_list,
+            conflicts=conflicts,
+            call_timeout=call_timeout,
+        )
+        return answer, citations, status
 
     async def synthesize(
         self,
@@ -265,7 +317,6 @@ class ResearchSynthesizer:
         conflicts: list[ResearchConflict] | None = None,
         call_timeout: float = 20.0,
     ) -> Any:
-        from uuid import uuid4
         from domain.research import ResearchIntent, ResearchMode, ResearchResult
 
         query_text = getattr(query, "query_text", str(query))
@@ -275,26 +326,29 @@ class ResearchSynthesizer:
         mode = getattr(query, "mode", ResearchMode.AUTO)
 
         try:
-            answer, citations, status = await self.synthesize_answer(
+            answer, citations, facts, status = await self.synthesize_answer_with_facts(
                 query=query_text,
                 evidence_list=evidence_list,
                 conflicts=conflicts,
                 call_timeout=call_timeout,
             )
         except Exception:
-            # Non-hallucinatory failure path without leaking exception text (Guardrail 4 & Blocker 8)
+            # Non-hallucinatory failure path without leaking exception text
             answer = "Synthesis unavailable at this time due to upstream service status."
             citations = []
-            for idx, ev in enumerate(evidence_list, start=1):
+            facts = []
+            for ev in evidence_list:
+                token = str(ev.evidence_id)
                 citations.append(
                     ResearchCitation(
-                        citation_id=f"[cite:{idx}]",
+                        citation_id=f"[cite:{token}]",
                         evidence_id=ev.evidence_id,
                         title=ev.title,
                         domain=ev.domain,
                         canonical_url=ev.canonical_url,
                         published_at=ev.published_at,
                         retrieved_at=ev.retrieved_at,
+                        source_id=ev.source_id,
                     )
                 )
             status = EvidenceStatus.PARTIAL
@@ -302,10 +356,12 @@ class ResearchSynthesizer:
         return ResearchResult(
             research_session_id=session_id,
             query_id=query_id,
+            query_text=query.query_text,
             intent=intent,
             mode=mode,
             answer=answer,
             citations=citations,
+            facts=facts,
             evidence_status=status,
             conflicts=conflicts or [],
             stale=False,

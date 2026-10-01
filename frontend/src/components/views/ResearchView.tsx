@@ -41,9 +41,6 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
   const [trip, setTrip] = useState<TripDetail | null>(null);
   const [allTrips, setAllTrips] = useState<TripSummary[]>([]);
   const [selectedDestination, setSelectedDestination] = useState<string>('Kyoto, Japan');
-  const [activeSessionId, setActiveSessionId] = useState<string>(
-    `rs_${tripId || 'global'}_${Date.now().toString(36)}`
-  );
 
   // Queries results list
   const [results, setResults] = useState<ResearchResponse[]>([]);
@@ -92,10 +89,9 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
 
     try {
       const response = await api.researchQuery({
-        trip_id: tripId,
-        session_id: activeSessionId,
-        question,
+        query: question,
         mode,
+        trip_id: tripId,
       });
 
       setResults((prev) => [response, ...prev]);
@@ -116,19 +112,12 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
     setIsDrawerOpen(true);
   };
 
-  // Apply to trip notes
-  const handleApplyToNotes = (insightText: string) => {
-    if (!trip) {
-      notify('Selected insight copied to clipboard.', 'info');
+  // Copy insight handler
+  const handleCopyInsight = (insightText: string) => {
+    if (navigator?.clipboard) {
       navigator.clipboard.writeText(insightText);
-      return;
     }
-
-    notify(
-      'Insight linked to journey planning context. Will be referenced during itinerary synthesis.',
-      'success',
-      'Insight Attached'
-    );
+    notify('Insight copied to clipboard.', 'success', 'Insight Copied');
   };
 
   const destinationName = trip?.destination || selectedDestination;
@@ -314,10 +303,10 @@ export const ResearchView: React.FC<ResearchViewProps> = ({
             <div className="space-y-6">
               {results.map((res, idx) => (
                 <ResearchDiscoveryCard
-                  key={res.session_id + '_' + idx}
+                  key={res.query_id || res.research_session_id || idx}
                   result={res}
                   onSelectCitation={handleOpenEvidence}
-                  onApplyToTripNotes={trip ? handleApplyToNotes : undefined}
+                  onCopyInsight={handleCopyInsight}
                 />
               ))}
             </div>

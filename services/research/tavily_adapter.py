@@ -109,7 +109,7 @@ class TavilyResearchProvider(ResearchProviderPort):
                         if not url or url in seen_urls:
                             continue
                         seen_urls.add(url)
-                        title = item.get("title") or "Untitled Source"
+                        title = item.get("title")
                         content = item.get("content") or ""
                         source = build_normalized_source(
                             raw_url=url,

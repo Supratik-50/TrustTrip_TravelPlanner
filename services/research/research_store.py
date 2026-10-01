@@ -226,6 +226,69 @@ class ResearchStore:
                     ),
                 )
 
+    def get_evidence(self, evidence_id: UUID) -> ResearchEvidence | None:
+        eid_str = str(evidence_id)
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                return self._IN_MEM_EVIDENCE.get(eid_str)
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM research_evidence WHERE id = %s",
+                (eid_str,),
+            ).fetchone()
+            if not row:
+                return None
+            return self._row_to_evidence(row)
+
+    def get_evidence_for_query(self, query_id: UUID) -> list[ResearchEvidence]:
+        qid_str = str(query_id)
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                return [ev for ev in self._IN_MEM_EVIDENCE.values() if str(ev.query_id) == qid_str]
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_evidence WHERE query_id = %s ORDER BY retrieved_at ASC",
+                (qid_str,),
+            ).fetchall()
+            return [self._row_to_evidence(r) for r in rows]
+
+    def _row_to_evidence(self, row: dict[str, Any]) -> ResearchEvidence:
+        claims = row.get("claims")
+        if isinstance(claims, str):
+            try:
+                claims = json.loads(claims)
+            except Exception:
+                claims = []
+        elif not isinstance(claims, list):
+            claims = []
+
+        rel_score = row.get("relevance_score")
+        if rel_score is not None:
+            rel_score = float(rel_score)
+
+        return ResearchEvidence(
+            evidence_id=UUID(str(row["id"])),
+            query_id=UUID(str(row["query_id"])),
+            user_id=UUID(str(row["user_id"])) if row.get("user_id") else None,
+            source_id=UUID(str(row["source_id"])),
+            trip_id=UUID(str(row["trip_id"])) if row.get("trip_id") else None,
+            revision_id=UUID(str(row["revision_id"])) if row.get("revision_id") else None,
+            canonical_url=row.get("canonical_url", ""),
+            title=row.get("title"),
+            domain=row.get("domain", ""),
+            trust_class=SourceTrustClass(row.get("trust_class", SourceTrustClass.UNKNOWN.value)),
+            claims=claims,
+            snippet=row.get("snippet"),
+            locator=row.get("locator"),
+            relevance_score=rel_score,
+            freshness_state=ResearchFreshnessState(row.get("freshness_state", ResearchFreshnessState.FRESH.value)),
+            retrieved_at=row.get("retrieved_at"),
+            published_at=row.get("published_at"),
+            immutable_hash=row.get("immutable_hash", ""),
+        )
+
     def save_citations(self, query_id: UUID, user_id: UUID, citations: list[ResearchCitation]) -> None:
         qid_str = str(query_id)
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
@@ -257,6 +320,32 @@ class ResearchStore:
                         c.published_at,
                     ),
                 )
+
+    def get_citations(self, query_id: UUID) -> list[ResearchCitation]:
+        qid_str = str(query_id)
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                return list(self._IN_MEM_CITATIONS.get(qid_str, []))
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_citations WHERE query_id = %s ORDER BY citation_token ASC",
+                (qid_str,),
+            ).fetchall()
+            return [
+                ResearchCitation(
+                    citation_id=r["citation_token"],
+                    evidence_id=UUID(str(r["evidence_id"])),
+                    title=r.get("title"),
+                    domain=r.get("domain", ""),
+                    canonical_url=r.get("canonical_url", ""),
+                    published_at=r.get("published_at"),
+                    retrieved_at=r.get("retrieved_at"),
+                    locator=r.get("locator"),
+                    cited_claims=json.loads(r["cited_claims"]) if isinstance(r.get("cited_claims"), str) else (r.get("cited_claims") or []),
+                )
+                for r in rows
+            ]
 
     # ==================== RAG DOCUMENTS & CHUNKS ====================
 

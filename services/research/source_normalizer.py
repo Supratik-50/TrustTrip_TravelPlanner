@@ -152,7 +152,7 @@ def classify_source_trust(hostname: str) -> SourceTrustClass:
 
 def build_normalized_source(
     raw_url: str,
-    title: str = "Untitled",
+    title: str | None = None,
     snippet: str = "",
     source_type: SourceType = SourceType.WEB_PAGE,
 ) -> ResearchSource:
@@ -162,13 +162,13 @@ def build_normalized_source(
     domain = parsed.hostname or ""
 
     trust = classify_source_trust(domain)
-    content_hash = hashlib.sha256(f"{canonical}:{title}:{snippet}".encode("utf-8")).hexdigest()
+    content_hash = hashlib.sha256(f"{canonical}:{title or ''}:{snippet}".encode("utf-8")).hexdigest()
 
     return ResearchSource(
         source_id=uuid4(),
         url=raw_url,
         canonical_url=canonical,
-        title=title or "Untitled",
+        title=title,
         domain=domain,
         source_type=source_type,
         trust_class=trust,

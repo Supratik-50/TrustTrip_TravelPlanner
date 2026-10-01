@@ -610,7 +610,7 @@ def research_agent(state: TravelState):
         summary = (result.answer or "")[:4000]
         ev_ids = [c.evidence_id for c in result.citations]
         cite_ids = [c.citation_id for c in result.citations]
-        source_ids = []
+        source_ids = list(dict.fromkeys(c.source_id for c in result.citations if c.source_id))
         sess_id = str(result.research_session_id)
         q_id = str(result.query_id)
         conflicts_data = [
@@ -623,13 +623,19 @@ def research_agent(state: TravelState):
             }
             for c in result.conflicts
         ]
+        # Only evidence-backed claims become allowed_facts (no arbitrary sentence splitting)
+        allowed_facts = [f.claim for f in result.facts if f.claim]
         advisory = ResearchAdvisoryProjection(
-            allowed_facts=[s.strip() for s in summary.split(". ") if s.strip()][:5],
+            summary=summary,
+            allowed_facts=allowed_facts,
+            facts=result.facts,
             evidence_ids=ev_ids,
             citation_ids=cite_ids,
+            source_ids=source_ids,
             limitations=["Research output is informational advisory context only."],
             conflicts_as_structured_records=conflicts_data,
             is_untrusted=True,
+            status=result.evidence_status.value,
         )
     except Exception:
         # Redact internal exception text (Blocker 8)
@@ -639,19 +645,23 @@ def research_agent(state: TravelState):
         sess_id = None
         q_id = None
         advisory = ResearchAdvisoryProjection(
+            summary=summary,
             allowed_facts=[],
+            facts=[],
             evidence_ids=[],
             citation_ids=[],
+            source_ids=[],
             limitations=["Service outage."],
             conflicts_as_structured_records=[],
             is_untrusted=True,
+            status="unavailable",
         )
 
     return {
         "research_session_id": sess_id,
         "research_query_id": q_id,
         "evidence_ids": [str(e) for e in ev_ids],
-        "source_ids": source_ids,
+        "source_ids": [str(s) for s in source_ids],
         "research_summary": summary,
         "research_advisory": advisory.model_dump(),
         "messages": [AIMessage(content="Research advisory context compiled.")],
@@ -1072,6 +1082,7 @@ def _serialize_result(
         "evidence_ids": result.get("evidence_ids", []),
         "source_ids": result.get("source_ids", []),
         "research_summary": result.get("research_summary", ""),
+        "research_advisory": result.get("research_advisory"),
     }
 
 

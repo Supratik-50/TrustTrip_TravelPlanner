@@ -681,7 +681,7 @@ class Phase8ResearchTestSuite(unittest.TestCase):
 
         async def _test():
             result = await synthesizer.synthesize(rq, [ev1], conflicts=[])
-            self.assertIn("[cite:1]", result.answer)
+            self.assertIn(f"[cite:{ev1.stable_token}]", result.answer)
             self.assertEqual(len(result.citations), 1)
             self.assertEqual(result.citations[0].evidence_id, ev1.evidence_id)
             self.assertEqual(result.evidence_status, EvidenceStatus.COMPLETE)
@@ -1215,7 +1215,7 @@ class Phase8ResearchTestSuite(unittest.TestCase):
         async def _test():
             # Mock LLM returning an answer where sentence 1 is cited, but sentence 2 is an uncited substantive claim
             uncited_response = (
-                "Passengers are permitted one 23kg cabin bag [cite:1]. "
+                f"Passengers are permitted one 23kg cabin bag [cite:{ev1.stable_token}]. "
                 "All flights include free complimentary champagne and luxury limousines for all passengers."
             )
             with patch.object(test_llm, "synthesize", new_callable=AsyncMock) as mock_synth:
@@ -1225,7 +1225,7 @@ class Phase8ResearchTestSuite(unittest.TestCase):
                 self.assertIn("[unverified]", ans)
                 self.assertEqual(ev_status, EvidenceStatus.PARTIAL)
                 self.assertEqual(len(cites), 1)
-                self.assertEqual(cites[0].citation_id, "[cite:1]")
+                self.assertEqual(cites[0].citation_id, f"[cite:{ev1.stable_token}]")
 
         asyncio.run(_test())
 
@@ -1455,8 +1455,8 @@ class Phase8ResearchTestSuite(unittest.TestCase):
         async def _test():
             # LLM generates 1 supported claim and 1 unsupported numerical hallucination
             llm_text = (
-                "Cabin baggage allowance is 12kg for economy passengers [cite:1]. "
-                "Checked bags incur a fee of $999 [cite:1]."
+                f"Cabin baggage allowance is 12kg for economy passengers [cite:{ev_standard.stable_token}]. "
+                f"Checked bags incur a fee of $999 [cite:{ev_standard.stable_token}]."
             )
             with patch.object(test_llm, "synthesize", new_callable=AsyncMock) as mock_s:
                 mock_s.return_value = llm_text

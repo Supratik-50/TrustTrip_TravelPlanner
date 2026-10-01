@@ -11,12 +11,11 @@ import os
 from typing import Any
 import httpx
 
-from services.research.ports import LLMProviderPort, ResearchProviderError
-
-
-class LLMProviderUnavailableError(ResearchProviderError):
-    """Raised when the primary LLM provider fails, times out, or exceeds rate limits."""
-    pass
+from services.research.ports import (
+    LLMProviderPort,
+    ResearchProviderError,
+    LLMProviderUnavailableError,
+)
 
 
 class GroqLLMProvider(LLMProviderPort):
@@ -101,26 +100,42 @@ class DeterministicTestLLMProvider(LLMProviderPort):
         if self.fixed_answer:
             return self.fixed_answer
 
-        # Generate a structured answer with verified citations based on the prompt
+        # Generate a structured answer with verified citations using canonical full-UUID cite_tokens
         import re
-        ev_matches = re.findall(r'index="(\d+)"', untrusted_evidence_prompt)
-        if not ev_matches:
-            ev_matches = re.findall(r"\[Evidence\s+(\d+)\]", untrusted_evidence_prompt)
+        tokens = re.findall(r'cite_token="([^"]+)"', untrusted_evidence_prompt)
+        if not tokens:
+            tokens = re.findall(r'evidence_id="([^"]+)"', untrusted_evidence_prompt)
 
         lines: list[str] = []
-        if ev_matches:
-            for num in sorted(list(set(ev_matches)), key=int):
-                snip_match = re.search(rf'<untrusted_evidence_data index="{num}"[^>]*>\s*(.*?)\s*</untrusted_evidence_data>', untrusted_evidence_prompt, re.DOTALL)
+        if tokens:
+            seen: set[str] = set()
+            ordered_tokens = [t for t in tokens if not (t in seen or seen.add(t))]
+            for token in ordered_tokens:
+                snip_match = re.search(
+                    rf'<untrusted_evidence_data [^>]*cite_token="{re.escape(token)}"[^>]*>\s*(.*?)\s*</untrusted_evidence_data>',
+                    untrusted_evidence_prompt,
+                    re.DOTALL,
+                )
                 if not snip_match:
-                    snip_match = re.search(rf'<item index="{num}"[^>]*>.*?<snippet>(.*?)</snippet>', untrusted_evidence_prompt, re.DOTALL)
+                    snip_match = re.search(
+                        rf'<untrusted_evidence_data [^>]*evidence_id="{re.escape(token)}"[^>]*>\s*(.*?)\s*</untrusted_evidence_data>',
+                        untrusted_evidence_prompt,
+                        re.DOTALL,
+                    )
+                if not snip_match:
+                    snip_match = re.search(
+                        rf'<item [^>]*cite_token="{re.escape(token)}"[^>]*>.*?<snippet>(.*?)</snippet>',
+                        untrusted_evidence_prompt,
+                        re.DOTALL,
+                    )
                 if snip_match:
                     s = snip_match.group(1).strip()
                     # Strip any inner XML tags if present
                     s = re.sub(r"<[^>]+>", " ", s).strip()
                     first_sent = s.split('.')[0].strip() if '.' in s else s[:80].strip()
-                    lines.append(f"{first_sent} [cite:{num}].")
+                    lines.append(f"{first_sent} [cite:{token}].")
                 else:
-                    lines.append(f"Official policy and travel rules verified for reference item {num} [cite:{num}].")
+                    lines.append(f"Official policy and travel rules verified for reference item {token} [cite:{token}].")
         else:
-            lines.append("According to official policy, cabin baggage allowance is 1 piece up to 23kg [cite:1].")
+            lines.append("According to official policy, cabin baggage allowance is 1 piece up to 23kg.")
         return "\n".join(lines)

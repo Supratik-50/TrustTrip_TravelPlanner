@@ -53,7 +53,7 @@ export const EvidenceDrawer: React.FC<EvidenceDrawerProps> = ({
     }
   };
 
-  const badge = getSourceTypeBadge(citation.source_type);
+  const badge = getSourceTypeBadge(citation.source_type || 'web');
 
   return (
     <div className="fixed inset-0 z-50 overflow-hidden">
@@ -90,34 +90,36 @@ export const EvidenceDrawer: React.FC<EvidenceDrawerProps> = ({
           {/* Body Content */}
           <div className="p-6 space-y-6 flex-1">
             {/* Research Claim */}
-            {citation.claim && (
+            {(citation.claim || (citation.cited_claims && citation.cited_claims.length > 0)) && (
               <div className="space-y-1.5">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--primary)] font-mono">
                   Research Claim
                 </span>
                 <p className="text-sm font-medium text-[var(--text-primary)] leading-relaxed bg-[var(--surface-muted)]/50 p-3.5 rounded-2xl border border-[var(--border)]">
-                  "{citation.claim}"
+                  "{citation.claim || citation.cited_claims?.join('. ') || ''}"
                 </p>
               </div>
             )}
 
             {/* Evidence Quote / Excerpt with Paper Notebook Styling */}
-            <div className="space-y-2">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-secondary)] font-mono flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-[var(--terracotta)]" />
-                Original Evidence Excerpt
-              </span>
-              <div className="relative p-5 rounded-2xl bg-[var(--surface-muted)] border-l-4 border-[var(--primary)] border-t border-r border-b border-[var(--border)] shadow-xs">
-                <blockquote className="text-sm italic font-serif text-[var(--text-primary)] leading-relaxed">
-                  "{citation.snippet}"
-                </blockquote>
-                {citation.publisher && (
-                  <div className="mt-3 text-right text-xs font-mono font-medium text-[var(--text-secondary)]">
-                    — {citation.publisher}
-                  </div>
-                )}
+            {(citation.snippet || citation.locator) && (
+              <div className="space-y-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-secondary)] font-mono flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-[var(--terracotta)]" />
+                  Original Evidence Excerpt
+                </span>
+                <div className="relative p-5 rounded-2xl bg-[var(--surface-muted)] border-l-4 border-[var(--primary)] border-t border-r border-b border-[var(--border)] shadow-xs">
+                  <blockquote className="text-sm italic font-serif text-[var(--text-primary)] leading-relaxed">
+                    "{citation.snippet || citation.locator}"
+                  </blockquote>
+                  {(citation.publisher || citation.domain) && (
+                    <div className="mt-3 text-right text-xs font-mono font-medium text-[var(--text-secondary)]">
+                      — {citation.publisher || citation.domain}
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Source Provenance Metadata */}
             <div className="space-y-3 pt-2">
@@ -127,11 +129,20 @@ export const EvidenceDrawer: React.FC<EvidenceDrawerProps> = ({
 
               <div className="space-y-2.5 p-4 rounded-2xl bg-[var(--surface)] border border-[var(--border)] text-xs">
                 <div className="flex items-start justify-between gap-3">
-                  <span className="text-[var(--text-muted)] font-medium">Source Title:</span>
+                  <span className="text-[var(--text-muted)] font-medium">Source:</span>
                   <span className="text-[var(--text-primary)] font-semibold text-right font-editorial text-sm">
-                    {citation.title}
+                    {citation.title || citation.domain || 'Verified Knowledge Reference'}
                   </span>
                 </div>
+
+                {citation.domain && (
+                  <div className="flex items-center justify-between gap-3 pt-2 border-t border-[var(--border)]/70">
+                    <span className="text-[var(--text-muted)]">Domain:</span>
+                    <span className="text-[var(--text-primary)] font-mono text-[11px]">
+                      {citation.domain}
+                    </span>
+                  </div>
+                )}
 
                 {citation.publisher && (
                   <div className="flex items-center justify-between gap-3 pt-2 border-t border-[var(--border)]/70">
@@ -190,9 +201,9 @@ export const EvidenceDrawer: React.FC<EvidenceDrawerProps> = ({
 
           {/* Footer with Safe External Link */}
           <div className="p-6 border-t border-[var(--border)] bg-[var(--surface-muted)]/40 flex items-center justify-between gap-3">
-            {citation.url ? (
+            {(citation.canonical_url || citation.url) ? (
               <a
-                href={citation.url}
+                href={citation.canonical_url || citation.url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-white text-xs font-semibold shadow-xs transition-colors"

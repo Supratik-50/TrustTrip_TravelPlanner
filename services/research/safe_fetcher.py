@@ -198,16 +198,6 @@ def resolve_and_validate_target(url: str, allow_http: bool = False) -> tuple[str
     return url_clean, hostname, port, validated_ip
 
 
-def validate_research_url(url: str, allow_http: bool = False) -> tuple[str, str, int]:
-    """Validate URL scheme, credentials, hostname, and pre-resolve DNS against SSRF blacklist.
-
-    Returns (normalized_url, hostname, port).
-    Raises SSRFSecurityViolation on invalid or dangerous targets.
-    """
-    url_clean, hostname, port, _ = resolve_and_validate_target(url, allow_http=allow_http)
-    return url_clean, hostname, port
-
-
 class PinnedNetworkBackend(AnyIOBackend):
     """Transport-level network backend that pins the TCP socket connection to a pre-validated IP.
 
@@ -258,7 +248,7 @@ class SafeHttpFetcher(FetcherPort):
         except ValueError:
             return True
 
-    def _validate_url(self, url: str) -> tuple[str, str, int]:
+    def _validate_url(self, url: str) -> str:
         return validate_research_url(url, allow_http=self.allow_http)
 
     async def fetch(
@@ -423,3 +413,12 @@ class SafeHttpFetcher(FetcherPort):
 
 # Backward-compatible alias
 SafeFetcher = SafeHttpFetcher
+
+
+def validate_research_url(url: str, allow_http: bool = False) -> str:
+    """Validate research URL format and SSRF safety, returning normalized URL.
+
+    Raises SSRFSecurityViolation if invalid or disallowed.
+    """
+    normalized_url, _, _, _ = resolve_and_validate_target(url, allow_http=allow_http)
+    return normalized_url

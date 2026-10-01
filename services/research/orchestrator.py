@@ -141,6 +141,7 @@ class ResearchOrchestrator:
             return ResearchResult(
                 research_session_id=sess_id,
                 query_id=q_id,
+                query_text=query_text,
                 intent=ResearchIntent.LIVE_FLIGHT_SEARCH,
                 mode=effective_mode,
                 answer=(
@@ -195,6 +196,7 @@ class ResearchOrchestrator:
             return ResearchResult(
                 research_session_id=sess_id,
                 query_id=q_id,
+                query_text=query_text,
                 intent=intent_decision.intent,
                 mode=effective_mode,
                 answer=clarification,
@@ -207,14 +209,17 @@ class ResearchOrchestrator:
             )
 
         # 4. Retrieval execution
+        # 4. Retrieval execution
         web_evidence: list[ResearchEvidence] = []
         rag_evidence: list[ResearchEvidence] = []
+        web_error: Exception | None = None
+        rag_error: Exception | None = None
 
         should_fetch_web = effective_mode in (ResearchMode.WEB, ResearchMode.HYBRID, ResearchMode.AUTO)
         should_fetch_rag = effective_mode in (ResearchMode.RAG, ResearchMode.HYBRID) or has_docs
 
         async def _retrieve_web():
-            nonlocal web_evidence
+            nonlocal web_evidence, web_error
             try:
                 from services.research.safe_fetcher import validate_research_url
                 sources = await self.web_provider.search(
@@ -223,9 +228,21 @@ class ResearchOrchestrator:
                     call_timeout=min(12.0, call_timeout),
                 )
                 for src in sources:
-                    # Validate URL via SafeHttpFetcher logic (Blocker 4)
+                    # Validate URL via SafeHttpFetcher logic
+                    if not src.url:
+                        continue
+                    try:
+                        normalized_url = validate_research_url(
+                            src.url,
+                            allow_http=getattr(self.safe_fetcher, "allow_http", False),
+                        )
+                        src = src.model_copy(update={"canonical_url": normalized_url})
+                    except Exception as url_err:
+                        logger.warning("Rejecting invalid or unsafe research source URL '%s': %s", src.url, url_err)
+                        continue
+
                     # If source snippet is missing or empty, fetch page content via SafeHttpFetcher
-                    snippet = src.metadata.get("snippet", "")
+                    snippet = src.metadata.get("snippet", "") if src.metadata else ""
                     if not snippet and hasattr(self, "safe_fetcher") and self.safe_fetcher:
                         try:
                             content_text, final_url, status_code = await self.safe_fetcher.fetch(
@@ -234,7 +251,7 @@ class ResearchOrchestrator:
                             if status_code == 200 and content_text:
                                 snippet = content_text[:1500]
                                 src.metadata["snippet"] = snippet
-                                src.canonical_url = final_url
+                                src = src.model_copy(update={"canonical_url": final_url})
                         except Exception as fetch_err:
                             logger.warning("SafeHttpFetcher failed for source %s: %s", src.url, fetch_err)
                             continue
@@ -251,22 +268,28 @@ class ResearchOrchestrator:
                         title=src.title,
                         domain=src.domain,
                         trust_class=src.trust_class,
-                        claims=[src.metadata.get("snippet", "")[:300]],
-                        snippet=src.metadata.get("snippet", "")[:1500],
-                        locator="Web Snippet",
-                        relevance_score=0.85,
+                        claims=[snippet[:300]] if snippet else [],
+                        snippet=snippet[:1500] if snippet else None,
+                        locator="Web Snippet" if snippet else None,
+                        relevance_score=None,  # Populated only when actual reranker scores it
                         freshness_state=ResearchFreshnessState.FRESH,
                         retrieved_at=src.retrieved_at,
+                        published_at=src.published_at,
                         immutable_hash=ev_hash,
                         trip_id=trip_id,
                         revision_number=revision_number,
+                        citation_token=str(ev_id),
                     )
                     web_evidence.append(ev)
             except (ResearchProviderError, asyncio.TimeoutError) as exc:
                 logger.warning("Web research provider failed or timed out: %s", exc)
+                web_error = exc
+            except Exception as exc:
+                logger.warning("Unexpected error during web research retrieval: %s", exc)
+                web_error = exc
 
         def _retrieve_rag():
-            nonlocal rag_evidence
+            nonlocal rag_evidence, rag_error
             try:
                 q_emb = self.embedding_provider.embed_texts([query_text])[0]
                 scored_chunks = self.vector_store.query_similar(
@@ -296,10 +319,12 @@ class ResearchOrchestrator:
                         immutable_hash=ev_hash,
                         trip_id=trip_id,
                         revision_number=revision_number,
+                        citation_token=str(ev_id),
                     )
                     rag_evidence.append(ev)
             except Exception as exc:
                 logger.warning("RAG retrieval failed: %s", exc)
+                rag_error = exc
 
         tasks = []
         if should_fetch_web:
@@ -314,48 +339,61 @@ class ResearchOrchestrator:
         merged_evidence, conflicts = merge_and_deduplicate_evidence(web_evidence, rag_evidence)
 
         if not merged_evidence:
+            has_error = (web_error is not None and should_fetch_web) or (rag_error is not None and should_fetch_rag)
             return ResearchResult(
                 research_session_id=sess_id,
                 query_id=q_id,
+                query_text=query_text,
                 intent=intent_decision.intent,
                 mode=effective_mode,
-                answer="Evidence not found / source unavailable.",
+                answer=(
+                    "Research service unavailable: upstream provider timeout or failure."
+                    if has_error
+                    else "Evidence not found / source unavailable."
+                ),
                 citations=[],
-                evidence_status=EvidenceStatus.NOT_FOUND,
+                facts=[],
+                evidence_status=EvidenceStatus.PARTIAL if has_error else EvidenceStatus.NOT_FOUND,
                 conflicts=[],
                 stale=False,
                 evidence_count=0,
                 created_at=now,
             )
 
-        # 6. Reranking
-        passages = [(ev, f"{ev.title} {ev.snippet}") for ev in merged_evidence]
+        # 6. Reranking using actual reranker scores
+        passages = [(ev, f"{ev.title or ''} {ev.snippet or ''}".strip()) for ev in merged_evidence]
         reranked = self.reranker.rerank(query=query_text, passages=passages, top_k=max_sources)
-        final_evidence = [item for item, _ in reranked]
+        final_evidence = []
+        for item, score in reranked:
+            norm_score = max(0.0, min(1.0, float(score)))
+            final_evidence.append(item.model_copy(update={"relevance_score": norm_score}))
 
-        # 7. Grounded Synthesis with Citations
+        # 7. Grounded Synthesis with Citations & Facts
         citations: list[ResearchCitation] = []
+        facts: list[ResearchFact] = []
         answer_text: str = ""
         evidence_status: EvidenceStatus = EvidenceStatus.COMPLETE
 
+        partial_provider = (web_error is not None and should_fetch_web) or (rag_error is not None and should_fetch_rag)
+
         try:
-            answer_text, citations, evidence_status = await self.synthesizer.synthesize_answer(
+            answer_text, citations, facts, evidence_status = await self.synthesizer.synthesize_answer_with_facts(
                 query=query_text,
                 evidence_list=final_evidence,
                 conflicts=conflicts,
                 call_timeout=call_timeout,
             )
+            if partial_provider and evidence_status == EvidenceStatus.COMPLETE:
+                evidence_status = EvidenceStatus.PARTIAL
         except LLMProviderUnavailableError as exc:
-            # CRITICAL (Guardrail 4): Production LLM failure path is explicitly non-hallucinatory
             logger.error("LLM synthesis failed: %s", exc)
             answer_text = (
                 "Synthesis is currently unavailable due to an upstream model error. "
                 "Verified source citations and retrieved passages are provided below."
             )
-            # Create citations directly from evidence without synthetic text
             citations = [
                 ResearchCitation(
-                    citation_id=f"[cite:{idx}]",
+                    citation_id=f"[cite:{ev.stable_token}]",
                     evidence_id=ev.evidence_id,
                     title=ev.title,
                     domain=ev.domain,
@@ -364,9 +402,11 @@ class ResearchOrchestrator:
                     retrieved_at=ev.retrieved_at,
                     locator=ev.locator,
                     cited_claims=ev.claims[:2],
+                    source_id=ev.source_id,
                 )
-                for idx, ev in enumerate(final_evidence, start=1)
+                for ev in final_evidence
             ]
+            facts = []
             evidence_status = EvidenceStatus.PARTIAL
 
         # 8. Bridge to Phase 6 Evidence Lifecycle if attached to a trip
@@ -413,10 +453,12 @@ class ResearchOrchestrator:
         return ResearchResult(
             research_session_id=sess_id,
             query_id=q_id,
+            query_text=query_text,
             intent=intent_decision.intent,
             mode=effective_mode,
             answer=answer_text,
             citations=citations,
+            facts=facts,
             evidence_status=evidence_status,
             conflicts=conflicts,
             stale=False,

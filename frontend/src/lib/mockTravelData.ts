@@ -760,7 +760,8 @@ export const saveMockResearchQuery = (
 export const executeMockResearchQuery = (
   request: ResearchQueryRequest
 ): ResearchResponse => {
-  const q = request.question.toLowerCase();
+  const queryText = request.query || request.question || '';
+  const q = queryText.toLowerCase();
   const sessionId = request.session_id || `rs_${Date.now().toString(36)}`;
   const tripId = request.trip_id;
   const mode = request.mode || 'hybrid';
@@ -769,13 +770,19 @@ export const executeMockResearchQuery = (
   const isFood = q.includes('food') || q.includes('restaurant') || q.includes('eat') || q.includes('dining') || q.includes('kaiseki');
   const isStay = q.includes('stay') || q.includes('hotel') || q.includes('neighborhood') || q.includes('area');
 
+  const mockUuids = [
+    'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d',
+    'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e',
+    'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f',
+  ];
+
   let answer = '';
   let citations: ResearchResponse['citations'] = [];
   let conflicts: ResearchResponse['conflicts'] = [];
 
   if (isKyoto && isFood) {
     answer =
-      "For authentic traditional dining in Kyoto, focus on Higashiyama and the historic Gion district, where family-run kaiseki ryotei and machiya tea houses preserve generational culinary techniques [1]. Nishiki Market remains the epicenter for local street-level tastings such as grilled unagi skewers, artisanal yuba (tofu skin), and tsukemono (pickled Kyoto vegetables) [2]. For tea culture, Uji-sourced matcha ceremonies around Kodai-ji Temple provide intimate, reflective sessions away from tour groups [3].";
+      `For authentic traditional dining in Kyoto, focus on Higashiyama and the historic Gion district, where family-run kaiseki ryotei and machiya tea houses preserve generational culinary techniques [cite:${mockUuids[0]}]. Nishiki Market remains the epicenter for local street-level tastings such as grilled unagi skewers, artisanal yuba (tofu skin), and tsukemono (pickled Kyoto vegetables) [cite:${mockUuids[1]}]. For tea culture, Uji-sourced matcha ceremonies around Kodai-ji Temple provide intimate, reflective sessions away from tour groups [cite:${mockUuids[2]}].`;
 
     citations = [
       {
@@ -830,7 +837,7 @@ export const executeMockResearchQuery = (
     ];
   } else if (isKyoto && isStay) {
     answer =
-      "For a serene and traditional stay, Higashiyama and Southern Gion offer walking access to wooden machiya stays and peaceful morning temple walks before crowds arrive [1]. For superior transit convenience and bullet train connections, staying near Kyoto Station or Karasuma-Oike provides rapid subway access across all four quadrants of the city [2]. Keep in mind that city buses enforce strict small-baggage policies during peak commute hours [3].";
+      `For a serene and traditional stay, Higashiyama and Southern Gion offer walking access to wooden machiya stays and peaceful morning temple walks before crowds arrive [cite:${mockUuids[0]}]. For superior transit convenience and bullet train connections, staying near Kyoto Station or Karasuma-Oike provides rapid subway access across all four quadrants of the city [cite:${mockUuids[1]}]. Keep in mind that city buses enforce strict small-baggage policies during peak commute hours [cite:${mockUuids[2]}].`;
 
     citations = [
       {
@@ -874,7 +881,7 @@ export const executeMockResearchQuery = (
     ];
   } else if (q.includes('amalfi') || q.includes('italy')) {
     answer =
-      "When planning travel on the Amalfi Coast, ferry transit between Salerno, Amalfi, and Positano is significantly faster and more scenic than coastal road buses, which often experience heavy cliffside congestion between May and October [1]. For hiking enthusiasts, the Path of the Gods (Sentiero degli Dei) from Bomerano to Nocelle offers unmatched panoramic vistas over the Tyrrhenian Sea [2]. Ravello, perched 365 meters above sea level, provides a cooler, quieter haven known for Villa Cimbrone and Villa Rufolo cliffside gardens [3].";
+      `When planning travel on the Amalfi Coast, ferry transit between Salerno, Amalfi, and Positano is significantly faster and more scenic than coastal road buses, which often experience heavy cliffside congestion between May and October [cite:${mockUuids[0]}]. For hiking enthusiasts, the Path of the Gods (Sentiero degli Dei) from Bomerano to Nocelle offers unmatched panoramic vistas over the Tyrrhenian Sea [cite:${mockUuids[1]}]. Ravello, perched 365 meters above sea level, provides a cooler, quieter haven known for Villa Cimbrone and Villa Rufolo cliffside gardens [cite:${mockUuids[2]}].`;
 
     citations = [
       {
@@ -920,7 +927,7 @@ export const executeMockResearchQuery = (
   } else {
     // General travel discovery
     answer =
-      `Based on verified regional travel guidance, optimal visits require balancing landmark cultural highlights with quieter morning hours [1]. Local public transportation is recommended over congested car travel, and securing restaurant reservations 10 to 14 days in advance ensures access to renowned neighborhood dining [2]. Reviewing seasonal climate trends guarantees proper layering for evening strolls and coastal walkways [3].`;
+      `Based on verified regional travel guidance, optimal visits require balancing landmark cultural highlights with quieter morning hours [cite:${mockUuids[0]}]. Local public transportation is recommended over congested car travel, and securing restaurant reservations 10 to 14 days in advance ensures access to renowned neighborhood dining [cite:${mockUuids[1]}]. Reviewing seasonal climate trends guarantees proper layering for evening strolls and coastal walkways.`;
 
     citations = [
       {
@@ -946,15 +953,42 @@ export const executeMockResearchQuery = (
     ];
   }
 
+  const queryId = `qry_${Date.now().toString(36)}`;
+  const normalizedCitations = citations.map((c, i) => {
+    const evUuid = mockUuids[i] || `00000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}`;
+    return {
+      ...c,
+      citation_id: `[cite:${evUuid}]`,
+      evidence_id: evUuid,
+      canonical_url: c.canonical_url || c.url || '',
+      cited_claims: c.cited_claims || (c.claim ? [c.claim] : []),
+    };
+  });
+
+  const facts = normalizedCitations.map((c, i) => ({
+    fact_id: `fct_${i}_${Date.now().toString(36)}`,
+    claim: c.claim || c.title || 'Verified observation',
+    evidence_id: c.evidence_id,
+    citation_id: c.citation_id,
+    source_id: c.source_id,
+  }));
+
   const response: ResearchResponse = {
+    research_session_id: sessionId,
+    query_id: queryId,
+    query_text: queryText,
+    intent: 'DESTINATION_RESEARCH',
+    mode,
+    answer,
+    citations: normalizedCitations,
+    facts,
+    evidence_status: 'complete',
     session_id: sessionId,
     trip_id: tripId,
-    question: request.question,
-    answer,
+    question: queryText,
     source_type: mode === 'rag' ? 'rag' : mode === 'web' ? 'web' : 'hybrid',
     confidence_score: 0.96,
     freshness_note: 'Verified against current 2026 transit timetables and official tourism notices',
-    citations,
     conflicts: conflicts.length > 0 ? conflicts : undefined,
     insights_count: {
       places: citations.length + 1,

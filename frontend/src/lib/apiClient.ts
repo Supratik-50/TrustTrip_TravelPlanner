@@ -724,7 +724,7 @@ export class ApiClient {
 
     // --- Part 4: Research Query Fallback ---
     if (endpoint === '/api/research/query' && method === 'POST') {
-      const body: ResearchQueryRequest = options.body ? JSON.parse(options.body as string) : { question: '' };
+      const body: ResearchQueryRequest = options.body ? JSON.parse(options.body as string) : { query: '' };
       const response = executeMockResearchQuery(body);
       return response as unknown as T;
     }

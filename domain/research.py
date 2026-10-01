@@ -105,7 +105,7 @@ class ResearchSource(BaseModel):
     source_id: UUID = Field(default_factory=uuid4)
     url: str = Field(default="", max_length=2000)
     canonical_url: str = Field(default="", max_length=2000)
-    title: str = Field(default="Untitled", max_length=500)
+    title: str | None = Field(default=None, max_length=500)
     domain: str = Field(default="", max_length=255)
     source_type: SourceType = SourceType.WEB_PAGE
     trust_class: SourceTrustClass = SourceTrustClass.UNKNOWN
@@ -124,13 +124,13 @@ class ResearchEvidence(BaseModel):
     user_id: UUID | None = None
     source_id: UUID
     canonical_url: str = Field(default="", max_length=2000)
-    title: str = Field(default="", max_length=500)
+    title: str | None = Field(default=None, max_length=500)
     domain: str = Field(default="", max_length=255)
     trust_class: SourceTrustClass = SourceTrustClass.UNKNOWN
     claims: list[str] = Field(default_factory=list)
-    snippet: str = Field(default="", max_length=4000)
-    locator: str = Field(default="", max_length=500)
-    relevance_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    snippet: str | None = Field(default=None, max_length=4000)
+    locator: str | None = Field(default=None, max_length=500)
+    relevance_score: float | None = Field(default=None, ge=0.0, le=1.0)
     freshness_state: ResearchFreshnessState = ResearchFreshnessState.UNKNOWN
     retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     published_at: datetime | None = None
@@ -138,21 +138,38 @@ class ResearchEvidence(BaseModel):
     trip_id: UUID | None = None
     revision_id: UUID | None = None
     revision_number: int | None = None
+    citation_token: str | None = Field(default=None, max_length=100)
+
+    @property
+    def stable_token(self) -> str:
+        return str(self.evidence_id)
 
 
 class ResearchCitation(BaseModel):
     """Public projection of research citation for frontend display."""
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    citation_id: str = Field(description="Unique citation identifier e.g. [cite:1]")
+    citation_id: str = Field(description="Unique canonical citation identifier e.g. [cite:<uuid>]")
     evidence_id: UUID
-    title: str
-    domain: str
-    canonical_url: str
+    title: str | None = None
+    domain: str = ""
+    canonical_url: str = ""
     published_at: datetime | None = None
     retrieved_at: datetime
-    locator: str = ""
+    locator: str | None = None
     cited_claims: list[str] = Field(default_factory=list)
+    source_id: UUID | None = None
+
+
+class ResearchFact(BaseModel):
+    """Provenance-linked fact connecting a verified claim to supporting evidence and citation."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fact_id: UUID = Field(default_factory=uuid4)
+    claim: str = Field(min_length=1, max_length=2000)
+    evidence_id: UUID
+    citation_id: str
+    source_id: UUID | None = None
 
 
 class ResearchConflict(BaseModel):
@@ -177,10 +194,12 @@ class ResearchResult(BaseModel):
 
     research_session_id: UUID
     query_id: UUID
+    query_text: str = ""
     intent: ResearchIntent
     mode: ResearchMode
     answer: str
     citations: list[ResearchCitation] = Field(default_factory=list)
+    facts: list[ResearchFact] = Field(default_factory=list)
     evidence_status: EvidenceStatus = EvidenceStatus.COMPLETE
     conflicts: list[ResearchConflict] = Field(default_factory=list)
     stale: bool = False
@@ -242,11 +261,14 @@ class ResearchAdvisoryContext(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     summary: str = Field(default="", max_length=4000)
+    facts: list[ResearchFact] = Field(default_factory=list)
     evidence_ids: list[UUID] = Field(default_factory=list)
     citation_ids: list[str] = Field(default_factory=list)
+    source_ids: list[UUID] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
     is_untrusted: bool = Field(default=True)
+    status: str = Field(default="complete")
 
 
 class ResearchAdvisoryProjection(BaseModel):
@@ -258,9 +280,13 @@ class ResearchAdvisoryProjection(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    summary: str = Field(default="", max_length=4000)
     allowed_facts: list[str] = Field(default_factory=list)
+    facts: list[ResearchFact] = Field(default_factory=list)
     evidence_ids: list[UUID] = Field(default_factory=list)
     citation_ids: list[str] = Field(default_factory=list)
+    source_ids: list[UUID] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     conflicts_as_structured_records: list[dict[str, Any]] = Field(default_factory=list)
     is_untrusted: bool = Field(default=True)
+    status: str = Field(default="complete")

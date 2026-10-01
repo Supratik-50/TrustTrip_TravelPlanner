@@ -99,22 +99,34 @@ Fresh PostgreSQL DB (with pgvector extension available)
     ↓
 5. Apply Migration 007 (`booking_intents`, `booking_attempts`, `booking_transitions`)
     ↓
-6. Application Startup Schema Validation (`validate_database_schema()`)
+6. Apply Migration 008 (`research_evidence`, `research_sources`, `research_citations` nullable metadata)
+    ↓
+7. Application Startup Schema Validation (`validate_database_schema()`)
 ```
 
-#### Step-by-Step Bootstrap Commands:
+#### Automated Migration Execution (Recommended):
+Run the native TrustTrip migration runner to discover, execute, and track migrations 004 through 008 in strict numeric order:
+```bash
+python -m services.migration_runner
+```
+*Note: Application startup (`app.py` lifespan) also automatically invokes `run_migrations()` upon boot, ensuring migrations are never skipped.*
+
+#### Manual Step-by-Step Bootstrap Commands (Alternative):
 1. **Initialize Base Application Tables**:
    Run the Python bootstrap helper to create the core `users`, `trips`, and `threads` tables:
    ```bash
    python -c "from services.auth_store import init_auth_tables; from services.trip_store import init_trip_tables; init_auth_tables(); init_trip_tables(); print('Base tables initialized.')"
    ```
 2. **Apply Versioned SQL Migrations**:
-   Run the migrations sequentially using `psql`:
+   Run the migrations sequentially using `services.migration_runner` or `psql`:
    ```bash
+   python -m services.migration_runner
+   # Or manually via psql:
    psql -d "$DATABASE_URL" -f migrations/004_travel_intelligence.sql
    psql -d "$DATABASE_URL" -f migrations/005_evidence_revision_lifecycle.sql
    psql -d "$DATABASE_URL" -f migrations/006_research_and_rag.sql
    psql -d "$DATABASE_URL" -f migrations/007_flight_booking_lifecycle.sql
+   psql -d "$DATABASE_URL" -f migrations/008_research_evidence_nullable_metadata.sql
    ```
 3. **Startup Schema Verification**:
    At application startup, `validate_database_schema()` in `services/search_session_store.py` performs a zero-DDL check ensuring all required tables exist across all migrations:
@@ -122,6 +134,7 @@ Fresh PostgreSQL DB (with pgvector extension available)
    - `migrations/005`: `plan_revisions`, `evidence_records`, `evidence_provenance`, `plan_revision_evidence_links`, `plan_approvals`
    - `migrations/006`: `research_sessions`, `research_queries`, `research_sources`, `research_evidence`, `research_citations`, `rag_documents`, `rag_chunks`
    - `migrations/007`: `booking_intents`, `booking_attempts`, `booking_transitions`
+   - `migrations/008`: preserves NULL semantics for research metadata columns
 
 ### 6. Local Run
 To run both backend and frontend locally for development or testing:
