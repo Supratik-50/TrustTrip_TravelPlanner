@@ -157,10 +157,14 @@ class PlannerService:
 
             canonical_constraints = {
                 "origin": orig_code,
+                "origin_airport": orig_code,
+                "origin_code": orig_code,
                 "origin_query": origin_raw,
                 "origin_city": orig_city or origin_raw,
                 "origin_country": orig_country or "",
                 "destination": dest_code,
+                "destination_airport": dest_code,
+                "destination_code": dest_code,
                 "destination_query": dest_raw,
                 "destination_city": dest_city or dest_raw,
                 "destination_country": dest_country or "",
@@ -310,10 +314,14 @@ class PlannerService:
 
                 # Authoritative canonical trip constraints ALWAYS WIN over arbitrary prompt text
                 parsed["origin"] = canonical_constraints.get("origin")
+                parsed["origin_airport"] = canonical_constraints.get("origin_airport")
+                parsed["origin_code"] = canonical_constraints.get("origin_code")
                 parsed["origin_city"] = canonical_constraints.get("origin_city")
                 parsed["origin_country"] = canonical_constraints.get("origin_country")
                 parsed["origin_query"] = canonical_constraints.get("origin_query")
                 parsed["destination"] = canonical_constraints.get("destination")
+                parsed["destination_airport"] = canonical_constraints.get("destination_airport")
+                parsed["destination_code"] = canonical_constraints.get("destination_code")
                 parsed["destination_city"] = canonical_constraints.get("destination_city")
                 parsed["destination_country"] = canonical_constraints.get("destination_country")
                 parsed["destination_query"] = canonical_constraints.get("destination_query")

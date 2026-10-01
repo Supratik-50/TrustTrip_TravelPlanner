@@ -167,6 +167,9 @@ export interface BackendPlanJson {
   origin?: string;
   destination_airport?: string;
   origin_airport?: string;
+  departure_date?: string;
+  return_date?: string;
+  travelers?: number;
   status?: string;
   planning_unavailable?: boolean;
 }

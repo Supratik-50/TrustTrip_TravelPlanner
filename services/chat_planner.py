@@ -106,6 +106,27 @@ def _gemini_model() -> str:
     return os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
+def _gemini_response_schema() -> dict[str, Any]:
+    """Return the TravelPlan JSON schema without JSON Schema keywords Gemini rejects.
+
+    Pydantic emits ``additionalProperties`` for ``dict[str, Any]`` fields.
+    The Gemini ``response_schema`` API does not accept that keyword, so strip
+    it recursively while preserving every supported structural constraint.
+    """
+    def remove_unsupported(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: remove_unsupported(item)
+                for key, item in value.items()
+                if key != "additionalProperties"
+            }
+        if isinstance(value, list):
+            return [remove_unsupported(item) for item in value]
+        return value
+
+    return remove_unsupported(TravelPlan.model_json_schema())
+
+
 def _compact_flight(o: dict[str, Any]) -> dict[str, Any]:
     segs = o.get("segments") or []
     first = segs[0] if segs else {}
@@ -204,7 +225,7 @@ def _gemini_plan(prompt: str) -> TravelPlan:
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.12, max_output_tokens=1700,
-            response_mime_type="application/json", response_schema=TravelPlan.model_json_schema(),
+            response_mime_type="application/json", response_schema=_gemini_response_schema(),
         ),
     )
     response = chat.send_message(prompt)
@@ -484,12 +505,43 @@ def enforce_complete_canonical_invariants(
         ctx = dict(canonical_context)
 
     # 1. HARD REJECT: Origin, Destination & Airport Identifiers
+    from services.travel_planner import _resolve_place
+
+    origin_code = ctx.get("origin_airport") or ctx.get("origin_code")
+    origin_city = ctx.get("origin_city")
+    if not origin_code:
+        raw_o = ctx.get("origin")
+        if raw_o:
+            s_o = str(raw_o).strip()
+            c_o, city_o, _ = _resolve_place(s_o)
+            if c_o:
+                origin_code = c_o
+            if not origin_city and city_o:
+                origin_city = city_o
+
+    dest_code = ctx.get("destination_airport") or ctx.get("destination_code")
+    dest_city = ctx.get("destination_city")
+    if not dest_code:
+        raw_d = ctx.get("destination")
+        if raw_d:
+            s_d = str(raw_d).strip()
+            c_d, city_d, _ = _resolve_place(s_d)
+            if c_d:
+                dest_code = c_d
+            if not dest_city and city_d:
+                dest_city = city_d
+
     valid_origins = {
         str(ctx.get("origin") or "").strip().lower(),
         str(ctx.get("origin_city") or "").strip().lower(),
         str(ctx.get("origin_query") or "").strip().lower(),
         str(ctx.get("origin_airport") or "").strip().lower(),
     } - {""}
+    if origin_code:
+        valid_origins.add(str(origin_code).strip().lower())
+    if origin_city:
+        valid_origins.add(str(origin_city).strip().lower())
+
     if valid_origins:
         if plan.origin is not None:
             p_orig = plan.origin.strip().lower()
@@ -497,8 +549,10 @@ def enforce_complete_canonical_invariants(
                 raise CanonicalInvariantViolation(
                     f"Canonical origin tampering detected: expected one of {valid_origins}, got '{plan.origin}'"
                 )
+            if origin_code and p_orig == str(origin_code).strip().lower() and origin_city:
+                plan.origin = origin_city
         else:
-            plan.origin = str(ctx.get("origin_city") or ctx.get("origin"))
+            plan.origin = str(origin_city or ctx.get("origin_city") or ctx.get("origin"))
 
     valid_dests = {
         str(ctx.get("destination") or "").strip().lower(),
@@ -506,6 +560,11 @@ def enforce_complete_canonical_invariants(
         str(ctx.get("destination_query") or "").strip().lower(),
         str(ctx.get("destination_airport") or "").strip().lower(),
     } - {""}
+    if dest_code:
+        valid_dests.add(str(dest_code).strip().lower())
+    if dest_city:
+        valid_dests.add(str(dest_city).strip().lower())
+
     if valid_dests:
         if plan.destination is not None:
             p_dest = plan.destination.strip().lower()
@@ -513,10 +572,11 @@ def enforce_complete_canonical_invariants(
                 raise CanonicalInvariantViolation(
                     f"Canonical destination tampering detected: expected one of {valid_dests}, got '{plan.destination}'"
                 )
+            if dest_code and p_dest == str(dest_code).strip().lower() and dest_city:
+                plan.destination = dest_city
         else:
-            plan.destination = str(ctx.get("destination_city") or ctx.get("destination"))
+            plan.destination = str(dest_city or ctx.get("destination_city") or ctx.get("destination"))
 
-    origin_code = ctx.get("origin_airport") or ctx.get("origin_code")
     if origin_code:
         if plan.origin_airport is not None and plan.origin_airport.strip().upper() != str(origin_code).strip().upper():
             raise CanonicalInvariantViolation(
@@ -525,7 +585,6 @@ def enforce_complete_canonical_invariants(
         elif plan.origin_airport is None:
             plan.origin_airport = str(origin_code).strip().upper()
 
-    dest_code = ctx.get("destination_airport") or ctx.get("destination_code")
     if dest_code:
         if plan.destination_airport is not None and plan.destination_airport.strip().upper() != str(dest_code).strip().upper():
             raise CanonicalInvariantViolation(

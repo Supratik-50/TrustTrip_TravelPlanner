@@ -307,7 +307,7 @@ export function normalizeBackendPlanResponse(
 
     const total = Math.round(Number(b.estimated_total_inr ?? b.total ?? b.estimated_total ?? (
       breakdown['Flights'] + breakdown['Accommodation'] + breakdown['Local Transit'] + breakdown['Activities'] + breakdown['Contingency']
-    ) ?? 0));
+    )));
 
     const target = Math.round(Number(b.target_budget_inr ?? b.target_budget ?? b.target ?? total));
     const remaining = Math.round(Number(b.remaining_inr ?? (target - total)));
