@@ -435,7 +435,7 @@ export class ApiClient {
   private getBaseUrl(): string {
     const custom = storage.getCustomApiUrl();
     if (custom) return custom.replace(/\/$/, '');
-    const envUrl = import.meta.env.VITE_API_BASE_URL;
+    const envUrl = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL;
     if (envUrl) return envUrl.replace(/\/$/, '');
     return '';
   }

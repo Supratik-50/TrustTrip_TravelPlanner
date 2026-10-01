@@ -89,6 +89,9 @@ app = FastAPI(
 # CORS Configuration
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000")
 allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+_frontend_env = os.getenv("FRONTEND_API_URL") or os.getenv("FRONTEND_URL")
+if _frontend_env and _frontend_env.strip() not in allowed_origins:
+    allowed_origins.append(_frontend_env.strip())
 has_wildcard = "*" in allowed_origins
 
 app.add_middleware(
@@ -356,6 +359,7 @@ async def approve_travel_plan(
 
 
 @app.get("/health")
+@app.get("/api/health")
 async def health_check():
     return {
         "status": "ok",

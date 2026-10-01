@@ -1,4 +1,224 @@
 
+# TrustTrip — Travel Planner & Booking Platform
+
+## Deployment & Production Quickstart Guide
+
+This guide provides reproducible instructions for configuring, building, and deploying the TrustTrip platform.
+
+### 1. Prerequisites
+- **Python**: 3.10+ (Python 3.11 recommended)
+- **Node.js**: 18+ (with npm 9+)
+- **PostgreSQL with pgvector**: 15+ (local instance, Docker, or managed cloud database e.g., Supabase / Neon / AWS RDS). **Crucial:** The PostgreSQL instance must have the `pgvector` extension installed and available, as `migrations/006_research_and_rag.sql` executes `CREATE EXTENSION IF NOT EXISTS vector;`.
+- **Git**: 2.30+
+
+### 2. Backend Setup
+1. Clone the repository and navigate to root:
+   ```bash
+   git clone <repo-url>
+   cd TrustTrip_TravelPlanner
+   ```
+2. Create and activate a Python virtual environment:
+   ```bash
+   # Windows PowerShell
+   python -m venv venv
+   .\venv\Scripts\Activate.ps1
+
+   # Linux / macOS
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+3. Install production and test dependencies:
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+### 3. Frontend Setup
+1. Navigate to the frontend directory:
+   ```bash
+   cd frontend
+   ```
+2. Install npm dependencies:
+   ```bash
+   npm install
+   ```
+3. Return to project root:
+   ```bash
+   cd ..
+   ```
+
+### 4. Environment Variables & Production Security Configuration
+Copy the provided `.env.example` templates to configure the runtime environment:
+
+1. **Backend Environment** (`.env` in repository root):
+   ```bash
+   cp .env.example .env
+   ```
+
+   #### Mandatory Production Security Variables (`services/config.py`):
+   When running in production (`APP_ENV=production`), the application strictly enforces that the following variables are non-empty and valid; otherwise, it **fails closed** with a `RuntimeError` at startup:
+   - `APP_ENV=production`: Activates strict production validation mode.
+   - `JWT_SECRET`: High-entropy persistent secret (min 32 bytes recommended) used for HMAC-SHA256 user authentication tokens. Must be persistent across server restarts so authenticated user sessions are maintained.
+   - `PAYLOAD_ENCRYPTION_KEY`: A persistent 32-byte base64-encoded key used for AES-256-GCM search session payload encryption in PostgreSQL.
+     Generate a valid key using:
+     ```bash
+     python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+     ```
+   > **Important:** Never rely on ephemeral development fallbacks in production. In development (`APP_ENV=development`), ephemeral in-memory keys are generated if omitted, which invalidate sessions and encrypted payloads upon process restart.
+
+   #### Core Runtime & Provider Variables:
+   - `DATABASE_URL`: PostgreSQL connection URI (`postgresql://<user>:<password>@<host>:<port>/<database>`).
+   - `FRONTEND_API_URL` or `FRONTEND_URL`: URL of the deployed frontend for CORS allowlist (e.g., `https://trusttrip.example.com` or `http://localhost:3000`).
+   - `ALLOWED_ORIGINS`: Comma-separated CORS origins fallback (defaults to `http://localhost:3000,http://localhost:8000`).
+   - `GROQ_API_KEY`: Primary LLM planner API key.
+   - `GEMINI_API_KEY`: Fallback LLM API key.
+   - `DUFFEL_API_TOKEN` / `DUFFEL_TEST_API_TOKEN`: Flight inventory provider token.
+   - `TAVILY_API_KEY`: Search & accommodation evidence gathering.
+
+2. **Frontend Environment** (`frontend/.env`):
+   ```bash
+   cp frontend/.env.example frontend/.env
+   ```
+   - `VITE_API_BASE_URL`: Base URL of the backend API (e.g., `http://127.0.0.1:8000` or `https://api.trusttrip.example.com`). Leave empty (`""`) if using a reverse proxy routing `/api` to the backend.
+
+> **Security Note:** Never commit `.env` or production credentials to source control.
+
+### 5. Fresh Database Bootstrap Sequence
+TrustTrip separates base tenant ownership tables from versioned feature migrations. Migration `004_travel_intelligence.sql` defines foreign keys referencing `users`, `trips`, and `threads`. Therefore, a fresh database must be bootstrapped in the following order:
+
+```text
+Fresh PostgreSQL DB (with pgvector extension available)
+    ↓
+1. Initialize Base Application Tables (`users`, `trips`, `threads`)
+    ↓
+2. Apply Migration 004 (`search_sessions`, `offer_snapshots`, `revalidation_history`)
+    ↓
+3. Apply Migration 005 (`plan_revisions`, `evidence_records`, etc.)
+    ↓
+4. Apply Migration 006 (`research_sessions`, `rag_documents`, `vector` extension, etc.)
+    ↓
+5. Apply Migration 007 (`booking_intents`, `booking_attempts`, `booking_transitions`)
+    ↓
+6. Application Startup Schema Validation (`validate_database_schema()`)
+```
+
+#### Step-by-Step Bootstrap Commands:
+1. **Initialize Base Application Tables**:
+   Run the Python bootstrap helper to create the core `users`, `trips`, and `threads` tables:
+   ```bash
+   python -c "from services.auth_store import init_auth_tables; from services.trip_store import init_trip_tables; init_auth_tables(); init_trip_tables(); print('Base tables initialized.')"
+   ```
+2. **Apply Versioned SQL Migrations**:
+   Run the migrations sequentially using `psql`:
+   ```bash
+   psql -d "$DATABASE_URL" -f migrations/004_travel_intelligence.sql
+   psql -d "$DATABASE_URL" -f migrations/005_evidence_revision_lifecycle.sql
+   psql -d "$DATABASE_URL" -f migrations/006_research_and_rag.sql
+   psql -d "$DATABASE_URL" -f migrations/007_flight_booking_lifecycle.sql
+   ```
+3. **Startup Schema Verification**:
+   At application startup, `validate_database_schema()` in `services/search_session_store.py` performs a zero-DDL check ensuring all required tables exist across all migrations:
+   - `migrations/004`: `search_sessions`, `offer_snapshots`, `revalidation_history`
+   - `migrations/005`: `plan_revisions`, `evidence_records`, `evidence_provenance`, `plan_revision_evidence_links`, `plan_approvals`
+   - `migrations/006`: `research_sessions`, `research_queries`, `research_sources`, `research_evidence`, `research_citations`, `rag_documents`, `rag_chunks`
+   - `migrations/007`: `booking_intents`, `booking_attempts`, `booking_transitions`
+
+### 6. Local Run
+To run both backend and frontend locally for development or testing:
+
+1. **Start Backend**:
+   ```bash
+   uvicorn app:app --host 127.0.0.1 --port 8000 --reload
+   ```
+2. **Start Frontend** (in a separate terminal):
+   ```bash
+   cd frontend
+   npm run dev
+   ```
+   Open `http://localhost:3000` in your browser (configured in `vite.config.ts`).
+
+### 7. Production Build
+1. In the `frontend/` directory, run:
+   ```bash
+   cd frontend
+   npm run build
+   ```
+2. The compiled static single-page application is output to `frontend/dist/`.
+3. To preview the production bundle locally:
+   ```bash
+   npm run preview
+   ```
+
+### 8. Deployment Commands
+TrustTrip supports standard stateless container or VM deployments:
+
+- **Standalone Production Server (Uvicorn / Gunicorn)**:
+  ```bash
+  uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
+  ```
+- **Docker Deployment**:
+  ```bash
+  # Build production image
+  docker build -t trusttrip:latest .
+
+  # Run container with environment configuration
+  docker run -d -p 8000:8000 \
+    --env-file .env \
+    --name trusttrip-backend \
+    trusttrip:latest
+  ```
+- **Static Frontend Hosting**:
+  Deploy `frontend/dist/` to any static hosting provider (Vercel, Netlify, Cloudflare Pages, AWS S3/CloudFront, or Nginx). Ensure `VITE_API_BASE_URL` points to the deployed backend address.
+
+### 9. API Health & Readiness Probes
+Verify backend process liveness and database readiness:
+
+- **Process Liveness**:
+  ```bash
+  curl -i http://localhost:8000/health
+  # or
+  curl -i http://localhost:8000/api/health
+  ```
+  **Success Semantics**: `HTTP 200 OK`
+  ```json
+  {
+    "status": "ok",
+    "version": "2.0.0",
+    "message": "Trust Trip MAS API is running",
+    "features": [ ... ]
+  }
+  ```
+
+- **Database Readiness**:
+  ```bash
+  curl -i http://localhost:8000/ready
+  ```
+  **Healthy Semantics**: `HTTP 200 OK`
+  ```json
+  {
+    "status": "ready"
+  }
+  ```
+  **Unhealthy Semantics**: If database connectivity fails, returns `HTTP 503 Service Unavailable`:
+  ```json
+  {
+    "status": "not_ready",
+    "reason": "database_unavailable"
+  }
+  ```
+
+### 10. End-to-End Demo Flow
+To demonstrate the complete verified TrustTrip workflow:
+1. **Trip Planning**: Enter travel criteria (e.g., origin, destination, dates, budget) in the travel assistant prompt.
+2. **Flight Search**: The platform queries live/sandbox inventory and persists immutable offer snapshots.
+3. **Offer Selection**: Choose an itinerary offer; view fare breakdown, baggage, cabin class, and rules.
+4. **Revalidation**: Click to revalidate the selected offer before booking to guarantee fare freshness and seat availability.
+5. **Human-in-the-Loop (HITL) Review**: Enter passenger details and review policy constraints. If revalidation detects a price change, the approval resets and requires explicit confirmation of the new fare.
+6. **Final Confirmation**: Confirm the booking with explicit user consent (`final_confirmation=true`).
+7. **Booking Fulfillment**: The backend claims the transaction, books with the supplier, and presents verified PNR and booking reference.
+
+---
+
 ## Final Multi-Agent Architecture
 
 Trust Trip uses **one Supervisor Agent coordinating exactly five specialist agents**:
@@ -22,7 +242,7 @@ Supervisor -> Flight Agent -> FlightService -> Duffel
                                       v
                                Human Review
                                       |
-                              changed flight need
+                               changed flight need
                                       v
                               Flight Agent -> Duffel
 ```

@@ -662,3 +662,30 @@ def test_stale_and_unavailable_states_reset_confirmation_and_block_booking():
     get_data = get_resp.json()
     assert get_data["status"] == "UNAVAILABLE"
     assert get_data["approved"] is False
+
+
+def test_deployment_health_and_cors_readiness():
+    """Verify health endpoints and CORS response readiness for deployment."""
+    # Process health check
+    health_resp = client.get("/health")
+    assert health_resp.status_code == 200
+    health_data = health_resp.json()
+    assert health_data["status"] == "ok"
+    assert health_data["version"] == "2.0.0"
+
+    # API path alias health check
+    api_health_resp = client.get("/api/health")
+    assert api_health_resp.status_code == 200
+    assert api_health_resp.json()["status"] == "ok"
+
+    # CORS preflight check
+    cors_resp = client.options(
+        "/api/flights/search",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Authorization,Content-Type",
+        },
+    )
+    assert cors_resp.status_code == 200
+    assert "access-control-allow-origin" in cors_resp.headers
