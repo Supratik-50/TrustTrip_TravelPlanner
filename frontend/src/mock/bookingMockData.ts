@@ -165,6 +165,35 @@ class MockBookingService implements IBookingService {
     return { approved: true, approved_at: approvedAt, active_revision_number: expectedRevision + 1 };
   }
 
+  async authorizeBooking(
+    tripId: string,
+    expectedRevision: number,
+    revisionId: string,
+    _notes?: string
+  ): Promise<{ authorized: boolean; authorized_at: string; authorization_id: string; revision_number: number }> {
+    if (!revisionId || typeof revisionId !== 'string' || revisionId.trim() === '') {
+      throw Object.assign(
+        new Error('authorizeBooking requires an exact revisionId.'),
+        { code: 'MISSING_REVISION_ID', statusCode: 400 }
+      );
+    }
+    if (typeof expectedRevision !== 'number' || !Number.isInteger(expectedRevision) || expectedRevision < 1) {
+      throw Object.assign(
+        new Error('authorizeBooking requires a valid positive expectedRevision number.'),
+        { code: 'MISSING_EXPECTED_REVISION', statusCode: 400 }
+      );
+    }
+    await this.delay(500);
+    const authId = `mock_auth_${Date.now().toString(36)}`;
+    const authorizedAt = new Date().toISOString();
+    return {
+      authorized: true,
+      authorized_at: authorizedAt,
+      authorization_id: authId,
+      revision_number: expectedRevision,
+    };
+  }
+
   async verifyFlight(tripId: string, offerId: string): Promise<{
     state: FlightVerificationState;
     current_amount: number;

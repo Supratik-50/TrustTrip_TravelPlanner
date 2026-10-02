@@ -88,6 +88,47 @@ export class TrustTripBookingService implements IBookingService {
     };
   }
 
+  /**
+   * Authorizes canonical journey plan for booking via POST /api/trips/{trip_id}/booking-approval.
+   *
+   * Section 9 invariant: the revision authorized MUST be exactly the revision
+   * the user reviewed. Both revisionId and expectedRevision are REQUIRED.
+   * Neither may be inferred from current trip state.
+   */
+  async authorizeBooking(
+    tripId: string,
+    expectedRevision: number,
+    revisionId: string,
+    notes?: string
+  ): Promise<{ authorized: boolean; authorized_at: string; authorization_id: string; revision_number: number }> {
+    // Local pre-flight validation — reject immediately, do NOT call backend
+    if (!revisionId || typeof revisionId !== 'string' || revisionId.trim() === '') {
+      throw Object.assign(
+        new Error('authorizeBooking requires an exact revisionId. Do not call this method without the reviewed revision identity.'),
+        { code: 'MISSING_REVISION_ID', statusCode: 400 }
+      );
+    }
+    if (typeof expectedRevision !== 'number' || !Number.isInteger(expectedRevision) || expectedRevision < 1) {
+      throw Object.assign(
+        new Error('authorizeBooking requires a valid positive expectedRevision number. Do not infer from current trip state.'),
+        { code: 'MISSING_EXPECTED_REVISION', statusCode: 400 }
+      );
+    }
+
+    const res = await api.authorizeBooking(tripId, {
+      revision_id: revisionId,
+      expected_revision_number: expectedRevision,
+      notes: notes || 'Authorized for booking by traveler',
+    });
+
+    return {
+      authorized: res.is_authorized,
+      authorized_at: res.authorized_at,
+      authorization_id: res.authorization_id,
+      revision_number: res.revision_number,
+    };
+  }
+
   // ========================================================================
   // SECTION 5B / 5C: CANONICAL FLIGHT BOOKING CONTRACT METHODS
   // ========================================================================

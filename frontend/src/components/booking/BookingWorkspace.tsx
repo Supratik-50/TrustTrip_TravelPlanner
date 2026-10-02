@@ -13,7 +13,7 @@ import {
   Users,
   CreditCard,
 } from 'lucide-react';
-import { TripDetail } from '../../types/trip';
+import { TripDetail, BookingAuthorizationInfo } from '../../types/trip';
 import { FlightOffer } from '../../types/flight';
 import { HotelOffer } from '../../types/hotel';
 import {
@@ -62,6 +62,85 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   // Booking persistent state
   const [isPlanApproved, setIsPlanApproved] = useState(false);
   const [approvedAt, setApprovedAt] = useState<string | undefined>(undefined);
+  // Section 9: Exact revision identity authorization state (never an independent unvalidated boolean)
+  const activeRevId = trip.active_revision_id;
+  const activeRevNum = trip.active_revision_number;
+
+  const [activeAuthorization, setActiveAuthorization] = useState<BookingAuthorizationInfo | undefined>(
+    trip.booking_authorization &&
+    activeRevId &&
+    activeRevNum &&
+    trip.booking_authorization.revision_id === activeRevId &&
+    trip.booking_authorization.revision_number === activeRevNum
+      ? trip.booking_authorization
+      : undefined
+  );
+
+  // Synchronize / reset active authorization when active revision identity changes
+  useEffect(() => {
+    if (
+      trip.booking_authorization &&
+      trip.active_revision_id &&
+      trip.active_revision_number &&
+      trip.booking_authorization.revision_id === trip.active_revision_id &&
+      trip.booking_authorization.revision_number === trip.active_revision_number
+    ) {
+      setActiveAuthorization(trip.booking_authorization);
+    } else {
+      setActiveAuthorization(undefined);
+    }
+  }, [trip.active_revision_id, trip.active_revision_number, trip.booking_authorization]);
+
+  const isPlanAccepted = Boolean(isPlanApproved || trip.is_approved || trip.status === 'approved');
+
+  // Exact identity match check:
+  // authorization.revision_id === active_revision_id AND authorization.revision_number === active_revision_number
+  const candidateAuth = activeAuthorization || (
+    trip.booking_authorization &&
+    activeRevId &&
+    activeRevNum &&
+    trip.booking_authorization.revision_id === activeRevId &&
+    trip.booking_authorization.revision_number === activeRevNum
+      ? trip.booking_authorization
+      : undefined
+  );
+
+  const isBookingAuthorized = Boolean(
+    isPlanAccepted &&
+    candidateAuth &&
+    activeRevId &&
+    activeRevNum &&
+    candidateAuth.revision_id === activeRevId &&
+    candidateAuth.revision_number === activeRevNum
+  );
+
+  const bookingAuthorizedAt = isBookingAuthorized ? candidateAuth?.authorized_at : undefined;
+
+  // Stale revision check (e.g. current_revision != active_revision)
+  const isStaleRevision = Boolean(
+    (trip.current_revision?.revision_id && activeRevId && trip.current_revision.revision_id !== activeRevId) ||
+    (trip.current_revision?.revision_number && activeRevNum && trip.current_revision.revision_number !== activeRevNum)
+  );
+
+  // Authorize for booking is allowed only when:
+  // - active revision exists
+  // - plan is accepted
+  // - active revision is not stale
+  const canAuthorizeBooking = Boolean(
+    isPlanAccepted &&
+    activeRevId &&
+    activeRevNum &&
+    activeRevNum > 0 &&
+    !isStaleRevision
+  );
+
+  // Historical authorization: any authorization on the trip that belongs to a different revision/version
+  const historicalAuthorization = Boolean(
+    trip.booking_authorization &&
+    (!activeRevId || !activeRevNum ||
+     trip.booking_authorization.revision_id !== activeRevId ||
+     trip.booking_authorization.revision_number !== activeRevNum)
+  ) ? trip.booking_authorization : undefined;
   const [flightState, setFlightState] = useState<FlightVerificationState>('idle');
   const [flightConfirmation, setFlightConfirmation] = useState<FlightConfirmationRecord | undefined>(undefined);
   const [hotelState, setHotelState] = useState<HotelBookingState | 'idle' | 'preparing' | 'payment_required' | 'confirmed'>('idle');
@@ -104,6 +183,17 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       if (trip.current_revision?.approved_at) {
         setApprovedAt(trip.current_revision.approved_at);
       }
+    }
+    if (
+      trip.booking_authorization &&
+      trip.active_revision_id &&
+      trip.active_revision_number &&
+      trip.booking_authorization.revision_id === trip.active_revision_id &&
+      trip.booking_authorization.revision_number === trip.active_revision_number
+    ) {
+      setActiveAuthorization(trip.booking_authorization);
+    } else {
+      setActiveAuthorization(undefined);
     }
 
     const saved = getStoredBookingState(trip.trip_id);
@@ -166,6 +256,56 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
         notify('Trip changed since review. Please refresh.', 'error', 'Revision Conflict (409)');
       } else {
         notify(err.message || 'Unable to approve journey plan.', 'error');
+      }
+    }
+  };
+
+  // Section 9 invariant: ONLY trip.active_revision_id + trip.active_revision_number
+  // may be used as authorization identity. No fallback to current_revision is permitted.
+  const handleAuthorizeBooking = async () => {
+    const reviewedRevisionId = trip.active_revision_id;
+    const reviewedRevisionNumber = trip.active_revision_number;
+
+    if (!reviewedRevisionId || typeof reviewedRevisionId !== 'string' || reviewedRevisionId.trim() === '') {
+      notify('No active revision found. Please wait for a plan to be generated.', 'error');
+      return;
+    }
+    if (!reviewedRevisionNumber || typeof reviewedRevisionNumber !== 'number' || reviewedRevisionNumber < 1) {
+      notify('Active revision number is missing or invalid. Please refresh.', 'error');
+      return;
+    }
+
+    if (!isPlanApproved && !trip.is_approved && trip.status !== 'approved') {
+      notify('Journey plan must be approved before booking authorization can be granted.', 'warning', 'Approval Required');
+      return;
+    }
+
+    if (isStaleRevision) {
+      notify('Active revision is stale. Please refresh and review latest plan revision.', 'error', 'Stale Revision');
+      return;
+    }
+
+    try {
+      if (bookingService.authorizeBooking) {
+        const res = await bookingService.authorizeBooking(
+          trip.trip_id,
+          reviewedRevisionNumber,
+          reviewedRevisionId
+        );
+        setActiveAuthorization({
+          authorization_id: res.authorization_id,
+          trip_id: trip.trip_id,
+          revision_id: reviewedRevisionId,
+          revision_number: reviewedRevisionNumber,
+          authorized_at: res.authorized_at,
+        });
+      }
+      notify('Revision explicitly authorized for booking!', 'success', 'Booking Authorized');
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        notify(err.message || 'Revision conflict: unable to authorize booking.', 'error', 'Conflict (409)');
+      } else {
+        notify(err.message || 'Unable to authorize booking for this revision.', 'error');
       }
     }
   };
@@ -511,6 +651,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   const handleResetSimulation = () => {
     clearStoredBookingState(trip.trip_id);
     setIsPlanApproved(false);
+    setActiveAuthorization(undefined);
     setIsFlightApproved(false);
     setIsFinalConfirmationChecked(false);
     setApprovedAt(undefined);
@@ -615,6 +756,34 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
               <span className="text-xs text-[var(--text-muted)] font-mono">
                 {approvedAt && new Date(approvedAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}
               </span>
+
+              {isBookingAuthorized ? (
+                <span data-testid="booking-authorized-badge" className="ml-3 px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-mono font-semibold border border-emerald-500/20 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3" />
+                  Booking Authorized
+                </span>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="authorize-booking-button"
+                    disabled={!canAuthorizeBooking}
+                    onClick={handleAuthorizeBooking}
+                    className={`ml-3 px-2.5 py-1 rounded-lg text-xs font-mono font-medium transition-colors ${
+                      canAuthorizeBooking
+                        ? 'bg-[var(--primary)] text-white hover:bg-[var(--primary-hover)] cursor-pointer'
+                        : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
+                    }`}
+                  >
+                    Authorize for Booking
+                  </button>
+                  {historicalAuthorization && (
+                    <span data-testid="historical-auth-badge" className="text-xs text-[var(--text-muted)] font-mono">
+                      (Rev #{historicalAuthorization.revision_number} authorized historically)
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex items-center gap-3">

@@ -47,6 +47,8 @@ export interface TripSummary {
   status: 'draft' | 'planning' | 'approved' | 'booked' | 'cancelled';
   active_revision_number?: number;
   active_revision_id?: string;
+  is_booking_authorized?: boolean;
+  booking_authorization?: BookingAuthorizationInfo | null;
   thread_id?: string;
   travelers_count?: number;
   budget?: number;
@@ -55,6 +57,27 @@ export interface TripSummary {
   metadata?: Record<string, any>;
   created_at: string;
   updated_at: string;
+}
+
+export interface BookingAuthorizationInfo {
+  authorization_id: string;
+  trip_id: string;
+  revision_id: string;
+  revision_number: number;
+  authorized_at: string;
+  metadata?: Record<string, any>;
+}
+
+export interface BookingEligibilityInfo {
+  is_eligible: boolean;
+  trip_id: string;
+  revision_id?: string;
+  revision_number?: number;
+  is_approved: boolean;
+  is_rejected: boolean;
+  is_authorized: boolean;
+  authorized_at?: string;
+  reasons: string[];
 }
 
 export interface DiffItem {
@@ -83,6 +106,8 @@ export interface TripRevision {
   change_summary: string;
   is_approved: boolean;
   is_rejected?: boolean;
+  is_booking_authorized?: boolean;
+  booking_authorization?: BookingAuthorizationInfo | null;
   approved_at?: string;
   rejected_at?: string;
   rejection_reason?: string;
@@ -262,6 +287,8 @@ export interface TripDetail extends TripSummary {
   revisions: TripRevision[];
   current_revision?: TripRevision;
   is_approved: boolean;
+  is_booking_authorized?: boolean;
+  booking_authorization?: BookingAuthorizationInfo | null;
   selected_flight_offer?: FlightOffer | Record<string, any>;
   selected_hotel_offer?: HotelOffer | Record<string, any>;
   plan?: TravelPlanResponse;

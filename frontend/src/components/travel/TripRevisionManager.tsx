@@ -220,6 +220,49 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
     }
   };
 
+  const handleAuthorizeBooking = async () => {
+    const targetRevId = trip.active_revision_id;
+    const targetRevNum = trip.active_revision_number;
+    const activeRevision = revisions.find(
+      (revision) =>
+        revision.revision_id === targetRevId &&
+        revision.revision_number === targetRevNum
+    );
+
+    if (
+      typeof targetRevId !== 'string' ||
+      targetRevId.trim() === '' ||
+      typeof targetRevNum !== 'number' ||
+      !Number.isInteger(targetRevNum) ||
+      targetRevNum < 1 ||
+      !activeRevision
+    ) {
+      notify('The active revision identity is unavailable or inconsistent. Refresh before authorizing.', 'error');
+      return;
+    }
+
+    setIsDeciding(true);
+    try {
+      await api.authorizeBooking(trip.trip_id, {
+        revision_id: targetRevId,
+        expected_revision_number: targetRevNum,
+      });
+
+      notify(
+        `Revision #${targetRevNum} authorized for booking!`,
+        'success',
+        'Booking Authorized'
+      );
+
+      const freshTrip = await api.getTrip(trip.trip_id);
+      onTripUpdated(freshTrip);
+    } catch (err: any) {
+      notify(err.message || 'Unable to authorize booking for this revision.', 'error');
+    } finally {
+      setIsDeciding(false);
+    }
+  };
+
   const handleRefreshTrip = async () => {
     try {
       const fresh = await api.getTrip(trip.trip_id);
@@ -382,8 +425,25 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
             )}
 
             {currentStatus === 'APPROVED' && (
-              <div className="text-xs font-mono text-[var(--status-success)] flex items-center gap-1.5 font-bold">
-                <CheckCircle2 className="w-4 h-4" /> This proposal is verified and accepted.
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="text-xs font-mono text-[var(--status-success)] flex items-center gap-1.5 font-bold">
+                  <CheckCircle2 className="w-4 h-4" /> This proposal is verified and accepted.
+                </div>
+                {currentRevision?.is_booking_authorized || trip.is_booking_authorized ? (
+                  <span className="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-mono font-semibold border border-emerald-500/20 flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" /> Booking Authorized
+                  </span>
+                ) : (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleAuthorizeBooking}
+                    isLoading={isDeciding}
+                    leftIcon={<ShieldCheck className="w-4 h-4" />}
+                  >
+                    Authorize for Booking
+                  </Button>
+                )}
               </div>
             )}
           </div>
@@ -681,6 +741,11 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
                             Latest
                           </span>
                         )}
+                        {rev.is_booking_authorized && (
+                          <span className="text-[10px] font-semibold text-emerald-400 font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20">
+                            Authorized
+                          </span>
+                        )}
                       </div>
 
                       <span className="text-[10px] text-[var(--text-muted)] font-mono">
@@ -738,6 +803,11 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
                     <span className="font-mono">
                       {formatCurrency(selectedHistoricalRev.budget || 0, trip.currency || 'INR')} ➔ {formatCurrency(trip.budget || 0, trip.currency || 'INR')}
                     </span>
+                  </div>
+                )}
+                {selectedHistoricalRev.is_booking_authorized && (
+                  <div className="text-[11px] font-mono text-amber-400/90 pt-1 border-t border-[var(--border)]/70">
+                    ℹ Historically authorized on Rev #{selectedHistoricalRev.revision_number}. Inactive on current revision.
                   </div>
                 )}
               </div>

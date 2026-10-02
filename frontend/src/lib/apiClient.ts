@@ -11,6 +11,8 @@ import {
   TripOfferSelection,
   TripRevision,
   CreateRevisionRequest,
+  BookingAuthorizationInfo,
+  BookingEligibilityInfo,
 } from '../types/trip';
 import {
   FlightOffer,
@@ -853,6 +855,31 @@ export class ApiClient {
       } as unknown as T;
     }
 
+    // Section 9: Booking authorization is a persisted security gate; mock fallback is forbidden for /booking-approval.
+
+    if (endpoint.startsWith('/api/trips/') && endpoint.includes('/booking-eligibility') && method === 'GET') {
+      const tripId = endpoint.split('/')[3].split('?')[0];
+      const trips = getMockTrips();
+      const trip = trips.find((t) => t.trip_id === tripId);
+      const isApproved = trip?.status === 'approved';
+      const isAuth = !!trip?.is_booking_authorized;
+
+      return {
+        success: true,
+        eligibility: {
+          is_eligible: isApproved && isAuth,
+          trip_id: tripId,
+          revision_id: trip?.active_revision_id,
+          revision_number: trip?.active_revision_number,
+          is_approved: isApproved,
+          is_rejected: false,
+          is_authorized: isAuth,
+          authorized_at: trip?.booking_authorization?.authorized_at,
+          reasons: isApproved && isAuth ? [] : ['Plan must be approved and authorized for booking'],
+        },
+      } as unknown as T;
+    }
+
     // --- Part 5B: Flight Price Change Acknowledgment ---
     if (endpoint.includes('/bookings/flight/') && endpoint.endsWith('/acknowledge-price') && method === 'POST') {
       const parts = endpoint.split('/');
@@ -1670,6 +1697,62 @@ export class ApiClient {
         }>(`/api/trips/${tripId}/revisions/${revisionId}/reject`, {
           method: 'POST',
           body: JSON.stringify(options),
+        });
+        if (mock) return mock;
+      }
+      throw err;
+    }
+  }
+
+  // --- Section 9: Booking Approval & Eligibility Canonical Endpoints ---
+  async authorizeBooking(
+    tripId: string,
+    options: { revision_id: string; expected_revision_number: number; notes?: string }
+  ): Promise<{
+    success: boolean;
+    trip_id: string;
+    revision_id: string;
+    revision_number: number;
+    authorization_id: string;
+    authorized_at: string;
+    is_authorized: boolean;
+    trip?: TripSummary | TripDetail;
+  }> {
+    // Section 9: Authorization is a persisted security gate.
+    // Real API/network failures MUST NOT fall back to a mock that fabricates authorization success.
+    return await this.request<{
+      success: boolean;
+      trip_id: string;
+      revision_id: string;
+      revision_number: number;
+      authorization_id: string;
+      authorized_at: string;
+      is_authorized: boolean;
+      trip?: TripSummary | TripDetail;
+    }>(`/api/trips/${tripId}/booking-approval`, {
+      method: 'POST',
+      body: JSON.stringify(options),
+    });
+  }
+
+  async getBookingEligibility(
+    tripId: string,
+    revisionId?: string,
+    expectedRevisionNumber?: number
+  ): Promise<BookingEligibilityInfo> {
+    try {
+      const q = new URLSearchParams();
+      if (revisionId) q.set('revision_id', revisionId);
+      if (expectedRevisionNumber !== undefined) q.set('expected_revision_number', String(expectedRevisionNumber));
+      const url = `/api/trips/${tripId}/booking-eligibility${q.toString() ? `?${q.toString()}` : ''}`;
+      const res = await this.request<{ success: boolean; eligibility: BookingEligibilityInfo }>(url, {
+        method: 'GET',
+      });
+      return res.eligibility;
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR') {
+        const mock = this.handleMockFallback<BookingEligibilityInfo>(`/api/trips/${tripId}/booking-eligibility`, {
+          method: 'GET',
         });
         if (mock) return mock;
       }

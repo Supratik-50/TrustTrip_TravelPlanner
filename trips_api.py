@@ -479,6 +479,12 @@ class TripRejectionRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class BookingApprovalRequest(BaseModel):
+    revision_id: UUID = Field(..., description="Exact revision ID to authorize for booking")
+    expected_revision_number: int = Field(..., ge=1, description="Expected monotonically increasing revision number")
+    notes: str | None = None
+
+
 @router.post("/{trip_id}/select-offer")
 async def select_trip_offer(
     trip_id: str,
@@ -777,12 +783,99 @@ async def list_trip_revisions(
         r_dict["structured_diff"] = diff.model_dump()
         r_dict["structured_changes"] = diff.model_dump()
 
+        # Section 9: Booking authorization enrichment
+        from services.authorization_store import AuthorizationStore
+        auth_store = AuthorizationStore()
+        auth = auth_store.get_booking_authorization(trip_id, r.revision_id)
+        r_dict["is_booking_authorized"] = (auth is not None)
+        if auth:
+            r_dict["booking_authorization"] = {
+                "authorization_id": str(auth.authorization_id),
+                "authorized_at": auth.authorized_at.isoformat() if hasattr(auth.authorized_at, "isoformat") else str(auth.authorized_at),
+                "revision_number": auth.revision_number,
+                "metadata": auth.authorization_metadata,
+            }
+        else:
+            r_dict["booking_authorization"] = None
+
         enriched.append(r_dict)
+
+    from services.authorization_store import AuthorizationStore
+    auth_store = AuthorizationStore()
+    cur_rid = str(trip.get("current_revision_id") or "")
+    cur_auth = auth_store.get_booking_authorization(trip_id, cur_rid) if cur_rid else None
 
     return {
         "success": True,
         "trip_id": trip_id,
-        "current_revision_id": str(trip.get("current_revision_id") or ""),
+        "current_revision_id": cur_rid,
         "current_revision_number": int(trip.get("current_revision_number") or 0),
+        "is_booking_authorized": (cur_auth is not None),
+        "booking_authorization": {
+            "authorization_id": str(cur_auth.authorization_id),
+            "authorized_at": cur_auth.authorized_at.isoformat() if hasattr(cur_auth.authorized_at, "isoformat") else str(cur_auth.authorized_at),
+            "revision_number": cur_auth.revision_number,
+            "metadata": cur_auth.authorization_metadata,
+        } if cur_auth else None,
         "revisions": enriched,
+    }
+
+
+@router.post("/{trip_id}/booking-approval")
+async def approve_booking(
+    trip_id: str,
+    req: BookingApprovalRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Explicitly authorize an approved trip revision for booking under parent trip row lock."""
+    from services.authorization_store import AuthorizationStore
+    auth_store = AuthorizationStore()
+
+    try:
+        authorization = auth_store.create_booking_authorization_atomic(
+            trip_id=trip_id,
+            user_id=current_user.id,
+            revision_id=str(req.revision_id),
+            expected_revision_number=req.expected_revision_number,
+            metadata={"notes": req.notes} if req.notes else None,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to authorize trip revision for booking: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Booking authorization failed due to an internal error.")
+
+    updated_trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    return {
+        "success": True,
+        "trip_id": trip_id,
+        "revision_id": str(req.revision_id),
+        "revision_number": authorization.revision_number,
+        "authorization_id": str(authorization.authorization_id),
+        "authorized_at": authorization.authorized_at.isoformat() if hasattr(authorization.authorized_at, "isoformat") else str(authorization.authorized_at),
+        "is_authorized": True,
+        "trip": updated_trip,
+    }
+
+
+@router.get("/{trip_id}/booking-eligibility")
+async def get_trip_booking_eligibility(
+    trip_id: str,
+    revision_id: str | None = None,
+    expected_revision_number: int | None = None,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Get runtime derived booking eligibility for a trip/revision."""
+    from services.authorization_store import AuthorizationStore
+    auth_store = AuthorizationStore()
+    result = auth_store.check_booking_eligibility(
+        trip_id=trip_id,
+        user_id=current_user.id,
+        revision_id=revision_id,
+        expected_revision_number=expected_revision_number,
+    )
+    return {
+        "success": True,
+        "eligibility": result.model_dump(),
     }

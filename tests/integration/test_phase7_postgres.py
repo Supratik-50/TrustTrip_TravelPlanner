@@ -84,6 +84,12 @@ def pg_schema():
             with open(m005_path, "r", encoding="utf-8") as f:
                 cur.execute(f.read())
 
+            # Load migration 009 (adds parent_revision_id and plan_revision_rejections)
+            m009_path = r"n:\Documents\GitHub\TrustTrip_TravelPlanner\migrations\009_revision_parent_and_rejections.sql"
+            if os.path.exists(m009_path):
+                with open(m009_path, "r", encoding="utf-8") as f:
+                    cur.execute(f.read())
+
         yield schema_name
 
     finally:

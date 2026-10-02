@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx src/__tests__/hotelTruthfulness.test.tsx && tsx src/__tests__/researchIntegration.test.tsx && tsx src/__tests__/section8RevisionClient.test.tsx"
+    "test": "tsx src/__tests__/hotelTruthfulness.test.tsx && tsx src/__tests__/researchIntegration.test.tsx && tsx src/__tests__/section8RevisionClient.test.tsx && tsx src/__tests__/section9BookingAuthClient.test.tsx"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

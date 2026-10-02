@@ -142,6 +142,7 @@ export interface CancellationRequest {
  */
 export interface IBookingService {
   approvePlan(tripId: string, expectedRevision: number, revisionId: string): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }>;
+  authorizeBooking?(tripId: string, expectedRevision: number, revisionId: string, notes?: string): Promise<{ authorized: boolean; authorized_at: string; authorization_id: string; revision_number: number }>;
   verifyFlight(tripId: string, offerId: string): Promise<{
     state: FlightVerificationState;
     current_amount: number;
