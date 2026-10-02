@@ -141,7 +141,7 @@ export interface CancellationRequest {
  * of these methods with live backend API adapters without touching the UI.
  */
 export interface IBookingService {
-  approvePlan(tripId: string, expectedRevision?: number): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }>;
+  approvePlan(tripId: string, expectedRevision: number, revisionId: string): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }>;
   verifyFlight(tripId: string, offerId: string): Promise<{
     state: FlightVerificationState;
     current_amount: number;

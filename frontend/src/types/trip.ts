@@ -57,14 +57,36 @@ export interface TripSummary {
   updated_at: string;
 }
 
+export interface DiffItem {
+  field: string;
+  label?: string;
+  old_value?: any;
+  new_value?: any;
+  value?: any;
+  description?: string;
+}
+
+export interface StructuredDiff {
+  added: DiffItem[];
+  removed: DiffItem[];
+  changed: DiffItem[];
+}
+
 export interface TripRevision {
   revision_id: string;
   revision_number: number;
   trip_id: string;
+  parent_revision_id?: string | null;
+  parent_id?: string | null;
+  status?: 'PROPOSED' | 'APPROVED' | 'REJECTED';
   created_at: string;
   change_summary: string;
   is_approved: boolean;
+  is_rejected?: boolean;
   approved_at?: string;
+  rejected_at?: string;
+  rejection_reason?: string;
+  decision_metadata?: Record<string, any>;
   origin: string;
   destination: string;
   start_date: string;
@@ -77,6 +99,7 @@ export interface TripRevision {
   flight_snapshot_id?: string;
   hotel_snapshot_id?: string;
   changes?: TripChangeSet;
+  structured_diff?: StructuredDiff;
   previous_revision_id?: string;
   stale_warnings?: string[];
 }
@@ -95,10 +118,12 @@ export interface TripChangeSet {
   hotel_constraints?: Record<string, unknown>;
   feedback?: string;
   expected_base_revision?: number;
+  expected_base_revision_id?: string;
 }
 
 export interface CreateRevisionRequest {
   expected_base_revision: number;
+  expected_base_revision_id?: string;
   changes: TripChangeSet;
   change_summary?: string;
 }

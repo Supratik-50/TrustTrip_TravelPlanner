@@ -462,7 +462,21 @@ class OfferSelectionRequest(BaseModel):
 class TripRevisionRequest(BaseModel):
     feedback: str = ""
     updated_constraints: dict[str, Any] = Field(default_factory=dict)
-    expected_base_revision: int | None = None
+    expected_base_revision: int | None = Field(default=None, ge=0)
+    expected_base_revision_id: UUID | str | None = None
+    changes: dict[str, Any] | None = None
+
+
+class TripApprovalRequest(BaseModel):
+    revision_id: UUID = Field(..., description="Exact revision ID to approve")
+    expected_revision_number: int = Field(..., ge=1, description="Expected monotonically increasing revision number")
+    notes: str | None = None
+
+
+class TripRejectionRequest(BaseModel):
+    expected_revision_number: int = Field(..., ge=1, description="Expected monotonically increasing revision number")
+    reason: str | None = Field(default=None, max_length=1000)
+    metadata: dict[str, Any] | None = None
 
 
 @router.post("/{trip_id}/select-offer")
@@ -515,12 +529,17 @@ async def create_trip_revision(
     Executed atomically under parent trip row lock inside a single transaction.
     """
     try:
+        effective_constraints = req.updated_constraints
+        if not effective_constraints and req.changes:
+            effective_constraints = req.changes
+
         return trip_store.create_revision_atomic(
             trip_id=trip_id,
             user_id=current_user.id,
             feedback=req.feedback,
-            updated_constraints=req.updated_constraints,
+            updated_constraints=effective_constraints,
             expected_base_revision=req.expected_base_revision,
+            expected_base_revision_id=req.expected_base_revision_id,
         )
     except OfferSelectionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
@@ -536,47 +555,54 @@ async def create_trip_revision(
 @router.post("/{trip_id}/approve")
 async def approve_trip(
     trip_id: str,
+    req: TripApprovalRequest,
     current_user: UserResponse = Depends(get_current_user),
     trip_store: TripStore = Depends(_trip_store),
 ):
-    """Explicitly approve a planned trip, establishing PlanApproval record."""
+    """Explicitly approve an exact proposed plan revision under parent trip row lock."""
     trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
 
     ev_store = EvidenceRevisionStore()
-    current_rev_id = trip.get("current_revision_id")
+    target_rev = ev_store.get_revision(revision_id=str(req.revision_id), user_id=current_user.id)
+    if not target_rev or str(target_rev.trip_id) != str(trip_id):
+        raise HTTPException(status_code=404, detail="Revision not found or does not belong to this trip.")
 
-    # If current_revision_id is not set, publish baseline revision 1 first
-    if not current_rev_id:
-        meta = trip.get("metadata") or {}
-        plan_snapshot = {
-            "title": trip.get("title"),
-            "destination": trip.get("destination"),
-            "origin": trip.get("origin"),
-            "constraints": meta.get("constraints") or {},
-            "metadata": meta,
-        }
-        published_rev = ev_store.publish_revision_transaction(
-            trip_id=trip_id,
-            user_id=current_user.id,
-            expected_base_revision=0,
-            change_set={"initial": True},
-            plan_snapshot=plan_snapshot,
+    current_rev_id = trip.get("current_revision_id")
+    if not current_rev_id or str(req.revision_id) != str(current_rev_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Cannot approve revision {req.revision_id}: not current revision ({current_rev_id}).",
         )
-        current_rev_id = str(published_rev.revision_id)
+
+    current_num = int(trip.get("current_revision_number") or 0)
+    if current_num != req.expected_revision_number or target_rev.revision_number != req.expected_revision_number:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Expected revision number {req.expected_revision_number} but current is {current_num}.",
+        )
 
     meta = trip.get("metadata") or {}
     now_iso = datetime.now(timezone.utc).isoformat()
     meta["approved_at"] = now_iso
 
     # Execute approval transaction under parent trip lock
-    approval = ev_store.approve_revision_transaction(
-        trip_id=trip_id,
-        user_id=current_user.id,
-        revision_id=current_rev_id,
-        metadata={"approved_at": now_iso},
-    )
+    try:
+        approval = ev_store.approve_revision_transaction(
+            trip_id=trip_id,
+            user_id=current_user.id,
+            revision_id=str(req.revision_id),
+            expected_revision=req.expected_revision_number,
+            metadata={"approved_at": now_iso, "notes": req.notes},
+        )
+    except HTTPException as exc:
+        if exc.status_code == 400 and "not current revision" in str(exc.detail):
+            raise HTTPException(status_code=409, detail=f"Conflict: {exc.detail}")
+        raise
+    except Exception as exc:
+        logger.error("Failed to approve trip revision: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trip approval failed due to an internal error.")
 
     updated_trip = trip_store.update_trip(
         trip_id,
@@ -587,11 +613,73 @@ async def approve_trip(
     return {
         "success": True,
         "trip_id": trip_id,
-        "revision_id": str(current_rev_id),
+        "revision_id": str(req.revision_id),
         "status": "approved",
+        "review_status": "APPROVED",
         "approval_id": str(approval.approval_id),
         "trip": updated_trip,
     }
+
+
+@router.post("/{trip_id}/revisions/{revision_id}/reject")
+async def reject_trip_revision(
+    trip_id: str,
+    revision_id: str,
+    req: TripRejectionRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Explicitly reject an exact proposed trip revision under parent trip row lock."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    # Verify revision belongs to this trip
+    ev_store = EvidenceRevisionStore()
+    rev = ev_store.get_revision(revision_id=revision_id, user_id=current_user.id)
+    if not rev or str(rev.trip_id) != str(trip_id):
+        raise HTTPException(status_code=404, detail="Revision not found or does not belong to this trip.")
+
+    current_rev_id = trip.get("current_revision_id")
+    if not current_rev_id or str(revision_id) != str(current_rev_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Cannot reject revision {revision_id}: not current revision ({current_rev_id}).",
+        )
+
+    current_num = int(trip.get("current_revision_number") or 0)
+    if current_num != req.expected_revision_number or rev.revision_number != req.expected_revision_number:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Expected revision number {req.expected_revision_number} but current is {current_num}.",
+        )
+
+    try:
+        rejection = ev_store.reject_revision_transaction(
+            trip_id=trip_id,
+            user_id=current_user.id,
+            revision_id=revision_id,
+            expected_revision=req.expected_revision_number,
+            reason=req.reason,
+            metadata=req.metadata,
+        )
+        updated_trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+        return {
+            "success": True,
+            "trip_id": trip_id,
+            "revision_id": str(revision_id),
+            "revision_number": rev.revision_number,
+            "status": "REJECTED",
+            "trip_status": "rejected",
+            "rejection_id": str(rejection.rejection_id),
+            "reason": rejection.reason,
+            "trip": updated_trip,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to reject trip revision: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Trip revision rejection failed due to an internal error.")
 
 
 @router.post("/{trip_id}/revoke-approval")
@@ -624,17 +712,77 @@ async def list_trip_revisions(
     current_user: UserResponse = Depends(get_current_user),
     trip_store: TripStore = Depends(_trip_store),
 ):
-    """List all immutable plan revisions for an owned trip."""
+    """List all immutable plan revisions for an owned trip with derived review status and diffs."""
     trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
 
     ev_store = EvidenceRevisionStore()
     revisions = ev_store.list_revisions_for_trip(trip_id=trip_id, user_id=current_user.id)
+
+    from domain.plan_revision import compute_structured_diff
+
+    enriched = []
+    # Build dictionary of parent snapshots for computing historical diffs
+    revs_by_id = {str(r.revision_id): r for r in revisions}
+
+    for r in revisions:
+        r_dict = r.model_dump()
+        r_dict["revision_id"] = str(r.revision_id)
+        r_dict["trip_id"] = str(r.trip_id)
+        r_dict["user_id"] = str(r.user_id)
+        r_dict["parent_revision_id"] = str(r.parent_revision_id) if r.parent_revision_id else None
+        r_dict["version"] = r.revision_number
+        r_dict["parent_id"] = r_dict["parent_revision_id"]
+
+        approval = ev_store.get_approval_for_revision(trip_id, r.revision_id)
+        rejection = ev_store.get_rejection_for_revision(trip_id, r.revision_id)
+
+        status = "PROPOSED"
+        decision_metadata: dict[str, Any] = {}
+        if approval:
+            status = "APPROVED"
+            decision_metadata = {
+                "decision": "APPROVED",
+                "approved_at": approval.approved_at.isoformat() if hasattr(approval.approved_at, "isoformat") else str(approval.approved_at),
+                "approved_by_user_id": str(approval.approved_by_user_id),
+                **approval.approval_metadata,
+            }
+        elif rejection:
+            status = "REJECTED"
+            decision_metadata = {
+                "decision": "REJECTED",
+                "rejected_at": rejection.rejected_at.isoformat() if hasattr(rejection.rejected_at, "isoformat") else str(rejection.rejected_at),
+                "rejected_by_user_id": str(rejection.rejected_by_user_id),
+                "reason": rejection.reason,
+                **rejection.rejection_metadata,
+            }
+
+        r_dict["status"] = status
+        r_dict["is_approved"] = (status == "APPROVED")
+        r_dict["is_rejected"] = (status == "REJECTED")
+        r_dict["decision_metadata"] = decision_metadata
+
+        parent_snapshot: dict[str, Any] = {}
+        if r.parent_revision_id and str(r.parent_revision_id) in revs_by_id:
+            parent_rev = revs_by_id[str(r.parent_revision_id)]
+            parent_snapshot = parent_rev.plan_snapshot or {}
+
+        curr_snapshot = r.plan_snapshot or {}
+        curr_constraints = curr_snapshot.get("constraints") or {}
+        parent_constraints = parent_snapshot.get("constraints") or {}
+        notes = (r.change_set or {}).get("freeform_notes") or ""
+
+        diff = compute_structured_diff(parent_constraints, curr_constraints, notes)
+        r_dict["structured_diff"] = diff.model_dump()
+        r_dict["structured_changes"] = diff.model_dump()
+
+        enriched.append(r_dict)
+
     return {
         "success": True,
         "trip_id": trip_id,
         "current_revision_id": str(trip.get("current_revision_id") or ""),
         "current_revision_number": int(trip.get("current_revision_number") or 0),
-        "revisions": [r.model_dump() for r in revisions],
+        "revisions": enriched,
     }

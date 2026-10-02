@@ -377,7 +377,11 @@ def test_atomic_approval_transaction_succeeds():
     assert rev_res.json()["status"] == "awaiting_approval"
 
     # Approve endpoint
-    appr_res = client.post(f"/api/trips/{trip_id}/approve")
+    rev_id = rev_res.json()["revision_id"]
+    appr_res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
     assert appr_res.status_code == 200
     assert appr_res.json()["status"] == "approved"
     assert "approval_id" in appr_res.json()
@@ -390,8 +394,11 @@ def test_publishing_new_revision_when_prior_is_approved_resets_status_awaiting_a
     trip_id = t_res.json()["trip"]["id"]
 
     # R1 + approve
-    client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "v1"})
-    client.post(f"/api/trips/{trip_id}/approve")
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "v1"}).json()
+    client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": r1["revision_id"], "expected_revision_number": 1},
+    )
     assert client.get(f"/api/trips/{trip_id}").json()["trip"]["status"] == "approved"
 
     # R2 published

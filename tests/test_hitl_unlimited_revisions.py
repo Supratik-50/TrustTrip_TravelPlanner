@@ -76,13 +76,17 @@ def test_explicit_trip_approval():
     trip_id = trip_res.json()["trip"]["id"]
 
     # Submit revision
-    client.post(
+    rev_res = client.post(
         f"/api/trips/{trip_id}/revisions",
         json={"feedback": "Add Louvre visit", "updated_constraints": {}},
     )
+    rev_id = rev_res.json()["revision_id"]
 
     # Approve
-    appr_res = client.post(f"/api/trips/{trip_id}/approve")
+    appr_res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
     assert appr_res.status_code == 200
     assert appr_res.json()["status"] == "approved"
 

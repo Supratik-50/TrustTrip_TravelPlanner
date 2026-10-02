@@ -435,16 +435,20 @@ export class ApiClient {
   private getBaseUrl(): string {
     const custom = storage.getCustomApiUrl();
     if (custom) return custom.replace(/\/$/, '');
-    const envUrl = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL;
+    const envUrl = (typeof import.meta !== 'undefined' && (import.meta as any)?.env)
+      ? ((import.meta as any).env.VITE_API_BASE_URL || (import.meta as any).env.VITE_API_URL)
+      : undefined;
     if (envUrl) return envUrl.replace(/\/$/, '');
     return '';
   }
 
   private isDemoMode(): boolean {
+    if (typeof localStorage === 'undefined') return false;
     return localStorage.getItem('trusttrip_force_demo_mode') === 'true';
   }
 
   public setDemoMode(enabled: boolean) {
+    if (typeof localStorage === 'undefined') return;
     localStorage.setItem('trusttrip_force_demo_mode', enabled ? 'true' : 'false');
   }
 
@@ -601,7 +605,7 @@ export class ApiClient {
       return newTrip as unknown as T;
     }
 
-    if (endpoint.startsWith('/api/trips/') && method === 'GET') {
+    if (endpoint.startsWith('/api/trips/') && !endpoint.endsWith('/revisions') && method === 'GET') {
       const tripId = endpoint.split('/')[3];
       const trips = getMockTrips();
       const summary = trips.find((t) => t.trip_id === tripId) || {
@@ -1542,15 +1546,22 @@ export class ApiClient {
   // --- Part 4: Trip Revision Canonical Endpoints ---
   async getTripRevisions(tripId: string): Promise<TripRevision[]> {
     try {
-      return await this.request<TripRevision[]>(`/api/trips/${tripId}/revisions`, {
-        method: 'GET',
-      });
+      const res = await this.request<{ success?: boolean; trip_id?: string; revisions?: TripRevision[] } | TripRevision[]>(
+        `/api/trips/${tripId}/revisions`,
+        { method: 'GET' }
+      );
+      if (Array.isArray(res)) {
+        return res;
+      }
+      return Array.isArray(res?.revisions) ? res.revisions : [];
     } catch (err: any) {
       if (err.code === 'NETWORK_ERROR') {
         const mock = this.handleMockFallback<TripRevision[]>(`/api/trips/${tripId}/revisions`, {
           method: 'GET',
         });
-        if (mock) return mock;
+        if (mock) {
+          return Array.isArray(mock) ? mock : (mock as any)?.revisions ?? [];
+        }
       }
       throw err;
     }
@@ -1577,13 +1588,15 @@ export class ApiClient {
     }
   }
 
-  // --- Part 5B: Trip Approval Canonical Endpoint ---
+  // --- Part 5B & Section 8: Trip Approval & Rejection Canonical Endpoints ---
   async approveTrip(
     tripId: string,
-    options?: { expected_revision?: number; notes?: string }
+    options: { revision_id: string; expected_revision_number: number; notes?: string }
   ): Promise<{
     trip_id: string;
     status: 'approved';
+    review_status?: string;
+    revision_id?: string;
     approved_at: string;
     active_revision_number: number;
     is_approved: boolean;
@@ -1592,24 +1605,71 @@ export class ApiClient {
       return await this.request<{
         trip_id: string;
         status: 'approved';
+        review_status?: string;
+        revision_id?: string;
         approved_at: string;
         active_revision_number: number;
         is_approved: boolean;
       }>(`/api/trips/${tripId}/approve`, {
         method: 'POST',
-        body: JSON.stringify(options || {}),
+        body: JSON.stringify(options),
       });
     } catch (err: any) {
       if (err.code === 'NETWORK_ERROR') {
         const mock = this.handleMockFallback<{
           trip_id: string;
           status: 'approved';
+          review_status?: string;
+          revision_id?: string;
           approved_at: string;
           active_revision_number: number;
           is_approved: boolean;
         }>(`/api/trips/${tripId}/approve`, {
           method: 'POST',
-          body: JSON.stringify(options || {}),
+          body: JSON.stringify(options),
+        });
+        if (mock) return mock;
+      }
+      throw err;
+    }
+  }
+
+  async rejectTripRevision(
+    tripId: string,
+    revisionId: string,
+    options: { expected_revision_number: number; reason?: string }
+  ): Promise<{
+    trip_id: string;
+    revision_id: string;
+    status: 'REJECTED';
+    trip_status: 'rejected';
+    rejection_id: string;
+    reason?: string;
+  }> {
+    try {
+      return await this.request<{
+        trip_id: string;
+        revision_id: string;
+        status: 'REJECTED';
+        trip_status: 'rejected';
+        rejection_id: string;
+        reason?: string;
+      }>(`/api/trips/${tripId}/revisions/${revisionId}/reject`, {
+        method: 'POST',
+        body: JSON.stringify(options),
+      });
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR') {
+        const mock = this.handleMockFallback<{
+          trip_id: string;
+          revision_id: string;
+          status: 'REJECTED';
+          trip_status: 'rejected';
+          rejection_id: string;
+          reason?: string;
+        }>(`/api/trips/${tripId}/revisions/${revisionId}/reject`, {
+          method: 'POST',
+          body: JSON.stringify(options),
         });
         if (mock) return mock;
       }
@@ -1845,3 +1905,4 @@ export class ApiClient {
 }
 
 export const api = new ApiClient();
+export const apiClient = api;

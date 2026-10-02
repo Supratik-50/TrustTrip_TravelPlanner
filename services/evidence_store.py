@@ -30,7 +30,13 @@ from domain.evidence import (
     canonical_hash,
 )
 from domain.plan_approval import PlanApproval
-from domain.plan_revision import PlanRevision
+from domain.plan_revision import (
+    PlanRevision,
+    PlanRevisionRejection,
+    StructuredDiff,
+    compute_structured_diff,
+    derive_revision_status,
+)
 
 
 def _dsn() -> str:
@@ -51,6 +57,7 @@ class EvidenceRevisionStore:
     _IN_MEMORY_REVISIONS: dict[str, PlanRevision] = {}
     _IN_MEMORY_LINKS: list[PlanRevisionEvidenceLink] = []
     _IN_MEMORY_APPROVALS: dict[str, PlanApproval] = {}
+    _IN_MEMORY_REJECTIONS: dict[str, PlanRevisionRejection] = {}
 
     def __init__(self) -> None:
         self.use_in_memory = bool(os.getenv("USE_IN_MEMORY_AUTH"))
@@ -243,6 +250,7 @@ class EvidenceRevisionStore:
                 trip_id=UUID(str(row["trip_id"])),
                 user_id=UUID(str(row["user_id"])),
                 revision_number=int(row["revision_number"]),
+                parent_revision_id=UUID(str(row["parent_revision_id"])) if row.get("parent_revision_id") else None,
                 change_set=row["change_set"],
                 plan_snapshot=row["plan_snapshot"],
                 is_published=bool(row["is_published"]),
@@ -274,6 +282,7 @@ class EvidenceRevisionStore:
                     trip_id=UUID(str(r["trip_id"])),
                     user_id=UUID(str(r["user_id"])),
                     revision_number=int(r["revision_number"]),
+                    parent_revision_id=UUID(str(r["parent_revision_id"])) if r.get("parent_revision_id") else None,
                     change_set=r["change_set"],
                     plan_snapshot=r["plan_snapshot"],
                     is_published=bool(r["is_published"]),
@@ -291,6 +300,8 @@ class EvidenceRevisionStore:
         change_set: dict[str, Any],
         plan_snapshot: dict[str, Any],
         evidence_links: list[tuple[UUID | str, UsageState]] | None = None,
+        expected_base_revision_id: UUID | str | None = None,
+        parent_revision_id: UUID | str | None = None,
     ) -> PlanRevision:
         """Publish a new plan revision under parent trip row lock with optimistic concurrency."""
         from services.trip_store import TripStore
@@ -311,7 +322,15 @@ class EvidenceRevisionStore:
                     status_code=409,
                     detail=f"Conflict: Expected base revision {expected_base_revision} but current is {current_num}.",
                 )
+            if expected_base_revision_id is not None:
+                cur_rid = str(trip.get("current_revision_id") or "")
+                if cur_rid != str(expected_base_revision_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Expected base revision ID {expected_base_revision_id} but current is {cur_rid}.",
+                    )
 
+            parent_id_val = UUID(str(parent_revision_id)) if parent_revision_id else (UUID(str(trip["current_revision_id"])) if trip.get("current_revision_id") else None)
             new_revision_number = current_num + 1
             new_rev_id = uuid4()
             rev = PlanRevision(
@@ -319,6 +338,7 @@ class EvidenceRevisionStore:
                 trip_id=UUID(tid_str),
                 user_id=UUID(uid_str),
                 revision_number=new_revision_number,
+                parent_revision_id=parent_id_val,
                 change_set=change_set,
                 plan_snapshot=plan_snapshot,
                 is_published=True,
@@ -372,32 +392,71 @@ class EvidenceRevisionStore:
                         status_code=409,
                         detail=f"Conflict: Expected base revision {expected_base_revision} but current is {current_num}.",
                     )
+                if expected_base_revision_id is not None:
+                    cur_rid = str(trip_row["current_revision_id"] or "")
+                    if cur_rid != str(expected_base_revision_id):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Conflict: Expected base revision ID {expected_base_revision_id} but current is {cur_rid}.",
+                        )
 
+                parent_id_str = str(parent_revision_id) if parent_revision_id else (str(trip_row["current_revision_id"]) if trip_row["current_revision_id"] else None)
                 new_revision_number = current_num + 1
                 new_rev_id = uuid4()
 
                 # 2. Insert new revision directly as published
-                conn.execute(
+                col_exists = conn.execute(
                     """
-                    INSERT INTO plan_revisions (
-                        revision_id, trip_id, user_id, revision_number,
-                        change_set, plan_snapshot, is_published, published_at, created_at
-                    ) VALUES (
-                        %s, %s, %s, %s,
-                        %s::jsonb, %s::jsonb, TRUE, %s, %s
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'plan_revisions' AND column_name = 'parent_revision_id'
+                    """
+                ).fetchone()
+
+                if col_exists:
+                    conn.execute(
+                        """
+                        INSERT INTO plan_revisions (
+                            revision_id, trip_id, user_id, revision_number, parent_revision_id,
+                            change_set, plan_snapshot, is_published, published_at, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, TRUE, %s, %s
+                        )
+                        """,
+                        (
+                            str(new_rev_id),
+                            tid_str,
+                            uid_str,
+                            new_revision_number,
+                            parent_id_str,
+                            json.dumps(change_set),
+                            json.dumps(plan_snapshot),
+                            now,
+                            now,
+                        ),
                     )
-                    """,
-                    (
-                        str(new_rev_id),
-                        tid_str,
-                        uid_str,
-                        new_revision_number,
-                        json.dumps(change_set),
-                        json.dumps(plan_snapshot),
-                        now,
-                        now,
-                    ),
-                )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO plan_revisions (
+                            revision_id, trip_id, user_id, revision_number,
+                            change_set, plan_snapshot, is_published, published_at, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, TRUE, %s, %s
+                        )
+                        """,
+                        (
+                            str(new_rev_id),
+                            tid_str,
+                            uid_str,
+                            new_revision_number,
+                            json.dumps(change_set),
+                            json.dumps(plan_snapshot),
+                            now,
+                            now,
+                        ),
+                    )
 
                 # 3. Insert evidence links
                 for eid, usage in links:
@@ -436,6 +495,7 @@ class EvidenceRevisionStore:
                 trip_id=UUID(tid_str),
                 user_id=UUID(uid_str),
                 revision_number=new_revision_number,
+                parent_revision_id=UUID(parent_id_str) if parent_id_str else None,
                 change_set=change_set,
                 plan_snapshot=plan_snapshot,
                 is_published=True,
@@ -451,9 +511,10 @@ class EvidenceRevisionStore:
         trip_id: UUID | str,
         user_id: UUID | str,
         revision_id: UUID | str,
+        expected_revision: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> PlanApproval:
-        """Approve trip revision under parent trip row lock."""
+        """Approve trip revision under parent trip row lock with exact revision and conflict checks."""
         from services.trip_store import TripStore
 
         tid_str = str(trip_id)
@@ -466,11 +527,35 @@ class EvidenceRevisionStore:
             trip = TripStore().get_trip(trip_id, user_id)
             if not trip:
                 raise HTTPException(status_code=404, detail="Trip not found.")
-            if str(trip.get("current_revision_id")) != rid_str:
+            cur_rid = str(trip.get("current_revision_id") or "")
+            if cur_rid != rid_str:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Cannot approve revision {rid_str}: not current revision ({trip.get('current_revision_id')}).",
+                    detail=f"Cannot approve revision {rid_str}: not current revision ({cur_rid}).",
                 )
+            if expected_revision is not None:
+                cur_num = int(trip.get("current_revision_number") or 0)
+                if cur_num != expected_revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Expected revision number {expected_revision} but current is {cur_num}.",
+                    )
+
+            # Check mutual exclusion: cannot approve if already rejected
+            for r in self._IN_MEMORY_REJECTIONS.values():
+                if str(r.trip_id) == tid_str and str(r.revision_id) == rid_str:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already rejected; cannot approve.",
+                    )
+
+            # Check duplicate approval
+            for a in self._IN_MEMORY_APPROVALS.values():
+                if str(a.trip_id) == tid_str and str(a.revision_id) == rid_str:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already approved.",
+                    )
 
             appr_id = uuid4()
             approval = PlanApproval(
@@ -490,7 +575,7 @@ class EvidenceRevisionStore:
                 # 1. Universal parent trip lock FOR UPDATE
                 trip_row = conn.execute(
                     """
-                    SELECT id, user_id, current_revision_id, status
+                    SELECT id, user_id, current_revision_id, current_revision_number, status
                     FROM trips
                     WHERE id = %s AND user_id = %s
                     FOR UPDATE
@@ -501,10 +586,40 @@ class EvidenceRevisionStore:
                 if not trip_row:
                     raise HTTPException(status_code=404, detail="Trip not found.")
 
-                if str(trip_row["current_revision_id"]) != rid_str:
+                cur_rid = str(trip_row["current_revision_id"] or "")
+                if cur_rid != rid_str:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Cannot approve revision {rid_str}: not current revision ({trip_row['current_revision_id']}).",
+                        detail=f"Cannot approve revision {rid_str}: not current revision ({cur_rid}).",
+                    )
+                if expected_revision is not None:
+                    cur_num = int(trip_row["current_revision_number"] or 0)
+                    if cur_num != expected_revision:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Conflict: Expected revision number {expected_revision} but current is {cur_num}.",
+                        )
+
+                # Check mutual exclusion: cannot approve if already rejected
+                rej_exists = conn.execute(
+                    "SELECT 1 FROM plan_revision_rejections WHERE trip_id = %s AND revision_id = %s",
+                    (tid_str, rid_str),
+                ).fetchone()
+                if rej_exists:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already rejected; cannot approve.",
+                    )
+
+                # Check duplicate approval
+                appr_exists = conn.execute(
+                    "SELECT 1 FROM plan_approvals WHERE trip_id = %s AND revision_id = %s",
+                    (tid_str, rid_str),
+                ).fetchone()
+                if appr_exists:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already approved.",
                     )
 
                 appr_id = uuid4()
@@ -535,6 +650,215 @@ class EvidenceRevisionStore:
                 approved_by_user_id=UUID(uid_str),
                 approved_at=now,
                 approval_metadata=meta,
+            )
+
+    def reject_revision_transaction(
+        self,
+        trip_id: UUID | str,
+        user_id: UUID | str,
+        revision_id: UUID | str,
+        expected_revision: int | None = None,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PlanRevisionRejection:
+        """Reject trip revision under parent trip row lock with exact revision and conflict checks."""
+        from services.trip_store import TripStore
+
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        rid_str = str(revision_id)
+        now = datetime.now(timezone.utc)
+        meta = metadata or {}
+        bounded_reason = reason.strip() if reason and reason.strip() else None
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            trip = TripStore().get_trip(trip_id, user_id)
+            if not trip:
+                raise HTTPException(status_code=404, detail="Trip not found.")
+            cur_rid = str(trip.get("current_revision_id") or "")
+            if cur_rid != rid_str:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Conflict: Cannot reject revision {rid_str}: not current revision ({cur_rid}).",
+                )
+            if expected_revision is not None:
+                cur_num = int(trip.get("current_revision_number") or 0)
+                if cur_num != expected_revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Expected revision number {expected_revision} but current is {cur_num}.",
+                    )
+
+            # Check mutual exclusion: cannot reject if already approved
+            for a in self._IN_MEMORY_APPROVALS.values():
+                if str(a.trip_id) == tid_str and str(a.revision_id) == rid_str:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already approved; cannot reject.",
+                    )
+
+            # Check duplicate rejection
+            for r in self._IN_MEMORY_REJECTIONS.values():
+                if str(r.trip_id) == tid_str and str(r.revision_id) == rid_str:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already rejected.",
+                    )
+
+            rej_id = uuid4()
+            rejection = PlanRevisionRejection(
+                rejection_id=rej_id,
+                trip_id=UUID(tid_str),
+                revision_id=UUID(rid_str),
+                rejected_by_user_id=UUID(uid_str),
+                rejected_at=now,
+                reason=bounded_reason,
+                rejection_metadata=meta,
+            )
+            self._IN_MEMORY_REJECTIONS[str(rej_id)] = rejection
+            TripStore().update_trip(trip_id, user_id, status="rejected")
+            return rejection
+
+        with self._connect() as conn:
+            with conn.transaction():
+                # 1. Universal parent trip lock FOR UPDATE
+                trip_row = conn.execute(
+                    """
+                    SELECT id, user_id, current_revision_id, current_revision_number, status
+                    FROM trips
+                    WHERE id = %s AND user_id = %s
+                    FOR UPDATE
+                    """,
+                    (tid_str, uid_str),
+                ).fetchone()
+
+                if not trip_row:
+                    raise HTTPException(status_code=404, detail="Trip not found.")
+
+                cur_rid = str(trip_row["current_revision_id"] or "")
+                if cur_rid != rid_str:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Cannot reject revision {rid_str}: not current revision ({cur_rid}).",
+                    )
+                if expected_revision is not None:
+                    cur_num = int(trip_row["current_revision_number"] or 0)
+                    if cur_num != expected_revision:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Conflict: Expected revision number {expected_revision} but current is {cur_num}.",
+                        )
+
+                # Check mutual exclusion: cannot reject if already approved
+                appr_exists = conn.execute(
+                    "SELECT 1 FROM plan_approvals WHERE trip_id = %s AND revision_id = %s",
+                    (tid_str, rid_str),
+                ).fetchone()
+                if appr_exists:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already approved; cannot reject.",
+                    )
+
+                # Check duplicate rejection
+                rej_exists = conn.execute(
+                    "SELECT 1 FROM plan_revision_rejections WHERE trip_id = %s AND revision_id = %s",
+                    (tid_str, rid_str),
+                ).fetchone()
+                if rej_exists:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Conflict: Revision {rid_str} is already rejected.",
+                    )
+
+                rej_id = uuid4()
+                # 2. Insert rejection
+                conn.execute(
+                    """
+                    INSERT INTO plan_revision_rejections (
+                        rejection_id, trip_id, revision_id, rejected_by_user_id, rejected_at, reason, rejection_metadata
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (str(rej_id), tid_str, rid_str, uid_str, now, bounded_reason, json.dumps(meta)),
+                )
+
+                # 3. Update trip status to rejected
+                conn.execute(
+                    """
+                    UPDATE trips
+                    SET status = 'rejected', updated_at = %s
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (now, tid_str, uid_str),
+                )
+
+            return PlanRevisionRejection(
+                rejection_id=rej_id,
+                trip_id=UUID(tid_str),
+                revision_id=UUID(rid_str),
+                rejected_by_user_id=UUID(uid_str),
+                rejected_at=now,
+                reason=bounded_reason,
+                rejection_metadata=meta,
+            )
+
+    def get_approval_for_revision(
+        self, trip_id: UUID | str, revision_id: UUID | str
+    ) -> PlanApproval | None:
+        """Fetch PlanApproval record for specific trip revision if exists."""
+        tid_str = str(trip_id)
+        rid_str = str(revision_id)
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            for a in self._IN_MEMORY_APPROVALS.values():
+                if str(a.trip_id) == tid_str and str(a.revision_id) == rid_str:
+                    return a
+            return None
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_approvals WHERE trip_id = %s AND revision_id = %s",
+                (tid_str, rid_str),
+            ).fetchone()
+            if not row:
+                return None
+            return PlanApproval(
+                approval_id=UUID(str(row["approval_id"])),
+                trip_id=UUID(str(row["trip_id"])),
+                revision_id=UUID(str(row["revision_id"])),
+                approved_by_user_id=UUID(str(row["approved_by_user_id"])),
+                approved_at=row["approved_at"],
+                approval_metadata=row.get("approval_metadata") or {},
+            )
+
+    def get_rejection_for_revision(
+        self, trip_id: UUID | str, revision_id: UUID | str
+    ) -> PlanRevisionRejection | None:
+        """Fetch PlanRevisionRejection record for specific trip revision if exists."""
+        tid_str = str(trip_id)
+        rid_str = str(revision_id)
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            for r in self._IN_MEMORY_REJECTIONS.values():
+                if str(r.trip_id) == tid_str and str(r.revision_id) == rid_str:
+                    return r
+            return None
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_revision_rejections WHERE trip_id = %s AND revision_id = %s",
+                (tid_str, rid_str),
+            ).fetchone()
+            if not row:
+                return None
+            return PlanRevisionRejection(
+                rejection_id=UUID(str(row["rejection_id"])),
+                trip_id=UUID(str(row["trip_id"])),
+                revision_id=UUID(str(row["revision_id"])),
+                rejected_by_user_id=UUID(str(row["rejected_by_user_id"])),
+                rejected_at=row["rejected_at"],
+                reason=row.get("reason"),
+                rejection_metadata=row.get("rejection_metadata") or {},
             )
 
     def revoke_approval_transaction(

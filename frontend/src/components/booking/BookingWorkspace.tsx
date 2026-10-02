@@ -132,10 +132,31 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   }, [syncFromStorage]);
 
   // Handle Plan Approval with 409 conflict detection
+  // Section 8 invariant: ONLY trip.active_revision_id + trip.active_revision_number
+  // may be used as approval identity. No fallback to current_revision is permitted.
   const handleApprovePlan = async () => {
     setApprovalConflict(null);
+
+    // Read ONLY the active revision fields — no current_revision fallback allowed.
+    const reviewedRevisionId = trip.active_revision_id;
+    const reviewedRevisionNumber = trip.active_revision_number;
+
+    // Validate both fields are present and well-formed before any service call.
+    if (!reviewedRevisionId || typeof reviewedRevisionId !== 'string' || reviewedRevisionId.trim() === '') {
+      notify('No active revision found. Please wait for a plan to be generated.', 'error');
+      return;
+    }
+    if (!reviewedRevisionNumber || typeof reviewedRevisionNumber !== 'number' || reviewedRevisionNumber < 1) {
+      notify('Active revision number is missing or invalid. Please refresh.', 'error');
+      return;
+    }
+
     try {
-      const res = await bookingService.approvePlan(trip.trip_id, trip.active_revision_number);
+      const res = await bookingService.approvePlan(
+        trip.trip_id,
+        reviewedRevisionNumber,
+        reviewedRevisionId
+      );
       setIsPlanApproved(true);
       setApprovedAt(res.approved_at);
       notify('Journey plan approved! Ready for service verification.', 'success', 'Plan Approved');

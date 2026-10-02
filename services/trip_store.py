@@ -728,14 +728,16 @@ class TripStore:
         updated_constraints: dict[str, Any] | None = None,
         expected_base_revision: int | None = None,
         constraints_update: dict[str, Any] | None = None,
+        expected_base_revision_id: str | uuid.UUID | None = None,
     ) -> dict[str, Any]:
         """Atomically advance trip plan revision under parent trip row lock in a single transaction.
 
         Guarantees:
         1. Universal parent trip row lock (SELECT ... FOR UPDATE) inside a single transaction.
-        2. Derives changeset and replanning decisions from the LOCKED current constraints/metadata.
-        3. Advances revision pointer, records PlanRevision, and persists updated metadata in the SAME transaction.
-        4. Zero possibility of overwriting concurrent offer selections or metadata updates.
+        2. Derives changeset, replanning decisions, and structured diff from the LOCKED current constraints/metadata.
+        3. Advances revision pointer, records PlanRevision with parent linkage, and persists updated metadata.
+        4. Validates expected base revision number and ID, raising 409 conflict if stale.
+        5. Zero possibility of overwriting concurrent offer selections or metadata updates.
         """
         tid_str = str(trip_id)
         uid_str = str(user_id)
@@ -744,6 +746,7 @@ class TripStore:
         now = datetime.now(timezone.utc)
 
         from domain.change_set import compute_change_set, calculate_replanning_plan
+        from domain.plan_revision import PlanRevision, compute_structured_diff
 
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             with _get_memory_trip_lock(tid_str):
@@ -752,6 +755,13 @@ class TripStore:
                     raise OfferSelectionError(404, "Trip not found or does not belong to you.")
                 trip_row = dict(t)
                 authoritative_rev = int(trip_row.get("current_revision_number") or 0)
+                cur_rev_id = str(trip_row.get("current_revision_id") or "")
+
+                if expected_base_revision_id is not None and cur_rev_id != str(expected_base_revision_id):
+                    raise OfferSelectionError(
+                        409,
+                        f"Conflict: Expected base revision ID {expected_base_revision_id} but current is {cur_rev_id}.",
+                    )
                 if expected_base_revision is not None and authoritative_rev != expected_base_revision:
                     raise OfferSelectionError(
                         409,
@@ -763,6 +773,7 @@ class TripStore:
 
                 change_set = compute_change_set(locked_constraints, constraints_update, feedback)
                 plan = calculate_replanning_plan(change_set)
+                structured_diff = compute_structured_diff(locked_constraints, {**locked_constraints, **constraints_update}, feedback)
 
                 new_revision_number = authoritative_rev + 1
                 new_constraints = {**locked_constraints, **constraints_update}
@@ -797,6 +808,7 @@ class TripStore:
                     meta.pop("selected_hotel_snapshot_id", None)
 
                 new_rev_id = uuid.uuid4()
+                parent_rev_id = trip_row.get("current_revision_id")
                 plan_snapshot = {
                     "title": trip_row.get("title") or "",
                     "destination": trip_row.get("destination") or "",
@@ -805,21 +817,18 @@ class TripStore:
                     "metadata": meta,
                 }
 
-                from domain.plan_revision import PlanRevision
                 from services.evidence_store import EvidenceRevisionStore
                 ev_store = EvidenceRevisionStore()
-                rev = PlanRevision(
-                    revision_id=new_rev_id,
+                published_rev = ev_store.publish_revision_transaction(
                     trip_id=uuid.UUID(tid_str),
                     user_id=uuid.UUID(uid_str),
-                    revision_number=new_revision_number,
+                    expected_base_revision=authoritative_rev,
+                    expected_base_revision_id=expected_base_revision_id,
                     change_set=change_set.model_dump(),
                     plan_snapshot=plan_snapshot,
-                    is_published=True,
-                    published_at=now,
-                    created_at=now,
+                    parent_revision_id=uuid.UUID(str(parent_rev_id)) if parent_rev_id else None,
                 )
-                ev_store._IN_MEMORY_REVISIONS[str(new_rev_id)] = rev
+                new_rev_id = published_rev.revision_id
 
                 t["current_revision_id"] = str(new_rev_id)
                 t["current_revision_number"] = new_revision_number
@@ -831,10 +840,26 @@ class TripStore:
                     "success": True,
                     "trip_id": tid_str,
                     "revision": new_revision_number,
+                    "revision_number": new_revision_number,
                     "revision_id": str(new_rev_id),
+                    "parent_revision_id": str(parent_rev_id) if parent_rev_id else None,
                     "status": "awaiting_approval",
+                    "proposal_status": "PROPOSED",
+                    "review_status": "PROPOSED",
+                    "trip_status": "awaiting_approval",
                     "change_set": change_set.model_dump(),
+                    "structured_diff": structured_diff.model_dump(),
                     "affected_agents": plan.affected_agents,
+                    "plan_snapshot": plan_snapshot,
+                    "proposal_snapshot": plan_snapshot,
+                    "review_projection": {
+                        "revision_id": str(new_rev_id),
+                        "revision_number": new_revision_number,
+                        "parent_revision_id": str(parent_rev_id) if parent_rev_id else None,
+                        "status": "PROPOSED",
+                        "structured_diff": structured_diff.model_dump(),
+                        "plan_snapshot": plan_snapshot,
+                    },
                     "trip": dict(t),
                 }
 
@@ -855,7 +880,13 @@ class TripStore:
 
                 trip_row = dict(row)
                 authoritative_rev = int(trip_row.get("current_revision_number") or 0)
+                cur_rev_id = str(trip_row.get("current_revision_id") or "")
 
+                if expected_base_revision_id is not None and cur_rev_id != str(expected_base_revision_id):
+                    raise OfferSelectionError(
+                        409,
+                        f"Conflict: Expected base revision ID {expected_base_revision_id} but current is {cur_rev_id}.",
+                    )
                 if expected_base_revision is not None and authoritative_rev != expected_base_revision:
                     raise OfferSelectionError(
                         409,
@@ -880,6 +911,7 @@ class TripStore:
 
                 change_set = compute_change_set(locked_constraints, constraints_update, feedback)
                 plan = calculate_replanning_plan(change_set)
+                structured_diff = compute_structured_diff(locked_constraints, {**locked_constraints, **constraints_update}, feedback)
 
                 new_revision_number = authoritative_rev + 1
                 new_constraints = {**locked_constraints, **constraints_update}
@@ -914,6 +946,9 @@ class TripStore:
                     meta.pop("selected_hotel_snapshot_id", None)
 
                 new_rev_id = uuid.uuid4()
+                parent_rev_id = trip_row.get("current_revision_id")
+                parent_id_str = str(parent_rev_id) if parent_rev_id else None
+
                 plan_snapshot = {
                     "title": trip_row.get("title") or "",
                     "destination": trip_row.get("destination") or "",
@@ -922,27 +957,58 @@ class TripStore:
                     "metadata": meta,
                 }
 
-                conn.execute(
+                col_exists = conn.execute(
                     """
-                    INSERT INTO plan_revisions (
-                        revision_id, trip_id, user_id, revision_number,
-                        change_set, plan_snapshot, is_published, published_at, created_at
-                    ) VALUES (
-                        %s, %s, %s, %s,
-                        %s::jsonb, %s::jsonb, TRUE, %s, %s
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'plan_revisions' AND column_name = 'parent_revision_id'
+                    """
+                ).fetchone()
+
+                if col_exists:
+                    conn.execute(
+                        """
+                        INSERT INTO plan_revisions (
+                            revision_id, trip_id, user_id, revision_number, parent_revision_id,
+                            change_set, plan_snapshot, is_published, published_at, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, TRUE, %s, %s
+                        )
+                        """,
+                        (
+                            str(new_rev_id),
+                            tid_str,
+                            uid_str,
+                            new_revision_number,
+                            parent_id_str,
+                            json.dumps(change_set.model_dump()),
+                            json.dumps(plan_snapshot),
+                            now,
+                            now,
+                        ),
                     )
-                    """,
-                    (
-                        str(new_rev_id),
-                        tid_str,
-                        uid_str,
-                        new_revision_number,
-                        json.dumps(change_set.model_dump()),
-                        json.dumps(plan_snapshot),
-                        now,
-                        now,
-                    ),
-                )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO plan_revisions (
+                            revision_id, trip_id, user_id, revision_number,
+                            change_set, plan_snapshot, is_published, published_at, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, TRUE, %s, %s
+                        )
+                        """,
+                        (
+                            str(new_rev_id),
+                            tid_str,
+                            uid_str,
+                            new_revision_number,
+                            json.dumps(change_set.model_dump()),
+                            json.dumps(plan_snapshot),
+                            now,
+                            now,
+                        ),
+                    )
 
                 updated_row = conn.execute(
                     """
@@ -963,10 +1029,26 @@ class TripStore:
                     "success": True,
                     "trip_id": tid_str,
                     "revision": new_revision_number,
+                    "revision_number": new_revision_number,
                     "revision_id": str(new_rev_id),
+                    "parent_revision_id": parent_id_str,
                     "status": "awaiting_approval",
+                    "proposal_status": "PROPOSED",
+                    "review_status": "PROPOSED",
+                    "trip_status": "awaiting_approval",
                     "change_set": change_set.model_dump(),
+                    "structured_diff": structured_diff.model_dump(),
                     "affected_agents": plan.affected_agents,
+                    "plan_snapshot": plan_snapshot,
+                    "proposal_snapshot": plan_snapshot,
+                    "review_projection": {
+                        "revision_id": str(new_rev_id),
+                        "revision_number": new_revision_number,
+                        "parent_revision_id": parent_id_str,
+                        "status": "PROPOSED",
+                        "structured_diff": structured_diff.model_dump(),
+                        "plan_snapshot": plan_snapshot,
+                    },
                     "trip": updated_trip,
                 }
 

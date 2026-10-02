@@ -47,14 +47,37 @@ export class TrustTripBookingService implements IBookingService {
   private activePrebookIds: Map<string, string> = new Map();
 
   /**
-   * Approves canonical journey plan via POST /api/trips/{trip_id}/approve
+   * Approves canonical journey plan via POST /api/trips/{trip_id}/approve.
+   *
+   * Section 8 invariant: the revision approved MUST be exactly the revision
+   * the user reviewed. Both revisionId and expectedRevision are REQUIRED.
+   * Neither may be inferred from current trip state.
+   *
+   * @throws {Error} immediately (without calling the backend) if revisionId
+   *   is absent/empty or expectedRevision is absent/non-positive.
    */
   async approvePlan(
     tripId: string,
-    expectedRevision?: number
+    expectedRevision: number,
+    revisionId: string
   ): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }> {
+    // Local pre-flight validation — reject immediately, do NOT call backend
+    if (!revisionId || typeof revisionId !== 'string' || revisionId.trim() === '') {
+      throw Object.assign(
+        new Error('approvePlan requires an exact revisionId. Do not call this method without the reviewed revision identity.'),
+        { code: 'MISSING_REVISION_ID', statusCode: 400 }
+      );
+    }
+    if (typeof expectedRevision !== 'number' || !Number.isInteger(expectedRevision) || expectedRevision < 1) {
+      throw Object.assign(
+        new Error('approvePlan requires a valid positive expectedRevision number. Do not infer from current trip state.'),
+        { code: 'MISSING_EXPECTED_REVISION', statusCode: 400 }
+      );
+    }
+
     const res = await api.approveTrip(tripId, {
-      expected_revision: expectedRevision,
+      revision_id: revisionId,
+      expected_revision_number: expectedRevision,
       notes: 'Approved by traveler in review stage',
     });
 

@@ -140,15 +140,29 @@ class MockBookingService implements IBookingService {
 
   async approvePlan(
     tripId: string,
-    expectedRevision?: number
+    expectedRevision: number,
+    revisionId: string
   ): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }> {
+    // Same local pre-flight validation as production service — no fallback allowed
+    if (!revisionId || typeof revisionId !== 'string' || revisionId.trim() === '') {
+      throw Object.assign(
+        new Error('approvePlan requires an exact revisionId.'),
+        { code: 'MISSING_REVISION_ID', statusCode: 400 }
+      );
+    }
+    if (typeof expectedRevision !== 'number' || !Number.isInteger(expectedRevision) || expectedRevision < 1) {
+      throw Object.assign(
+        new Error('approvePlan requires a valid positive expectedRevision number.'),
+        { code: 'MISSING_EXPECTED_REVISION', statusCode: 400 }
+      );
+    }
     await this.delay(650);
     const state = getStoredBookingState(tripId);
     const approvedAt = new Date().toISOString();
     state.isApproved = true;
     state.approvedAt = approvedAt;
     saveStoredBookingState(tripId, state);
-    return { approved: true, approved_at: approvedAt, active_revision_number: (expectedRevision || 1) + 1 };
+    return { approved: true, approved_at: approvedAt, active_revision_number: expectedRevision + 1 };
   }
 
   async verifyFlight(tripId: string, offerId: string): Promise<{
