@@ -22,7 +22,7 @@ interface CheckoutHandoffModalProps {
   amount: number;
   currency?: string;
   providerName?: string;
-  onSimulateComplete: () => Promise<void>;
+  onSimulateComplete?: () => Promise<void>;
 }
 
 export const CheckoutHandoffModal: React.FC<CheckoutHandoffModalProps> = ({
@@ -53,7 +53,9 @@ export const CheckoutHandoffModal: React.FC<CheckoutHandoffModalProps> = ({
   const handleComplete = async () => {
     setStep('completing');
     try {
-      await onSimulateComplete();
+      if (onSimulateComplete) {
+        await onSimulateComplete();
+      }
     } finally {
       onClose();
     }

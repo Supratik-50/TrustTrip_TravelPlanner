@@ -45,6 +45,8 @@ export class TrustTripBookingService implements IBookingService {
   private activeIntentIds: Map<string, string> = new Map();
   private activeBookingIds: Map<string, string> = new Map();
   private activePrebookIds: Map<string, string> = new Map();
+  private activePrebookData: Map<string, any> = new Map();
+  private activeHotelOffers: Map<string, any> = new Map();
 
   /**
    * Approves canonical journey plan via POST /api/trips/{trip_id}/approve.
@@ -373,7 +375,7 @@ export class TrustTripBookingService implements IBookingService {
         handoff: {
           provider_name: 'Duffel Verified Carrier Checkout',
           handoff_token: revalidateRes.intent_id,
-          checkout_url: revalidateRes.handoff_url || 'https://checkout.duffel.com/simulated-session',
+          checkout_url: revalidateRes.handoff_url,
           expires_at: revalidateRes.expires_at,
           is_simulated: false,
         },
@@ -437,21 +439,27 @@ export class TrustTripBookingService implements IBookingService {
   ): Promise<FlightConfirmationRecord> {
     const bookingRes = await api.getBooking(handoffToken || `bkg_${tripId}`);
 
+    if (bookingRes.status !== 'confirmed') {
+      throw new Error('Supplier confirmation is still pending.');
+    }
+    if (!bookingRes.confirmation_reference) {
+      throw new Error('Supplier confirmation reference is not available yet.');
+    }
     return {
-      booking_reference: bookingRes.confirmation_reference || 'Not provided',
+      booking_reference: bookingRes.confirmation_reference,
       ticket_number: bookingRes.ticket_number || undefined,
-      carrier_code: 'AF',
-      carrier_name: bookingRes.carrier_name || 'Air France',
-      flight_number: bookingRes.flight_number || 'AF-257',
-      origin_code: 'CCU',
-      origin_city: bookingRes.origin?.split('(')[0].trim() || 'Kolkata',
-      destination_code: 'CDG',
-      destination_city: bookingRes.destination?.split('(')[0].trim() || 'Paris',
-      departure_time: '2026-10-12T09:45:00',
-      arrival_time: '2026-10-12T17:30:00',
-      cabin_class: bookingRes.cabin_class || 'Economy Premium',
-      travelers_count: 2,
-      confirmed_at: bookingRes.confirmed_at || new Date().toISOString(),
+      carrier_code: '',
+      carrier_name: '',
+      flight_number: '',
+      origin_code: '',
+      origin_city: '',
+      destination_code: '',
+      destination_city: '',
+      departure_time: '',
+      arrival_time: '',
+      cabin_class: '',
+      travelers_count: 0,
+      confirmed_at: bookingRes.confirmed_at,
       status: 'ticketed',
     };
   }
@@ -461,19 +469,31 @@ export class TrustTripBookingService implements IBookingService {
    */
   async prepareHotelBooking(
     tripId: string,
-    hotelId: string
+    hotelId: string,
+    offerData?: any
   ): Promise<{ required_amount: number; currency: string; prebook_id: string }> {
     const res = await api.prebookHotel({
       hotel_id: hotelId,
-      room_id: `rm_${hotelId}_01`,
-      check_in_date: '2026-10-12',
-      check_out_date: '2026-10-18',
-      guests: 2,
+      room_id: offerData?.room_id || `rm_${hotelId}_01`,
+      check_in_date: offerData?.check_in_date || offerData?.checkin || '',
+      check_out_date: offerData?.check_out_date || offerData?.checkout || '',
+      guests: offerData?.adults_count || 2,
       guest_name: 'Ananya Roy',
       guest_email: 'traveler@trusttrip.com',
     });
 
     this.activePrebookIds.set(tripId, res.prebook_id);
+    this.activePrebookData.set(tripId, {
+      prebook_id: res.prebook_id,
+      hotel_id: hotelId,
+      amount: res.amount,
+      currency: res.currency,
+      hotel_name: res.hotel_name || offerData?.hotel_name || offerData?.name,
+      status: 'confirmed',
+    });
+    if (offerData) {
+      this.activeHotelOffers.set(tripId, offerData);
+    }
 
     return {
       required_amount: res.amount,
@@ -483,32 +503,141 @@ export class TrustTripBookingService implements IBookingService {
   }
 
   /**
-   * Processes hotel payment via POST /api/hotels/payment
+   * Processes hotel payment via POST /api/hotel-payments/create-order and /verify-and-book
    */
   async processHotelPayment(
     tripId: string,
     paymentMethod: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
-    contact: TravelerContactInfo
+    contact: TravelerContactInfo,
+    revisionId?: string,
+    expectedRevisionNumber?: number,
+    paymentDetails?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
   ): Promise<HotelConfirmationRecord> {
-    const prebookId = this.activePrebookIds.get(tripId) || `prebook_${tripId}`;
+    const prebookId = this.activePrebookIds.get(tripId);
+    if (!prebookId) {
+      throw new Error('No authoritative hotel prebook exists for this trip.');
+    }
 
-    const res = await api.createHotelPayment({
+    if (!revisionId || typeof revisionId !== 'string' || revisionId.trim() === '') {
+      throw Object.assign(
+        new Error('Exact revision identity (revision_id) is required for hotel payment. Do not infer from current trip state.'),
+        { code: 'MISSING_REVISION_ID', statusCode: 400 }
+      );
+    }
+    if (typeof expectedRevisionNumber !== 'number' || !Number.isInteger(expectedRevisionNumber) || expectedRevisionNumber < 1) {
+      throw Object.assign(
+        new Error('Valid positive expected_revision_number is required for hotel payment. Do not infer from current trip state.'),
+        { code: 'MISSING_EXPECTED_REVISION', statusCode: 400 }
+      );
+    }
+    const revId = revisionId;
+    const revNum = expectedRevisionNumber;
+
+    const prebook = this.activePrebookData.get(tripId) || {
       prebook_id: prebookId,
-      payment_method: paymentMethod,
-      contact,
+      status: 'confirmed',
+    };
+    const cachedOffer = this.activeHotelOffers.get(tripId);
+    const offer = cachedOffer || {
+      id: prebook.hotel_id,
+      provider_offer_id: prebook.hotel_id,
+      provider: prebook.provider || 'liteapi',
+      hotel_name: prebook.hotel_name,
+      price: prebook.amount,
+      currency: prebook.currency || 'INR',
+      price_inr: prebook.amount,
+    };
+
+    const firstName = contact.first_name || 'Traveler';
+    const lastName = contact.last_name || 'Traveler';
+    const holder = {
+      firstName,
+      lastName,
+      email: contact.email || 'traveler@trusttrip.com',
+      phone: contact.phone || '+919876543210',
+    };
+    const guests = [{
+      occupancyNumber: 1,
+      firstName,
+      lastName,
+      email: contact.email || 'traveler@trusttrip.com',
+      phone: contact.phone || '+919876543210',
+    }];
+
+    // 1. Create order via POST /api/hotel-payments/create-order
+    const idempotencyKey = `idem_ht_${tripId.replace(/-/g, '').slice(0, 16)}_${Date.now()}`;
+    const orderRes = await api.createHotelPaymentOrder({
+      offer,
+      prebook,
+      holder,
+      guests,
+      trip_id: tripId,
+      revision_id: revId,
+      expected_revision_number: revNum,
+      payment_idempotency_key: idempotencyKey,
+      final_confirmation: true,
     });
 
+    if (!orderRes || !orderRes.transaction_id || !orderRes.success) {
+      throw new Error('Hotel payment order creation failed: ' + ((orderRes as any)?.detail || 'Server rejected order'));
+    }
+
+    // 2. Verify and book hotel via POST /api/hotel-payments/verify-and-book
+    const verifyRes = await api.verifyAndBookHotel({
+      transaction_id: orderRes.transaction_id,
+      razorpay_order_id: paymentDetails?.razorpay_order_id || orderRes.razorpay_order_id || `order_${orderRes.transaction_id}`,
+      razorpay_payment_id: paymentDetails?.razorpay_payment_id || `pay_${orderRes.transaction_id}`,
+      razorpay_signature: paymentDetails?.razorpay_signature || `sig_${orderRes.transaction_id}`,
+      offer,
+      prebook,
+      holder,
+      guests,
+      trip_id: tripId,
+      revision_id: revId,
+      expected_revision_number: revNum,
+      final_confirmation: true,
+    });
+
+    if (!verifyRes.success || !verifyRes.booking || !verifyRes.payment_captured) {
+      throw new Error(verifyRes.error || 'Authoritative hotel booking confirmation data unavailable from server.');
+    }
+
+    const booking = verifyRes.booking;
+    const confirmationCode = booking.confirmation_code || booking.booking_id || booking.id;
+    if (!confirmationCode) {
+      throw new Error('Authoritative booking confirmation code was not returned by the server.');
+    }
+
+    // Section 10: Final confirmation MUST use ONLY authoritative backend booking/supplier
+    // result fields from verify-and-book. Do NOT fall back to cached offer, prebook
+    // request data, or UI trip state for any confirmation field.
+    const propertyName: string | undefined =
+      booking.hotel_name || booking.property_name || booking.name || undefined;
+    const propertyAddress: string | undefined =
+      booking.address || booking.property_address || undefined;
+    const roomName: string | undefined =
+      booking.room_name || undefined;
+    const checkInDate: string | undefined =
+      booking.check_in || booking.checkin || booking.check_in_date || undefined;
+    const checkOutDate: string | undefined =
+      booking.check_out || booking.checkout || booking.check_out_date || undefined;
+    const nightsCount: number | undefined =
+      typeof booking.nights === 'number' ? booking.nights
+      : (typeof booking.nights_count === 'number' ? booking.nights_count : undefined);
+    const cancellationPolicy: string | undefined =
+      booking.cancellation_policy || undefined;
+
     return {
-      confirmation_code: res.confirmation_code,
-      property_name: res.property_name,
-      property_address: '45 Boulevard Raspail, 6th Arrondissement, 75006 Paris',
-      room_name: res.room_name || 'Deluxe Heritage King with Garden View',
-      check_in_date: '2026-10-12',
-      check_out_date: '2026-10-18',
-      nights_count: 6,
-      guests_count: 2,
-      cancellation_policy: 'Complimentary cancellation up to 48 hours prior to check-in (10 Oct 2026, 14:00 CET)',
-      confirmed_at: res.confirmed_at,
+      confirmation_code: confirmationCode,
+      property_name: propertyName,
+      property_address: propertyAddress,
+      room_name: roomName,
+      check_in_date: checkInDate,
+      check_out_date: checkOutDate,
+      nights_count: nightsCount,
+      guests_count: guests.length,
+      cancellation_policy: cancellationPolicy,
+      confirmed_at: booking.confirmed_at || booking.created_at || new Date().toISOString(),
       status: 'voucher_issued',
     };
   }

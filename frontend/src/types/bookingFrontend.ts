@@ -101,14 +101,14 @@ export interface FlightConfirmationRecord {
 
 export interface HotelConfirmationRecord {
   confirmation_code: string;
-  property_name: string;
-  property_address: string;
-  room_name: string;
-  check_in_date: string;
-  check_out_date: string;
-  nights_count: number;
-  guests_count: number;
-  cancellation_policy: string;
+  property_name?: string;
+  property_address?: string;
+  room_name?: string;
+  check_in_date?: string;
+  check_out_date?: string;
+  nights_count?: number;
+  guests_count?: number;
+  cancellation_policy?: string;
   confirmed_at: string;
   status: 'confirmed' | 'voucher_issued';
 }
@@ -153,11 +153,14 @@ export interface IBookingService {
   acceptPriceChange(tripId: string, offerId: string): Promise<boolean>;
   initiateFlightHandoff(tripId: string, offerId: string): Promise<ExternalCheckoutHandoff>;
   confirmFlightHandoffReturn(tripId: string, handoffToken: string): Promise<FlightConfirmationRecord>;
-  prepareHotelBooking(tripId: string, hotelId: string): Promise<{ required_amount: number; currency: string }>;
+  prepareHotelBooking(tripId: string, hotelId: string, offerData?: any): Promise<{ required_amount: number; currency: string; prebook_id?: string }>;
   processHotelPayment(
     tripId: string,
     paymentMethod: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
-    contact: TravelerContactInfo
+    contact: TravelerContactInfo,
+    revisionId?: string,
+    expectedRevisionNumber?: number,
+    paymentDetails?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
   ): Promise<HotelConfirmationRecord>;
   requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id: string; message: string }>;
   downloadTravelPlanPdf(tripId: string): Promise<void>;

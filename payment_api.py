@@ -33,6 +33,12 @@ class PaymentOrderRequest(BaseModel):
     passengers: list[dict] = Field(min_length=1, max_length=9)
     customer_ref: str | None = Field(default=None, max_length=120)
     final_confirmation: bool = False
+    # Section 10: exact trip/revision binding for eligibility guard and transaction lineage
+    trip_id: str = Field(min_length=1, description="Exact trip ID for Section 9 eligibility guard")
+    revision_id: str = Field(min_length=1, description="Exact revision ID for Section 9 eligibility guard")
+    expected_revision_number: int = Field(ge=1, description="Expected revision number for Section 9 eligibility guard")
+    # Section 10: payment-order idempotency key
+    payment_idempotency_key: str = Field(min_length=8, max_length=128, description="Client idempotency key for payment order creation")
 
 
 
@@ -50,6 +56,9 @@ class PresentationBookRequest(BaseModel):
     razorpay_payment_id: str = Field(min_length=4)
     razorpay_signature: str = Field(min_length=16)
     final_confirmation: bool = False
+    trip_id: str = Field(min_length=1)
+    revision_id: str = Field(min_length=1)
+    expected_revision_number: int = Field(ge=1)
 
 
 def _presentation_enabled() -> bool:
@@ -94,6 +103,9 @@ class PaymentVerifyRequest(BaseModel):
     razorpay_order_id: str = Field(min_length=4)
     razorpay_payment_id: str = Field(min_length=4)
     razorpay_signature: str = Field(min_length=16)
+    trip_id: str = Field(min_length=1)
+    revision_id: str = Field(min_length=1)
+    expected_revision_number: int = Field(ge=1)
     final_confirmation: bool = False
 
 
@@ -199,6 +211,22 @@ async def create_payment_order(
     if not request.final_confirmation:
         return {"success": False, "requires_final_confirmation": True, "error": "Final user confirmation is required before payment."}
 
+    # Section 10 — Section 9 eligibility gate before any payment-order creation
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication is required to create a payment order.")
+    try:
+        from services.authorization_store import AuthorizationStore
+        AuthorizationStore().assert_booking_eligible(
+            trip_id=request.trip_id,
+            user_id=current_user.id,
+            revision_id=request.revision_id,
+            expected_revision_number=request.expected_revision_number,
+        )
+    except Exception as elig_err:
+        if isinstance(elig_err, HTTPException):
+            raise
+        raise HTTPException(status_code=409, detail={"code": "BOOKING_NOT_ELIGIBLE", "message": str(elig_err)}) from elig_err
+
     rp = _razorpay()
     _integration_mode()
     if not rp.configured:
@@ -224,17 +252,6 @@ async def create_payment_order(
                 ),
             )
 
-        receipt = f"tt_{uuid.uuid4().hex[:30]}"
-        razor_order = await asyncio.to_thread(
-            rp.create_order,
-            amount,
-            receipt,
-            {
-                "offer_id": request.offer_id,
-                "app": "Trust Trip MAS",
-                "provider_currency": conversion["provider_currency"],
-            },
-        )
         if not current_user and request.customer_ref:
             from services.auth_store import UserStore
             if UserStore().get_by_id(request.customer_ref):
@@ -243,22 +260,60 @@ async def create_payment_order(
                     detail="Cannot assign payment order to a registered user account without authenticating.",
                 )
         effective_customer_ref = str(current_user.id) if current_user else request.customer_ref
-        tx_id = _store().create(
-            customer_ref=effective_customer_ref,
-            offer_id=request.offer_id,
-            razorpay_order_id=razor_order["id"],
-            amount=amount,
-            currency="INR",
-            provider_amount=conversion["provider_amount"],
-            provider_currency=conversion["provider_currency"],
-            fx_rate=conversion["fx_rate"],
-            fx_rate_date=conversion["fx_rate_date"],
-            fx_source=conversion["fx_source"],
-            payment_status="created",
-            booking_status="awaiting_payment",
-            passengers=request.passengers,
-            metadata={"receipt": receipt, "fare_rechecked_at_creation": True, "customer_final_confirmation": True},
-        )
+        receipt = f"tt_{uuid.uuid4().hex[:30]}"
+        store = _store()
+        try:
+            reserved, is_new = store.reserve_payment_order(
+                customer_ref=effective_customer_ref, offer_id=request.offer_id, amount=amount,
+                currency="INR", provider_amount=conversion["provider_amount"],
+                provider_currency=conversion["provider_currency"], fx_rate=conversion["fx_rate"],
+                fx_rate_date=conversion["fx_rate_date"], fx_source=conversion["fx_source"],
+                passengers=request.passengers,
+                metadata={"receipt": receipt, "fare_rechecked_at_creation": True, "customer_final_confirmation": True},
+                trip_id=request.trip_id, revision_id=request.revision_id,
+                revision_number=request.expected_revision_number,
+                payment_idempotency_key=request.payment_idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not is_new:
+            if reserved.get("razorpay_order_id"):
+                return {
+                    "success": True,
+                    "idempotent_replay": True,
+                    "transaction_id": str(reserved["id"]),
+                    "order_id": reserved["razorpay_order_id"],
+                    "amount": int(round(float(reserved.get("amount", 0)) * 100)),
+                    "currency": reserved.get("currency", "INR"),
+                    "key_id": rp.key_id,
+                }
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                reserved = store.get_by_payment_idempotency_key(request.payment_idempotency_key)
+                if reserved and reserved.get("razorpay_order_id"):
+                    return {
+                        "success": True, "idempotent_replay": True,
+                        "transaction_id": str(reserved["id"]),
+                        "order_id": reserved["razorpay_order_id"],
+                        "amount": int(round(float(reserved.get("amount", 0)) * 100)),
+                        "currency": reserved.get("currency", "INR"), "key_id": rp.key_id,
+                    }
+                if reserved and reserved.get("booking_status") == "payment_order_failed":
+                    raise HTTPException(status_code=409, detail="The prior payment-order request failed; use a new idempotency key after reviewing its state.")
+            raise HTTPException(status_code=409, detail="A payment order with this idempotency key is still being created.")
+        tx_id = str(reserved["id"])
+        try:
+            razor_order = await asyncio.to_thread(
+                rp.create_order,
+                amount,
+                receipt,
+                {"offer_id": request.offer_id, "app": "Trust Trip MAS", "provider_currency": conversion["provider_currency"]},
+            )
+        except Exception as exc:
+            store.update(tx_id, payment_status="order_failed", booking_status="payment_order_failed")
+            raise HTTPException(status_code=502, detail="Razorpay payment order creation failed.") from exc
+        store.update(tx_id, razorpay_order_id=razor_order["id"],
+                     payment_status="created", booking_status="awaiting_payment")
         return {
             "success": True,
             "transaction_id": tx_id,
@@ -323,6 +378,10 @@ async def presentation_book(
                 raise HTTPException(status_code=403, detail="This payment transaction does not belong to you.")
     if tx.get("razorpay_order_id") != request.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Payment order does not match this transaction.")
+    if (str(tx.get("trip_id") or "") != request.trip_id
+            or str(tx.get("revision_id") or "") != request.revision_id
+            or int(tx.get("revision_number") or 0) != request.expected_revision_number):
+        raise HTTPException(status_code=409, detail={"code": "REVISION_MISMATCH", "message": "Payment request revision does not match its persisted transaction."})
     if tx.get("booking_status") == "booked":
         return {
             "success": True, "payment_captured": True, "already_booked": True,
@@ -405,6 +464,34 @@ async def _fulfil_paid_transaction(transaction_id: str) -> dict:
         raise HTTPException(status_code=409, detail="This payment is already being processed or requires refund/review. Do not retry automatically.")
 
     passengers = _safe_json(tx.get("passenger_json"))
+    trip_id = tx.get("trip_id")
+    user_id = tx.get("customer_ref") or ""
+    revision_id = tx.get("revision_id")
+    revision_number = tx.get("revision_number")
+
+    if not trip_id or not revision_id or revision_number is None or not user_id:
+        store.update(transaction_id, payment_status="captured", booking_status="stale_revision_review",
+                     error="Payment transaction is missing mandatory revision lineage for supplier fulfillment.")
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "BOOKING_NOT_ELIGIBLE", "message": "Transaction lacks complete revision lineage."},
+        )
+
+    try:
+        from services.authorization_store import AuthorizationStore
+        AuthorizationStore().assert_booking_eligible(
+            trip_id=trip_id,
+            user_id=user_id,
+            revision_id=revision_id,
+            expected_revision_number=int(revision_number),
+        )
+    except Exception as elig_err:
+        store.update(transaction_id, payment_status="captured", booking_status="stale_revision_review",
+                     error=f"Eligibility check failed immediately before supplier fulfillment: {elig_err}")
+        if isinstance(elig_err, HTTPException):
+            raise
+        raise HTTPException(status_code=409, detail={"code": "BOOKING_NOT_ELIGIBLE", "message": str(elig_err)}) from elig_err
+
     service = FlightService()
     try:
         result = await asyncio.to_thread(
@@ -507,6 +594,10 @@ async def verify_and_book(
                 raise HTTPException(status_code=403, detail="This payment transaction does not belong to you.")
     if tx.get("razorpay_order_id") != request.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Payment order does not match this transaction.")
+    if (str(tx.get("trip_id") or "") != request.trip_id
+            or str(tx.get("revision_id") or "") != request.revision_id
+            or int(tx.get("revision_number") or 0) != request.expected_revision_number):
+        raise HTTPException(status_code=409, detail={"code": "REVISION_MISMATCH", "message": "Payment request revision does not match its persisted transaction."})
 
     if tx.get("booking_status") == "booked":
         return {"success": True, "payment_captured": True, "already_booked": True,
@@ -618,4 +709,3 @@ async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks):
         raise
     except (RazorpayError, ValueError, json.JSONDecodeError, FlightProviderError, FlightProviderTimeout) as exc:
         raise HTTPException(status_code=400 if not isinstance(exc, FlightProviderTimeout) else 504, detail=str(exc)) from exc
-

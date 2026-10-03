@@ -1,6 +1,7 @@
 """Hotel Booking Integration Service bridging snapshot authorization into existing HotelService and HotelTransactionStore."""
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from typing import Any
@@ -39,12 +40,29 @@ class HotelBookingService:
         user_id: UUID | str,
         holder: dict[str, Any],
         guests: list[dict[str, Any]],
+        trip_id: UUID | str,
+        revision_id: UUID | str,
+        expected_revision_number: int,
+        payment_idempotency_key: str,
         customer_ref: str | None = None,
         final_confirmation: bool = False,
     ) -> dict[str, Any]:
-        """Validate snapshot ownership, revalidate rates, and initiate existing TrustTrip hotel checkout order."""
+        """Validate snapshot ownership, revalidate rates, and initiate existing TrustTrip hotel checkout order.
+
+        Section 10: exact revision identity and an idempotency reservation are
+        required before creating a payment order.
+        """
         if not final_confirmation:
             raise ValueError("Final user confirmation is required before hotel payment order creation.")
+
+        # 0. Section 10 — Section 9 eligibility gate (must run before any irreversible action)
+        from services.authorization_store import AuthorizationStore
+        AuthorizationStore().assert_booking_eligible(
+            trip_id=trip_id,
+            user_id=user_id,
+            revision_id=revision_id,
+            expected_revision_number=expected_revision_number,
+        )
 
         # 1. Tenant ownership validation
         snapshot = self.store.get_snapshot(snapshot_id, user_id)
@@ -105,15 +123,26 @@ class HotelBookingService:
                 amount_inr = round(float(offer_dict["price"]) * 85.0, 2)
 
         # 4. Perform prebook via existing HotelService
+        # Section 10: A simulated/fallback prebook MUST NOT proceed to payment order creation.
         prebook_data = {}
         try:
             prebook_res = self.hotel_service.prebook(offer_dict)
-            prebook_data = prebook_res if isinstance(prebook_res, dict) else {"prebook_id": str(uuid.uuid4())}
+            prebook_data = prebook_res if isinstance(prebook_res, dict) else {}
         except Exception:
-            prebook_data = {"prebook_id": str(uuid.uuid4()), "status": "simulated"}
+            prebook_data = {}
 
+        # Reject simulated prebook: a UUID-only prebook without a real supplier reference
+        # cannot be used as a valid supplier hold. Fail closed rather than continue.
         if not prebook_data.get("prebook_id"):
-            prebook_data["prebook_id"] = str(uuid.uuid4())
+            raise ValueError(
+                "Hotel prebook did not return a valid supplier hold reference. "
+                "Cannot create payment order without an authoritative prebook."
+            )
+        if str(prebook_data.get("status", "")).lower() == "simulated":
+            raise ValueError(
+                "Hotel prebook returned a simulated reference. "
+                "A simulated prebook cannot be used for real payment order creation."
+            )
 
         # 5. Create transaction and payment order
         tx_id = str(uuid.uuid4())
@@ -121,21 +150,7 @@ class HotelBookingService:
 
         order_id = None
         key_id = "test_key"
-        if self.razorpay.configured:
-            try:
-                order = self.razorpay.create_order(
-                    float(amount_inr),
-                    f"hotel_{tx_id[:32]}",
-                    {"transaction_id": tx_id, "provider": offer_dict["provider"], "hotel": offer_dict["hotel_name"][:120]},
-                )
-                order_id = order.get("id")
-                key_id = self.razorpay.key_id
-            except Exception:
-                order_id = f"order_mock_{tx_id[:16]}"
-        else:
-            order_id = f"order_dev_{tx_id[:16]}"
-
-        self.tx_store.create(
+        reservation = self.tx_store.reserve_payment_order(
             id=tx_id,
             customer_ref=effective_customer_ref,
             provider=offer_dict["provider"],
@@ -145,8 +160,42 @@ class HotelBookingService:
             holder=holder,
             guests=guests,
             amount_inr=float(amount_inr),
-            razorpay_order_id=order_id,
+            trip_id=str(trip_id),
+            revision_id=str(revision_id),
+            revision_number=expected_revision_number,
+            payment_idempotency_key=payment_idempotency_key,
         )
+        if reservation["id"] != tx_id:
+            for _ in range(100):
+                if reservation.get("razorpay_order_id"):
+                    return {"success": True, "idempotent_replay": True,
+                            "transaction_id": reservation["id"],
+                            "razorpay_order_id": reservation["razorpay_order_id"]}
+                await asyncio.sleep(0.05)
+                reservation = self.tx_store.get_by_payment_idempotency_key(payment_idempotency_key) or reservation
+            if reservation.get("booking_status") == "payment_order_failed":
+                raise ValueError("The prior hotel payment-order request failed; use a new idempotency key after reviewing its state.")
+            if reservation.get("razorpay_order_id"):
+                return {"success": True, "idempotent_replay": True,
+                        "transaction_id": reservation["id"],
+                        "razorpay_order_id": reservation["razorpay_order_id"]}
+            raise ValueError("A hotel payment order with this idempotency key is still being created.")
+
+        if not self.razorpay.configured:
+            self.tx_store.update(tx_id, payment_status="order_failed", booking_status="payment_order_failed", error="Razorpay is not configured.")
+            raise ValueError("Razorpay is not configured; no payment order was created.")
+        try:
+            order = self.razorpay.create_order(
+                float(amount_inr), f"hotel_{tx_id[:32]}",
+                {"transaction_id": tx_id, "provider": offer_dict["provider"], "hotel": offer_dict["hotel_name"][:120]},
+            )
+            order_id = order.get("id")
+            key_id = self.razorpay.key_id
+        except Exception as exc:
+            self.tx_store.update(tx_id, payment_status="order_failed", booking_status="payment_order_failed", error="Razorpay order creation failed.")
+            raise ValueError("Razorpay payment order creation failed; no payment order was returned.") from exc
+
+        self.tx_store.update(tx_id, razorpay_order_id=order_id)
 
         return {
             "success": True,

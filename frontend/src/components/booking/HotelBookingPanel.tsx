@@ -30,9 +30,9 @@ interface HotelBookingPanelProps {
 
 export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
   hotel,
-  destination = 'Paris, France',
-  startDate = '2026-10-12',
-  endDate = '2026-10-18',
+  destination = '',
+  startDate = '',
+  endDate = '',
   travelersCount = 2,
   hotelState,
   confirmation,
@@ -42,7 +42,7 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
 }) => {
   const [isPreparing, setIsPreparing] = useState(false);
 
-  const roomPrice = hotel ? Number(hotel.total_amount) : 720;
+  const roomPrice = hotel ? Number(hotel.total_amount) : 0;
   const taxes = Math.round(roomPrice * 0.1);
   const total = roomPrice + taxes;
 
@@ -75,12 +75,14 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
         <div className="p-4 rounded-2xl bg-[var(--surface-muted)]/60 border border-[var(--border)] text-xs grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div>
             <span className="text-[var(--text-muted)] block">Room Category</span>
-            <span className="font-semibold text-[var(--text-primary)]">{confirmation.room_name}</span>
+            <span className="font-semibold text-[var(--text-primary)]">{confirmation.room_name || 'Standard'}</span>
           </div>
           <div>
             <span className="text-[var(--text-muted)] block">Dates & Nights</span>
             <span className="font-mono text-[var(--text-primary)]">
-              {confirmation.check_in_date} to {confirmation.check_out_date} ({confirmation.nights_count} nights)
+              {confirmation.check_in_date && confirmation.check_out_date
+                ? `${confirmation.check_in_date} to ${confirmation.check_out_date} (${confirmation.nights_count != null ? `${confirmation.nights_count} nights` : '—'})`
+                : 'Dates as confirmed on voucher'}
             </span>
           </div>
           <div>
@@ -105,7 +107,7 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
               </span>
             </div>
             <h3 className="text-xl sm:text-2xl font-bold font-editorial text-[var(--text-primary)]">
-              {hotel?.name || 'Hotel Lutetia Left Bank'}
+              {hotel?.name || 'Hotel Stay'}
             </h3>
           </div>
 

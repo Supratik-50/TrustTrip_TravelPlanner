@@ -54,9 +54,9 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
     try {
       await onDownloadPdf();
       notify(
-        'Travel plan voucher generated. PDF export adapter triggered.',
+        'Travel plan PDF generated.',
         'success',
-        'Voucher Prepared'
+        'Travel Plan Ready'
       );
     } catch {
       notify('Unable to generate travel PDF. Please retry.', 'error');
@@ -161,10 +161,10 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
 
           <div className="space-y-1">
             <div className="text-xs text-[var(--text-muted)] font-mono">
-              {flightConfirmation?.carrier_name || 'Air France'} · Flight {flightConfirmation?.flight_number || 'AF-257'}
+              {flightConfirmation?.carrier_name || 'Carrier'} · Flight {flightConfirmation?.flight_number || '—'}
             </div>
             <h3 className="text-2xl font-bold font-editorial text-[var(--text-primary)]">
-              {flightConfirmation?.origin_city || 'Kolkata'} → {flightConfirmation?.destination_city || 'Paris'}
+              {flightConfirmation?.origin_city || '—'} → {flightConfirmation?.destination_city || '—'}
             </h3>
             <div className="text-xs text-[var(--text-secondary)] font-light">
               Departure: {trip.start_date} · {flightConfirmation?.cabin_class || 'Economy Premium'}
@@ -210,10 +210,10 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
           <div className="space-y-1">
             <div className="text-xs text-[var(--text-muted)] font-mono">Boutique Property</div>
             <h3 className="text-2xl font-bold font-editorial text-[var(--text-primary)]">
-              {hotelConfirmation?.property_name || 'Hotel Lutetia Left Bank'}
+              {hotelConfirmation?.property_name || 'Property confirmation unavailable'}
             </h3>
             <div className="text-xs text-[var(--text-secondary)] font-light">
-              {hotelConfirmation?.property_address || 'Paris, France'}
+              {hotelConfirmation?.property_address || '—'}
             </div>
           </div>
 
@@ -221,19 +221,19 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
             <div className="flex justify-between items-center">
               <span className="text-[var(--text-muted)]">Voucher Code:</span>
               <span className="font-mono font-bold text-[var(--terracotta)] text-sm">
-                {hotelConfirmation?.confirmation_code || 'TT-HT-8921'}
+                {hotelConfirmation?.confirmation_code || '—'}
               </span>
             </div>
             <div className="flex justify-between items-center">
               <span className="text-[var(--text-muted)]">Stay Duration:</span>
               <span className="font-mono text-[var(--text-primary)]">
-                {trip.start_date} to {trip.end_date} ({hotelConfirmation?.nights_count || 6} nights)
+                {trip.start_date} to {trip.end_date} ({hotelConfirmation?.nights_count ?? '—'} nights)
               </span>
             </div>
             <div className="flex justify-between items-center">
               <span className="text-[var(--text-muted)]">Room Tier:</span>
               <span className="text-[var(--text-primary)] font-medium">
-                {hotelConfirmation?.room_name || 'Deluxe Heritage Room'}
+                {hotelConfirmation?.room_name || 'Not provided by supplier'}
               </span>
             </div>
           </div>

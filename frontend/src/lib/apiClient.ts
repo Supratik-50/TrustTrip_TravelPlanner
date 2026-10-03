@@ -506,6 +506,8 @@ export class ApiClient {
         let message = 'An unexpected error occurred';
         if (typeof errorData?.detail === 'string') {
           message = errorData.detail;
+        } else if (typeof errorData?.error === 'string') {
+          message = errorData.error;
         } else if (Array.isArray(errorData?.detail)) {
           message = errorData.detail
             .map((d: any) => d.msg || `${d.loc?.join('.')}: invalid`)
@@ -888,79 +890,6 @@ export class ApiClient {
       intent.price_change_acknowledged = true;
       intent.status = 'revalidated';
       return intent as unknown as T;
-    }
-
-    // --- Part 5B: Flight Checkout Handoff ---
-    if (endpoint.includes('/bookings/flight') && endpoint.endsWith('/handoff') && method === 'POST') {
-      const parts = endpoint.split('/');
-      const intentId = parts.length > 4 ? parts[4] : (options.body ? JSON.parse(options.body as string).intent_id : 'bkg_int_demo');
-      return {
-        intent_id: intentId,
-        handoff_url: 'https://checkout.duffel.com/simulated-handoff-session',
-        provider: 'Duffel Verified Checkout',
-        expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
-        status: 'handed_off',
-      } as unknown as T;
-    }
-
-    // --- Part 5B: Booking Status Retrieval ---
-    if (endpoint.startsWith('/api/bookings/') && !endpoint.includes('/flight') && !endpoint.includes('/cancel') && method === 'GET') {
-      const bookingId = endpoint.split('/')[3];
-      return {
-        booking_id: bookingId,
-        trip_id: 'trp_kyoto_2026',
-        type: 'flight',
-        status: 'confirmed',
-        confirmation_reference: `TT-FL-${bookingId.slice(-4).toUpperCase() || '8924'}`,
-        ticket_number: undefined,
-        confirmed_at: new Date().toISOString(),
-        total_amount: '860',
-        currency: 'USD',
-        carrier_name: 'Air France',
-        flight_number: 'AF-257',
-        origin: 'Kolkata (CCU)',
-        destination: 'Paris (CDG)',
-        cabin_class: 'Economy Premium',
-      } as unknown as T;
-    }
-
-    // --- Part 5B: Hotel Prebooking ---
-    if (endpoint === '/api/hotels/prebook' && method === 'POST') {
-      const body: HotelPrebookRequest = options.body ? JSON.parse(options.body as string) : {};
-      const prebookResp: HotelPrebookResponse = {
-        prebook_id: `prebook_${Date.now().toString(36)}`,
-        amount: 720,
-        currency: 'USD',
-        razorpay_order_id: `order_${Date.now().toString(36)}`,
-        hotel_name: 'Hotel Lutetia Left Bank',
-        expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
-      };
-      return prebookResp as unknown as T;
-    }
-
-    // --- Part 5B: Hotel Payment ---
-    if (endpoint === '/api/hotels/payment' && method === 'POST') {
-      const body = options.body ? JSON.parse(options.body as string) : {};
-      return {
-        payment_status: 'success',
-        booking_id: `ht_bkg_${Date.now().toString(36)}`,
-        confirmation_code: `TT-HT-${Math.floor(1000 + Math.random() * 9000)}`,
-        property_name: 'Hotel Lutetia Left Bank',
-        room_name: 'Deluxe Heritage King with Garden View',
-        total_paid: 792,
-        currency: 'USD',
-        confirmed_at: new Date().toISOString(),
-      } as unknown as T;
-    }
-
-    // --- Part 5B: Hotel Payment Status ---
-    if (endpoint.startsWith('/api/hotels/payment/') && endpoint.endsWith('/status') && method === 'GET') {
-      const orderId = endpoint.split('/')[4];
-      return {
-        order_id: orderId,
-        status: 'paid',
-        booking_id: `ht_bkg_${orderId}`,
-      } as unknown as T;
     }
 
     // --- Part 5B: Booking Cancellation Intent ---
@@ -1843,19 +1772,9 @@ export class ApiClient {
     cabin_class?: string;
     property_name?: string;
   }> {
-    try {
-      return await this.request<any>(`/api/bookings/${bookingId}`, {
-        method: 'GET',
-      });
-    } catch (err: any) {
-      if (err.code === 'NETWORK_ERROR') {
-        const mock = this.handleMockFallback<any>(`/api/bookings/${bookingId}`, {
-          method: 'GET',
-        });
-        if (mock) return mock;
-      }
-      throw err;
-    }
+    return await this.request<any>(`/api/bookings/${bookingId}`, {
+      method: 'GET',
+    });
   }
 
   // --- Part 5B: Hotel Prebooking ---
@@ -1877,58 +1796,82 @@ export class ApiClient {
     }
   }
 
-  // --- Part 5B: Hotel Payment ---
-  async createHotelPayment(request: {
-    prebook_id: string;
-    payment_method: string;
-    razorpay_payment_id?: string;
-    contact: any;
+  // --- Section 10: Authoritative Hotel Payment Endpoints ---
+  async createHotelPaymentOrder(request: {
+    offer?: any;
+    prebook?: any;
+    holder: any;
+    guests: any[];
+    trip_id: string;
+    revision_id: string;
+    expected_revision_number: number;
+    payment_idempotency_key: string;
+    customer_ref?: string;
+    final_confirmation: boolean;
+    snapshot_id?: string;
   }): Promise<{
-    payment_status: 'success' | 'processing' | 'failed';
-    booking_id: string;
-    confirmation_code: string;
-    property_name: string;
-    room_name?: string;
-    total_paid: number;
+    success: boolean;
+    transaction_id: string;
+    razorpay_order_id?: string;
+    amount_inr: number;
     currency: string;
-    confirmed_at: string;
+    key_id?: string;
+    provider?: string;
+    hotel_name?: string;
+    idempotent_replay?: boolean;
+    snapshot_id?: string;
   }> {
-    try {
-      return await this.request<any>('/api/hotels/payment', {
+    if (request.snapshot_id) {
+      return await this.request<any>('/api/hotel-payments/create-order-from-snapshot', {
         method: 'POST',
-        body: JSON.stringify(request),
+        body: JSON.stringify({
+          snapshot_id: request.snapshot_id,
+          trip_id: request.trip_id,
+          revision_id: request.revision_id,
+          expected_revision_number: request.expected_revision_number,
+          payment_idempotency_key: request.payment_idempotency_key,
+          holder: request.holder,
+          guests: request.guests,
+          customer_ref: request.customer_ref,
+          final_confirmation: request.final_confirmation,
+        }),
       });
-    } catch (err: any) {
-      if (err.code === 'NETWORK_ERROR') {
-        const mock = this.handleMockFallback<any>('/api/hotels/payment', {
-          method: 'POST',
-          body: JSON.stringify(request),
-        });
-        if (mock) return mock;
-      }
-      throw err;
     }
+    return await this.request<any>('/api/hotel-payments/create-order', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
   }
 
-  // --- Part 5B: Hotel Payment Status ---
-  async getHotelPaymentStatus(orderId: string): Promise<{
-    order_id: string;
-    status: 'paid' | 'pending' | 'failed';
-    booking_id?: string;
+  async verifyAndBookHotel(request: {
+    transaction_id: string;
+    razorpay_order_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+    offer: any;
+    prebook: any;
+    holder: any;
+    guests: any[];
+    trip_id: string;
+    revision_id: string;
+    expected_revision_number: number;
+    customer_ref?: string;
+    final_confirmation: boolean;
+  }): Promise<{
+    success: boolean;
+    transaction_id: string;
+    payment_captured: boolean;
+    booking: any;
+    amount_inr: number;
+    already_booked?: boolean;
+    pdf_available?: boolean;
+    requires_refund?: boolean;
+    error?: string;
   }> {
-    try {
-      return await this.request<any>(`/api/hotels/payment/${orderId}/status`, {
-        method: 'GET',
-      });
-    } catch (err: any) {
-      if (err.code === 'NETWORK_ERROR') {
-        const mock = this.handleMockFallback<any>(`/api/hotels/payment/${orderId}/status`, {
-          method: 'GET',
-        });
-        if (mock) return mock;
-      }
-      throw err;
-    }
+    return await this.request<any>('/api/hotel-payments/verify-and-book', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
   }
 
   // --- Part 5B: Booking Cancellation Intent ---

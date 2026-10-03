@@ -72,9 +72,20 @@ class TransactionStore:
                 "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS refund_status TEXT DEFAULT 'none'",
                 "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS passenger_json JSONB NOT NULL DEFAULT '[]'::jsonb",
                 "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+                # Section 10: payment transaction lineage fields
+                "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS trip_id UUID",
+                "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS revision_id UUID",
+                "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS revision_number INT",
+                "ALTER TABLE trust_trip_transactions ADD COLUMN IF NOT EXISTS payment_idempotency_key TEXT",
             ]
             for sql in migrations:
                 conn.execute(sql)
+            # Section 10: ensure idempotency uniqueness index (idempotent)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_trust_trip_transactions_idempotency_key
+                ON trust_trip_transactions (payment_idempotency_key)
+                WHERE payment_idempotency_key IS NOT NULL
+            """)
 
     def create(self, **data: Any) -> str:
         tx_id = str(uuid.uuid4())
@@ -84,8 +95,9 @@ class TransactionStore:
                 (id, customer_ref, offer_id, duffel_order_id, booking_reference,
                  razorpay_order_id, razorpay_payment_id, amount, currency,
                  provider_amount, provider_currency, fx_rate, fx_rate_date, fx_source,
-                 payment_status, booking_status, passenger_json, metadata)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+                 payment_status, booking_status, passenger_json, metadata,
+                 trip_id, revision_id, revision_number, payment_idempotency_key)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
             """, (
                 tx_id,
                 data.get("customer_ref"),
@@ -105,8 +117,71 @@ class TransactionStore:
                 data.get("booking_status", "pending"),
                 json.dumps(data.get("passengers", [])),
                 json.dumps(data.get("metadata", {})),
+                data.get("trip_id"),
+                data.get("revision_id"),
+                data.get("revision_number"),
+                data.get("payment_idempotency_key"),
             ))
         return tx_id
+
+    def reserve_payment_order(self, **data: Any) -> tuple[dict[str, Any], bool]:
+        """Atomically reserve a payment idempotency key before contacting Razorpay."""
+        key = data.get("payment_idempotency_key")
+        if not key:
+            raise ValueError("payment_idempotency_key is required.")
+        tx_id = str(uuid.uuid4())
+        with self._connect() as conn:
+            with conn.transaction():
+                inserted = conn.execute(
+                    """
+                    INSERT INTO trust_trip_transactions
+                    (id, customer_ref, offer_id, amount, currency, provider_amount,
+                     provider_currency, fx_rate, fx_rate_date, fx_source,
+                     payment_status, booking_status, passenger_json, metadata,
+                     trip_id, revision_id, revision_number, payment_idempotency_key)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s)
+                    ON CONFLICT (payment_idempotency_key)
+                    WHERE payment_idempotency_key IS NOT NULL
+                    DO NOTHING
+                    RETURNING *
+                    """,
+                    (
+                        tx_id, data.get("customer_ref"), data.get("offer_id"),
+                        data.get("amount"), data.get("currency", "INR"),
+                        data.get("provider_amount"), data.get("provider_currency"),
+                        data.get("fx_rate"), data.get("fx_rate_date"), data.get("fx_source"),
+                        "reserved", "payment_order_reserved",
+                        json.dumps(data.get("passengers", [])),
+                        json.dumps(data.get("metadata", {})),
+                        data.get("trip_id"), data.get("revision_id"),
+                        data.get("revision_number"), key,
+                    ),
+                ).fetchone()
+                if inserted:
+                    return dict(inserted), True
+                existing = conn.execute(
+                    "SELECT * FROM trust_trip_transactions WHERE payment_idempotency_key=%s FOR UPDATE",
+                    (key,),
+                ).fetchone()
+                if existing:
+                    stored_passengers = existing.get("passenger_json") or []
+                    if isinstance(stored_passengers, str):
+                        stored_passengers = json.loads(stored_passengers)
+                    same_request = (
+                        str(existing.get("customer_ref") or "") == str(data.get("customer_ref") or "")
+                        and str(existing.get("offer_id") or "") == str(data.get("offer_id") or "")
+                        and str(existing.get("trip_id") or "") == str(data.get("trip_id") or "")
+                        and str(existing.get("revision_id") or "") == str(data.get("revision_id") or "")
+                        and int(existing.get("revision_number") or 0) == int(data.get("revision_number") or 0)
+                        and str(existing.get("currency") or "INR").upper() == str(data.get("currency", "INR")).upper()
+                        and float(existing.get("amount") or 0) == float(data.get("amount") or 0)
+                        and float(existing.get("provider_amount") or 0) == float(data.get("provider_amount") or 0)
+                        and str(existing.get("provider_currency") or "").upper() == str(data.get("provider_currency") or "").upper()
+                        and stored_passengers == data.get("passengers", [])
+                    )
+                    if not same_request:
+                        raise ValueError("payment_idempotency_key was already used with a different payment request.")
+                return dict(existing), False
 
     def update(self, tx_id: str, **fields: Any) -> None:
         allowed = {
@@ -115,6 +190,8 @@ class TransactionStore:
             "provider_amount", "provider_currency", "fx_rate", "fx_rate_date", "fx_source",
             "payment_status", "booking_status", "refund_status", "passenger_json",
             "metadata",
+            # Section 10 lineage fields
+            "trip_id", "revision_id", "revision_number", "payment_idempotency_key",
         }
         fields = {k: v for k, v in fields.items() if k in allowed}
         if not fields:
@@ -187,3 +264,11 @@ class TransactionStore:
     def get_by_razorpay_order(self, order_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             return conn.execute("SELECT * FROM trust_trip_transactions WHERE razorpay_order_id=%s", (order_id,)).fetchone()
+
+    def get_by_payment_idempotency_key(self, key: str) -> dict[str, Any] | None:
+        """Return the existing transaction for a payment idempotency key, or None if not found."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM trust_trip_transactions WHERE payment_idempotency_key=%s",
+                (key,),
+            ).fetchone()

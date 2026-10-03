@@ -55,7 +55,6 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   trip,
   onNavigateTab,
   onBackToTrips,
-  initialSubStep = 'review',
 }) => {
   const { notify } = useNotification();
 
@@ -169,7 +168,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
   // Active view section when approved: 'stages' vs 'confirmation'
   const [currentStage, setCurrentStage] = useState<'review' | 'flight_stage' | 'hotel_stage' | 'confirmed'>(
-    initialSubStep === 'confirmation' ? 'confirmed' : 'review'
+    'review'
   );
 
   const selectedFlight = trip.selected_flight_offer as FlightOffer | undefined;
@@ -201,19 +200,13 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       setIsPlanApproved(true);
       if (saved.approvedAt) setApprovedAt(saved.approvedAt);
     }
-    setFlightState(saved.flightState);
-    setFlightConfirmation(saved.flightConfirmation);
-    setHotelState(saved.hotelState);
-    setHotelConfirmation(saved.hotelConfirmation);
+    setFlightState(saved.flightState === 'confirmed' ? 'idle' : saved.flightState);
+    setFlightConfirmation(undefined);
+    setHotelState(saved.hotelState === 'confirmed' ? 'idle' : saved.hotelState);
+    setHotelConfirmation(undefined);
 
-    if (saved.flightState === 'confirmed' && saved.hotelState === 'confirmed') {
-      setCurrentStage('confirmed');
-    } else if (saved.isApproved || trip.is_approved) {
-      if (saved.flightState !== 'confirmed') {
-        setCurrentStage('flight_stage');
-      } else {
-        setCurrentStage('hotel_stage');
-      }
+    if (saved.isApproved || trip.is_approved) {
+      setCurrentStage('flight_stage');
     }
   }, [trip]);
 
@@ -521,6 +514,9 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     setFlightState('booking_in_progress');
     try {
       const res = await bookingService.confirmFlightBooking(bId);
+      if (!res.booking_reference) {
+        throw new Error('Supplier confirmation reference is not available yet.');
+      }
       setBookingReference(res.booking_reference || undefined);
       setOrderId(res.order_id || undefined);
       setPnr(res.pnr || undefined);
@@ -529,20 +525,20 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
       // ISSUE 1 FIX: Truthful confirmation record without fabricated random fallback numbers
       const confRecord: FlightConfirmationRecord = {
-        booking_reference: res.booking_reference || 'Not provided',
+        booking_reference: res.booking_reference,
         ticket_number: res.e_ticket || res.pnr || undefined,
-        carrier_code: selectedFlight?.carrier_code || 'TT',
-        carrier_name: selectedFlight?.carrier_name || 'Airline Partner',
-        flight_number: selectedFlight?.slices?.[0]?.segments?.[0]?.flight_number || 'FL-100',
-        origin_code: selectedFlight?.slices?.[0]?.origin || trip.origin || 'ORIG',
-        origin_city: trip.origin?.split('(')[0]?.trim() || 'Origin',
-        destination_code: selectedFlight?.slices?.[0]?.destination || trip.destination || 'DEST',
-        destination_city: trip.destination?.split('(')[0]?.trim() || 'Destination',
-        departure_time: selectedFlight?.slices?.[0]?.departure_time || trip.start_date || new Date().toISOString(),
-        arrival_time: selectedFlight?.slices?.[0]?.arrival_time || trip.end_date || new Date().toISOString(),
-        cabin_class: selectedFlight?.cabin_class || 'Economy',
-        travelers_count: trip.travelers_count || 1,
-        confirmed_at: new Date().toISOString(),
+        carrier_code: selectedFlight?.carrier_code || '',
+        carrier_name: selectedFlight?.carrier_name || '',
+        flight_number: selectedFlight?.slices?.[0]?.segments?.[0]?.flight_number || '',
+        origin_code: selectedFlight?.slices?.[0]?.origin || '',
+        origin_city: trip.origin?.split('(')[0]?.trim() || '',
+        destination_code: selectedFlight?.slices?.[0]?.destination || '',
+        destination_city: trip.destination?.split('(')[0]?.trim() || '',
+        departure_time: selectedFlight?.slices?.[0]?.departure_time || '',
+        arrival_time: selectedFlight?.slices?.[0]?.arrival_time || '',
+        cabin_class: selectedFlight?.cabin_class || '',
+        travelers_count: trip.travelers_count || 0,
+        confirmed_at: '',
         status: 'ticketed',
       };
       setFlightConfirmation(confRecord);
@@ -563,8 +559,11 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     } catch (err: any) {
       if (err.statusCode === 409) {
         if (err.detail?.duplicate_attempt) {
-          setFlightState('confirmed');
-          notify('Booking was already confirmed.', 'info', 'Already Confirmed');
+          // A duplicate conflict is not confirmation evidence. The UI must wait
+          // until a persisted supplier booking result can be retrieved.
+          setFlightState('booking_in_progress');
+          setErrorMessage('This booking is already being processed. Refresh its status before treating it as confirmed.');
+          notify('Booking status is still being verified by the supplier.', 'info', 'Verification Pending');
           return;
         }
         // Price changed during confirmation
@@ -599,24 +598,9 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     }
   };
 
-  // External Checkout Simulation (Legacy fallback)
-  const handleCompleteCheckoutHandoff = async () => {
-    const confirmRec = await bookingService.confirmFlightHandoffReturn(trip.trip_id, 'token_123');
-    setFlightConfirmation(confirmRec);
-    setFlightState('confirmed');
-    notify(`Flight ticket issued! Reference: ${confirmRec.booking_reference}`, 'success', 'Flight Confirmed');
-
-    // If hotel is already confirmed, advance to full confirmation
-    if (hotelState === 'confirmed') {
-      setCurrentStage('confirmed');
-    } else {
-      setCurrentStage('hotel_stage');
-    }
-  };
-
   // Prepare Hotel Booking
   const handlePrepareHotel = async () => {
-    await bookingService.prepareHotelBooking(trip.trip_id, selectedHotel?.id || 'ht_off_101');
+    await bookingService.prepareHotelBooking(trip.trip_id, selectedHotel?.id || 'ht_off_101', selectedHotel);
     setHotelState('payment_required');
     notify('Stay reservation prepared. Ready for payment confirmation.', 'info', 'Reservation Prepared');
   };
@@ -626,7 +610,26 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
     travelerContact: TravelerContactInfo
   ) => {
-    const confirmRec = await bookingService.processHotelPayment(trip.trip_id, method, travelerContact);
+    if (
+      !activeAuthorization ||
+      !activeAuthorization.revision_id ||
+      typeof activeAuthorization.revision_number !== 'number' ||
+      activeAuthorization.revision_number < 1
+    ) {
+      const authErr = new Error('Active booking authorization is required before processing hotel payment. Please authorize the plan revision first.');
+      notify(authErr.message, 'error', 'Authorization Required');
+      throw authErr;
+    }
+
+    const revId = activeAuthorization.revision_id;
+    const revNum = activeAuthorization.revision_number;
+    const confirmRec = await bookingService.processHotelPayment(
+      trip.trip_id,
+      method,
+      travelerContact,
+      revId,
+      revNum
+    );
     setHotelConfirmation(confirmRec);
     setHotelState('confirmed');
     notify(`Stay reserved! Voucher code: ${confirmRec.confirmation_code}`, 'success', 'Stay Confirmed');
@@ -923,24 +926,23 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       <CheckoutHandoffModal
         isOpen={isHandoffModalOpen}
         onClose={() => setIsHandoffModalOpen(false)}
-        origin={trip.origin || 'Kolkata'}
-        destination={trip.destination || 'Paris'}
-        date={trip.start_date || '2026-10-12'}
+        origin={trip.origin || ''}
+        destination={trip.destination || ''}
+        date={trip.start_date || ''}
         amount={verifiedFlightAmount}
         currency={selectedFlight?.currency || trip.currency || 'USD'}
-        onSimulateComplete={handleCompleteCheckoutHandoff}
       />
 
       {/* Hotel Payment Modal (Simulated Razorpay) */}
       <PaymentReviewModal
         isOpen={isPaymentModalOpen}
         onClose={() => setIsPaymentModalOpen(false)}
-        hotelName={selectedHotel?.name || 'Hotel Lutetia Left Bank'}
-        roomName={selectedHotel?.rooms?.[0]?.name || 'Deluxe Heritage King'}
-        startDate={trip.start_date || '2026-10-12'}
-        endDate={trip.end_date || '2026-10-18'}
-        guestsCount={trip.travelers_count || 2}
-        roomAmount={selectedHotel ? Number(selectedHotel.total_amount) : 720}
+        hotelName={selectedHotel?.name || ''}
+        roomName={selectedHotel?.rooms?.[0]?.name || ''}
+        startDate={trip.start_date || ''}
+        endDate={trip.end_date || ''}
+        guestsCount={trip.travelers_count || 0}
+        roomAmount={selectedHotel ? Number(selectedHotel.total_amount) : 0}
         taxesAmount={Math.round((selectedHotel ? Number(selectedHotel.total_amount) : 720) * 0.1)}
         currency={selectedHotel?.currency || trip.currency || 'USD'}
         contact={contact}

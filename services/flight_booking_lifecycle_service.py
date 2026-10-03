@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import psycopg
+from fastapi import HTTPException
 from psycopg.rows import dict_row
 
 from domain.booking_lifecycle import (
@@ -632,10 +633,15 @@ class FlightBookingLifecycleService:
         trip_id: UUID | str,
         snapshot_id: UUID | str,
         passengers: list[PassengerBookingModel],
+        revision_id: UUID | str | None = None,
+        expected_revision_number: int | None = None,
         booking_mode: BookingMode = BookingMode.DUFFEL_LINK,
         idempotency_key: str = "",
     ) -> BookingIntent:
-        """Create a new BookingIntent bound to trip, tenant, snapshot, and authoritative revision."""
+        """Create a new BookingIntent bound to trip, tenant, snapshot, and authoritative revision.
+
+        Section 10: Calls assert_booking_eligible before creating the intent.
+        """
         if not idempotency_key:
             idempotency_key = str(uuid4())
         else:
@@ -663,6 +669,21 @@ class FlightBookingLifecycleService:
 
         prep_lock = await self._get_intent_lock(f"prep:{uid_str}:{idempotency_key}")
         async with prep_lock:
+            # 0. Section 10 — Section 9 eligibility gate
+            from services.authorization_store import AuthorizationStore
+            auth_store = AuthorizationStore()
+            try:
+                auth_store.assert_booking_eligible(
+                    trip_id=trip_id,
+                    user_id=user_id,
+                    revision_id=revision_id,
+                    expected_revision_number=expected_revision_number,
+                )
+            except HTTPException as _http_err:
+                if _http_err.status_code == 404 and "Trip not found" in str(_http_err.detail):
+                    raise OwnershipViolationException(f"Trip '{tid_str}' not found or access denied.")
+                raise
+
             # 1. Authenticate trip ownership
             trip = self.trip_store.get_trip(trip_id, user_id)
             if not trip:
@@ -824,6 +845,8 @@ class FlightBookingLifecycleService:
         user_id: UUID | str,
         intent_id: UUID | str,
         accepted_amount: Decimal | None = None,
+        revision_id: UUID | str = "",
+        expected_revision_number: int = 0,
         idempotency_key: str = "",
     ) -> OfferRevalidationResult:
         """Revalidate live supplier offer before checkout handoff."""
@@ -847,6 +870,8 @@ class FlightBookingLifecycleService:
         lock = await self._get_intent_lock(intent_id)
         async with lock:
             intent = await self.get_booking_intent(user_id, intent_id)
+            if str(intent.revision_id) != str(revision_id):
+                raise StaleRevisionException("Requested revision does not match the booking intent.")
 
             # Check revision
             trip = self.trip_store.get_trip(intent.trip_id, user_id)
@@ -860,6 +885,8 @@ class FlightBookingLifecycleService:
             trip_rev_id = trip.get("current_revision_id")
             if trip_rev_id and str(intent.revision_id) != str(trip_rev_id):
                 rev_mismatch = True
+            if expected_revision_number and expected_revision_number != current_rev_num:
+                rev_mismatch = True
 
             if rev_mismatch or intent.status == BookingStatus.EXPIRED:
                 if intent.status != BookingStatus.EXPIRED:
@@ -869,6 +896,14 @@ class FlightBookingLifecycleService:
                 raise StaleRevisionException(
                     f"Trip revision has advanced to {current_rev_num} or intent is expired; current booking intent is stale."
                 )
+
+            from services.authorization_store import AuthorizationStore
+            AuthorizationStore().assert_booking_eligible(
+                trip_id=intent.trip_id,
+                user_id=user_id,
+                revision_id=revision_id,
+                expected_revision_number=expected_revision_number,
+            )
 
             # Price acknowledgement handling
             current_status = intent.status
@@ -1009,6 +1044,8 @@ class FlightBookingLifecycleService:
         booking_mode: BookingMode | None = None,
         accepted_amount: Decimal | None = None,
         payment: dict[str, Any] | None = None,
+        revision_id: UUID | str = "",
+        expected_revision_number: int = 0,
         idempotency_key: str = "",
     ) -> FlightHandoffDestinationResponse:
         """Generate verified external booking handoff with fresh pre-handoff revalidation."""
@@ -1042,10 +1079,14 @@ class FlightBookingLifecycleService:
                     booking_mode=booking_mode,
                     accepted_amount=accepted_amount,
                     payment=payment,
+                    revision_id=revision_id,
+                    expected_revision_number=expected_revision_number,
                     idempotency_key=idempotency_key,
                 )
 
             intent = await self.get_booking_intent(user_id, intent_id)
+            if str(intent.revision_id) != str(revision_id):
+                raise StaleRevisionException("Requested revision does not match the booking intent.")
 
             # 1. State machine check
             if intent.status != BookingStatus.READY_FOR_BOOKING:
@@ -1062,9 +1103,17 @@ class FlightBookingLifecycleService:
             intent_rev_num = meta.get("trip_revision")
             trip_rev_id = trip.get("current_revision_id")
             rev_mismatch = (intent_rev_num is not None and intent_rev_num != current_rev_num) or (trip_rev_id and str(intent.revision_id) != str(trip_rev_id))
+            if expected_revision_number != current_rev_num:
+                rev_mismatch = True
             if rev_mismatch:
                 self._update_intent_status_cas(intent.id, intent.status, BookingStatus.EXPIRED, reason="REVISION_SUPERSEDED")
                 raise StaleRevisionException("Trip revision advanced; booking intent is stale.")
+
+            from services.authorization_store import AuthorizationStore
+            AuthorizationStore().assert_booking_eligible(
+                trip_id=intent.trip_id, user_id=user_id,
+                revision_id=revision_id, expected_revision_number=expected_revision_number,
+            )
 
             # 3. Accepted amount verification
             if accepted_amount is not None and abs(accepted_amount - intent.expected_amount) > Decimal("0.01"):
@@ -1271,6 +1320,8 @@ class FlightBookingLifecycleService:
         booking_mode: BookingMode | None,
         accepted_amount: Decimal | None,
         payment: dict[str, Any] | None,
+        revision_id: UUID | str,
+        expected_revision_number: int,
         idempotency_key: str,
     ) -> FlightHandoffDestinationResponse:
         """Execute handoff sequence under PostgreSQL SELECT ... FOR UPDATE row-level lock."""
@@ -1292,6 +1343,10 @@ class FlightBookingLifecycleService:
                     raise OwnershipViolationException(f"Booking intent '{iid_str}' not found or access denied.")
 
                 intent = BookingIntent.model_validate(dict(row))
+                if str(intent.revision_id) != str(revision_id):
+                    raise StaleRevisionException("Requested revision does not match the booking intent.")
+                if int(expected_revision_number) != int((intent.metadata or {}).get("trip_revision", expected_revision_number)):
+                    raise StaleRevisionException("Requested revision number does not match the booking intent.")
 
                 # 2. State machine check
                 if intent.status != BookingStatus.READY_FOR_BOOKING:
@@ -1314,6 +1369,23 @@ class FlightBookingLifecycleService:
                         (datetime.now(timezone.utc), iid_str),
                     )
                     raise StaleRevisionException("Trip revision advanced; booking intent is stale.")
+
+                # 3b. Section 10 — Section 9 eligibility re-check at the irreversible handoff boundary
+                # Re-run guard immediately before provider-order creation even if it passed at prepare.
+                try:
+                    from services.authorization_store import AuthorizationStore
+                    AuthorizationStore().assert_booking_eligible(
+                        trip_id=intent.trip_id,
+                        user_id=user_id,
+                        revision_id=revision_id,
+                        expected_revision_number=expected_revision_number,
+                    )
+                except Exception as _elig_err:
+                    conn.execute(
+                        "UPDATE booking_intents SET status = 'EXPIRED', updated_at = %s WHERE id = %s",
+                        (datetime.now(timezone.utc), iid_str),
+                    )
+                    raise
 
                 # 4. Accepted amount verification
                 if accepted_amount is not None and abs(accepted_amount - intent.expected_amount) > Decimal("0.01"):

@@ -50,6 +50,7 @@ from domain.booking_lifecycle import (
     UnauthorizedCallbackException,
     validate_idempotency_key,
 )
+from domain.booking_authorization import BookingEligibilityError
 from domain.user import UserResponse
 from services.flight_booking_lifecycle_service import FlightBookingLifecycleService
 from services.flight_provider import FlightProviderRateLimitError
@@ -87,9 +88,19 @@ def _handle_booking_exception(exc: Exception) -> None:
         )
     if isinstance(exc, OwnershipViolationException):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=status.HTTP_409_CONFLICT,
             detail={"code": "OWNERSHIP_VIOLATION", "message": str(exc)},
         )
+    # Section 10: Section 9 eligibility gate rejections
+    try:
+        from domain.booking_authorization import BookingEligibilityError
+        if isinstance(exc, BookingEligibilityError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "BOOKING_NOT_ELIGIBLE", "message": str(exc)},
+            )
+    except ImportError:
+        pass
     if isinstance(exc, FareChangedException):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -188,6 +199,8 @@ async def prepare_flight_booking(
             user_id=current_user.id,
             trip_id=req.trip_id,
             snapshot_id=req.snapshot_id,
+            revision_id=req.revision_id,
+            expected_revision_number=req.expected_revision_number,
             passengers=req.passengers,
             booking_mode=req.booking_mode,
             idempotency_key=validated_key,
@@ -200,19 +213,21 @@ async def prepare_flight_booking(
 @router.post("/flight/{id}/revalidate", response_model=OfferRevalidationResult)
 async def revalidate_flight_booking(
     id: UUID,
-    req: RevalidateFlightBookingRequest | None = Body(default=None),
+    req: RevalidateFlightBookingRequest,
     current_user: UserResponse = Depends(get_current_user),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     """Revalidate live supplier offer before checkout handoff."""
     service = _service()
-    accepted_amount = req.accepted_amount if req else None
+    accepted_amount = req.accepted_amount
     try:
         validated_key = validate_idempotency_key(idempotency_key)
         result = await service.revalidate_booking_intent(
             user_id=current_user.id,
             intent_id=id,
             accepted_amount=accepted_amount,
+            revision_id=req.revision_id,
+            expected_revision_number=req.expected_revision_number,
             idempotency_key=validated_key,
         )
         return result
@@ -223,15 +238,15 @@ async def revalidate_flight_booking(
 @router.post("/flight/{id}/handoff", response_model=FlightHandoffDestinationResponse)
 async def handoff_flight_booking(
     id: UUID,
-    req: HandoffFlightBookingRequest | None = Body(default=None),
+    req: HandoffFlightBookingRequest,
     current_user: UserResponse = Depends(get_current_user),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     """Generate verified external checkout destination with fresh pre-handoff revalidation."""
     service = _service()
-    booking_mode = req.booking_mode if req else None
-    accepted_amount = req.accepted_amount if req else None
-    payment = req.payment if req else None
+    booking_mode = req.booking_mode
+    accepted_amount = req.accepted_amount
+    payment = req.payment
     try:
         validated_key = validate_idempotency_key(idempotency_key)
         dest = await service.handoff_booking(
@@ -240,6 +255,8 @@ async def handoff_flight_booking(
             booking_mode=booking_mode,
             accepted_amount=accepted_amount,
             payment=payment,
+            revision_id=req.revision_id,
+            expected_revision_number=req.expected_revision_number,
             idempotency_key=validated_key,
         )
         return dest

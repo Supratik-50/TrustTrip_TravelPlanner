@@ -405,11 +405,16 @@ class BookingIntent(BaseModel):
 # ============================================================================
 
 class PrepareFlightBookingRequest(BaseModel):
-    """Client request to prepare a flight booking intent."""
+    """Client request to prepare a flight booking intent.
+
+    Section 10: exact revision identity is mandatory for every booking operation.
+    """
     model_config = ConfigDict(extra="forbid")
 
     trip_id: UUID
     snapshot_id: UUID
+    revision_id: UUID
+    expected_revision_number: int = Field(ge=1)
     passengers: list[PassengerBookingModel] = Field(min_length=1, max_length=9)
     booking_mode: BookingMode = BookingMode.DUFFEL_LINK
 
@@ -419,6 +424,8 @@ class RevalidateFlightBookingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     accepted_amount: Decimal | None = None
+    revision_id: UUID
+    expected_revision_number: int = Field(ge=1)
 
 
 class HandoffFlightBookingRequest(BaseModel):
@@ -428,6 +435,8 @@ class HandoffFlightBookingRequest(BaseModel):
     booking_mode: BookingMode | None = None
     accepted_amount: Decimal | None = None
     payment: SandboxBalancePaymentModel | None = None  # Used exclusively for sandbox balance demo
+    revision_id: UUID
+    expected_revision_number: int = Field(ge=1)
 
 
 class CancelFlightBookingRequest(BaseModel):

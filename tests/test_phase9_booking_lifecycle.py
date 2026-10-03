@@ -86,6 +86,10 @@ def clean_env(monkeypatch):
     TripStore._IN_MEMORY_TRIPS.clear()
     TripStore._IN_MEMORY_THREADS.clear()
     EvidenceRevisionStore._IN_MEMORY_REVISIONS.clear()
+    EvidenceRevisionStore._IN_MEMORY_APPROVALS.clear()
+    EvidenceRevisionStore._IN_MEMORY_REJECTIONS.clear()
+    from services.authorization_store import AuthorizationStore
+    AuthorizationStore._IN_MEMORY_AUTHORIZATIONS.clear()
     SearchSessionStore._IN_MEMORY_SESSIONS.clear()
     SearchSessionStore._IN_MEMORY_SNAPSHOTS.clear()
     SearchSessionStore._IN_MEMORY_REVALIDATIONS.clear()
@@ -93,6 +97,38 @@ def clean_env(monkeypatch):
     FlightBookingLifecycleService._IN_MEMORY_ATTEMPTS.clear()
     FlightBookingLifecycleService._IN_MEMORY_TRANSITIONS.clear()
     FlightBookingLifecycleService._IN_MEMORY_INTENT_LOCKS.clear()
+
+    orig_prepare = FlightBookingLifecycleService.prepare_booking_intent
+    orig_revalidate = FlightBookingLifecycleService.revalidate_booking_intent
+    orig_handoff = FlightBookingLifecycleService.handoff_booking
+
+    async def _test_prepare(self, user_id, trip_id, snapshot_id, passengers, revision_id=None, expected_revision_number=None, **kwargs):
+        if revision_id is None:
+            trip = self.trip_store.get_trip(trip_id, user_id)
+            if trip:
+                revision_id = trip.get("current_revision_id")
+                expected_revision_number = trip.get("current_revision_number", 1)
+        return await orig_prepare(self, user_id, trip_id, snapshot_id, passengers, revision_id=revision_id, expected_revision_number=expected_revision_number, **kwargs)
+
+    async def _test_revalidate(self, user_id, intent_id, accepted_amount=None, revision_id="", expected_revision_number=0, **kwargs):
+        if not revision_id:
+            intent = await self.get_booking_intent(user_id, intent_id)
+            if intent:
+                revision_id = intent.revision_id
+                expected_revision_number = (intent.metadata or {}).get("trip_revision", 1)
+        return await orig_revalidate(self, user_id, intent_id, accepted_amount=accepted_amount, revision_id=revision_id, expected_revision_number=expected_revision_number, **kwargs)
+
+    async def _test_handoff(self, user_id, intent_id, booking_mode=None, accepted_amount=None, payment=None, revision_id="", expected_revision_number=0, **kwargs):
+        if not revision_id:
+            intent = await self.get_booking_intent(user_id, intent_id)
+            if intent:
+                revision_id = intent.revision_id
+                expected_revision_number = (intent.metadata or {}).get("trip_revision", 1)
+        return await orig_handoff(self, user_id, intent_id, booking_mode=booking_mode, accepted_amount=accepted_amount, payment=payment, revision_id=revision_id, expected_revision_number=expected_revision_number, **kwargs)
+
+    monkeypatch.setattr(FlightBookingLifecycleService, "prepare_booking_intent", _test_prepare)
+    monkeypatch.setattr(FlightBookingLifecycleService, "revalidate_booking_intent", _test_revalidate)
+    monkeypatch.setattr(FlightBookingLifecycleService, "handoff_booking", _test_handoff)
 
 
 def _auth_user(email: str) -> tuple[TestClient, UUID]:
@@ -121,27 +157,70 @@ def _setup_trip_with_flight(
 
     # 1. Create Trip & published revision
     rev_id = uuid4()
+    canonical_meta = {
+        "departure_date": "2026-12-01",
+        "return_date": "2026-12-10",
+        "passengers": passenger_count,
+    }
     trip = trip_store.create_trip(
         user_id=user_id,
         title="London Vacation",
         destination="LHR",
         origin="DEL",
-        status="planning",
+        status="approved",
+        metadata=canonical_meta,
         current_revision_number=1,
         current_revision_id=rev_id,
     )
+    trip["departure_date"] = "2026-12-01"
+    trip["return_date"] = "2026-12-10"
+    trip["passengers"] = passenger_count
+    TripStore._IN_MEMORY_TRIPS[str(trip["id"])]["departure_date"] = "2026-12-01"
+    TripStore._IN_MEMORY_TRIPS[str(trip["id"])]["return_date"] = "2026-12-10"
+    TripStore._IN_MEMORY_TRIPS[str(trip["id"])]["passengers"] = passenger_count
+
+    plan_snap = {
+        "origin": "DEL",
+        "destination": "LHR",
+        "departure_date": "2026-12-01",
+        "return_date": "2026-12-10",
+        "passengers": passenger_count,
+        "constraints": {"origin": "DEL", "destination": "LHR"},
+    }
     rev = PlanRevision(
         revision_id=rev_id,
         trip_id=trip["id"],
         user_id=user_id,
         revision_number=1,
         change_set={},
-        plan_snapshot={"constraints": {"origin": "DEL", "destination": "LHR"}},
+        plan_snapshot=plan_snap,
         is_published=True,
         published_at=now,
         created_at=now,
     )
     ev_store._IN_MEMORY_REVISIONS[str(rev_id)] = rev
+    from domain.plan_approval import PlanApproval
+    appr = PlanApproval(
+        approval_id=uuid4(),
+        revision_id=rev_id,
+        trip_id=trip["id"],
+        approved_by_user_id=user_id,
+        approved_at=now,
+    )
+    ev_store._IN_MEMORY_APPROVALS[str(appr.approval_id)] = appr
+
+    from domain.booking_authorization import BookingAuthorization
+    from services.authorization_store import AuthorizationStore
+    auth_store = AuthorizationStore()
+    auth_rec = BookingAuthorization(
+        authorization_id=uuid4(),
+        trip_id=UUID(str(trip["id"])),
+        revision_id=rev_id,
+        user_id=user_id,
+        revision_number=1,
+        authorized_at=now,
+    )
+    auth_store._IN_MEMORY_AUTHORIZATIONS[str(auth_rec.authorization_id)] = auth_rec
 
     # 2. Create search session bound to trip revision
     session = snap_store.create_session(
@@ -723,6 +802,8 @@ def test_api_full_booking_lifecycle_duffel_link():
         json={
             "trip_id": str(trip["id"]),
             "snapshot_id": str(snap_id),
+            "revision_id": str(trip["current_revision_id"]),
+            "expected_revision_number": 1,
             "passengers": [
                 {
                     "given_name": "Supratik",
@@ -775,7 +856,10 @@ def test_api_full_booking_lifecycle_duffel_link():
         # 2. POST /api/bookings/flight/{id}/revalidate
         reval_res = client.post(
             f"/api/bookings/flight/{intent_id}/revalidate",
-            json={},
+            json={
+                "revision_id": str(trip["current_revision_id"]),
+                "expected_revision_number": 1,
+            },
             headers={"Idempotency-Key": "k_api_02"},
         )
         assert reval_res.status_code == 200
@@ -786,7 +870,11 @@ def test_api_full_booking_lifecycle_duffel_link():
         # 3. POST /api/bookings/flight/{id}/handoff
         handoff_res = client.post(
             f"/api/bookings/flight/{intent_id}/handoff",
-            json={"booking_mode": "duffel_link"},
+            json={
+                "booking_mode": "duffel_link",
+                "revision_id": str(trip["current_revision_id"]),
+                "expected_revision_number": 1,
+            },
             headers={"Idempotency-Key": "k_api_03"},
         )
         assert handoff_res.status_code == 200
@@ -809,6 +897,8 @@ def test_api_cancel_booking_intent():
         json={
             "trip_id": str(trip["id"]),
             "snapshot_id": str(snap_id),
+            "revision_id": str(trip["current_revision_id"]),
+            "expected_revision_number": 1,
             "passengers": [
                 {
                     "given_name": "Jane",
@@ -1026,6 +1116,8 @@ def test_acceptance_J_two_workers_same_idempotency_key_one_claim():
     payload = {
         "trip_id": str(trip["id"]),
         "snapshot_id": str(snap_id),
+        "revision_id": str(trip["current_revision_id"]),
+        "expected_revision_number": 1,
         "passengers": [{"given_name": "Bob", "family_name": "Smith", "born_on": "1990-01-01", "title": "mr", "gender": "m"}],
     }
     r1 = client.post("/api/bookings/flight/prepare", json=payload, headers={"Idempotency-Key": "claim_idem_100"})
@@ -1041,11 +1133,15 @@ def test_acceptance_K_same_key_conflicting_payload_rejected():
     payload1 = {
         "trip_id": str(trip["id"]),
         "snapshot_id": str(snap_id),
+        "revision_id": str(trip["current_revision_id"]),
+        "expected_revision_number": 1,
         "passengers": [{"given_name": "Bob", "family_name": "Smith", "born_on": "1990-01-01", "title": "mr", "gender": "m"}],
     }
     payload2 = {
         "trip_id": str(trip["id"]),
         "snapshot_id": str(snap_id),
+        "revision_id": str(trip["current_revision_id"]),
+        "expected_revision_number": 1,
         "passengers": [{"given_name": "Alice", "family_name": "Smith", "born_on": "1992-02-02", "title": "ms", "gender": "f"}],
     }
     r1 = client.post("/api/bookings/flight/prepare", json=payload1, headers={"Idempotency-Key": "key_conflict_01"})

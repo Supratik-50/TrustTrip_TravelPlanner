@@ -56,10 +56,18 @@ class FlightHandoffRequest(BaseModel):
 
 
 class HotelCheckoutSnapshotRequest(BaseModel):
-    """Client request to create hotel payment order via verified snapshot_id."""
+    """Client request to create hotel payment order via verified snapshot_id.
+
+    Section 10 requires exact revision identity and a database-backed payment
+    idempotency key before creating a payment order.
+    """
     model_config = ConfigDict(extra="forbid")
 
     snapshot_id: UUID
+    trip_id: UUID
+    revision_id: UUID
+    expected_revision_number: int = Field(ge=1)
+    payment_idempotency_key: str = Field(min_length=1, max_length=255)
     holder: dict[str, Any]
     guests: list[dict[str, Any]]
     customer_ref: str | None = None
