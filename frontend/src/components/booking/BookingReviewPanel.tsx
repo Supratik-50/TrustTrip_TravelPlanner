@@ -14,7 +14,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { TripDetail } from '../../types/trip';
-import { FlightOffer } from '../../types/flight';
+import { FlightOffer, FlightPassenger } from '../../types/flight';
 import { HotelOffer } from '../../types/hotel';
 import { TravelerContactInfo } from '../../types/bookingFrontend';
 import { BookingStatusBadge } from './BookingStatusBadge';
@@ -24,9 +24,11 @@ interface BookingReviewPanelProps {
   trip: TripDetail;
   flight?: FlightOffer;
   hotel?: HotelOffer;
-  contact: TravelerContactInfo;
+  contact?: TravelerContactInfo;
+  travelers?: FlightPassenger[];
   isApproved: boolean;
   onEditSection?: (section: 'flights' | 'hotels' | 'itinerary') => void;
+  onEditTravelers?: () => void;
 }
 
 export const BookingReviewPanel: React.FC<BookingReviewPanelProps> = ({
@@ -34,15 +36,25 @@ export const BookingReviewPanel: React.FC<BookingReviewPanelProps> = ({
   flight,
   hotel,
   contact,
+  travelers,
   isApproved,
   onEditSection,
+  onEditTravelers,
 }) => {
-  const flightAmount = flight ? Number(flight.total_amount) : 0;
-  const hotelAmount = hotel ? Number(hotel.total_amount) : 0;
+  const flightAmount = flight ? Number(flight.total_amount || flight.price || 0) : 0;
+  const hotelAmount = hotel ? Number(hotel.total_amount || hotel.price || 0) : 0;
   const subtotal = flightAmount + hotelAmount;
   const estimatedTaxes = Math.round(subtotal * 0.08);
   const grandTotal = subtotal + estimatedTaxes;
-  const bookingCurrency = trip.currency || flight?.currency || hotel?.currency || 'INR';
+  const flightCurrency = flight?.currency || trip.currency || 'USD';
+  const hotelCurrency = hotel?.currency || trip.currency || 'INR';
+  const bookingCurrency = (flight && !hotel)
+    ? flightCurrency
+    : (hotel && !flight)
+    ? hotelCurrency
+    : (flight?.currency === hotel?.currency && flight?.currency)
+    ? flight.currency
+    : (trip.currency || flight?.currency || hotel?.currency || 'INR');
 
   const calculateDays = () => {
     if (!trip.start_date || !trip.end_date) return '6 days';
@@ -192,27 +204,80 @@ export const BookingReviewPanel: React.FC<BookingReviewPanelProps> = ({
 
         <div className="p-6 rounded-3xl border border-[var(--border)] bg-[var(--surface)] space-y-6 text-xs sm:text-sm">
           {/* Traveler Information */}
-          <div className="space-y-2">
-            <span className="font-semibold font-mono text-[var(--text-primary)] uppercase tracking-wider text-xs flex items-center gap-1.5">
-              <Users className="w-3.5 h-3.5 text-[var(--primary)]" />
-              Primary Traveler & Contact
-            </span>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-4 rounded-2xl bg-[var(--surface-muted)]/50 border border-[var(--border)] text-xs">
-              <div>
-                <span className="text-[var(--text-muted)] block">Full Name</span>
-                <span className="font-semibold text-[var(--text-primary)]">
-                  {contact.first_name} {contact.last_name}
-                </span>
-              </div>
-              <div>
-                <span className="text-[var(--text-muted)] block">Email Address</span>
-                <span className="font-mono text-[var(--text-primary)]">{contact.email}</span>
-              </div>
-              <div>
-                <span className="text-[var(--text-muted)] block">Contact Mobile</span>
-                <span className="font-mono text-[var(--text-primary)]">{contact.phone}</span>
-              </div>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="font-semibold font-mono text-[var(--text-primary)] uppercase tracking-wider text-xs flex items-center gap-1.5">
+                <Users className="w-3.5 h-3.5 text-[var(--primary)]" />
+                Travelers & Passenger Details ({travelers?.length || trip.travelers_count || 1})
+              </span>
+              {onEditTravelers && (
+                <button
+                  type="button"
+                  onClick={onEditTravelers}
+                  className="px-2.5 py-1 rounded-lg text-xs font-mono font-medium bg-[var(--primary)]/10 text-[var(--primary)] hover:bg-[var(--primary)]/20 transition-colors cursor-pointer"
+                >
+                  Edit Travelers
+                </button>
+              )}
             </div>
+
+            {travelers && travelers.length > 0 ? (
+              <div className="space-y-2">
+                {travelers.map((t, idx) => {
+                  const isFilled = Boolean(t.given_name?.trim() && t.family_name?.trim());
+                  return (
+                    <div
+                      key={idx}
+                      className="grid grid-cols-1 sm:grid-cols-4 gap-3 p-3.5 rounded-2xl bg-[var(--surface-muted)]/50 border border-[var(--border)] text-xs"
+                    >
+                      <div>
+                        <span className="text-[var(--text-muted)] block text-[11px] font-mono">
+                          Passenger {idx + 1} {idx === 0 ? '(Lead)' : ''}
+                        </span>
+                        <span className={`font-semibold ${isFilled ? 'text-[var(--text-primary)]' : 'text-amber-400 font-mono'}`}>
+                          {isFilled ? `${t.title ? `${t.title.toUpperCase()} ` : ''}${t.given_name} ${t.family_name}` : 'Details Required'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[var(--text-muted)] block text-[11px] font-mono">Date of Birth</span>
+                        <span className="font-mono text-[var(--text-primary)]">
+                          {t.born_on || 'Not set'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[var(--text-muted)] block text-[11px] font-mono">Gender</span>
+                        <span className="font-mono text-[var(--text-primary)] capitalize">
+                          {t.gender === 'f' ? 'Female' : t.gender === 'm' ? 'Male' : t.gender === 'x' ? 'Other' : 'Not set'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[var(--text-muted)] block text-[11px] font-mono">Contact</span>
+                        <span className="font-mono text-[var(--text-primary)] truncate block">
+                          {t.email || t.phone_number || 'None'}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : contact ? (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-4 rounded-2xl bg-[var(--surface-muted)]/50 border border-[var(--border)] text-xs">
+                <div>
+                  <span className="text-[var(--text-muted)] block">Full Name</span>
+                  <span className="font-semibold text-[var(--text-primary)]">
+                    {contact.first_name} {contact.last_name}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[var(--text-muted)] block">Email Address</span>
+                  <span className="font-mono text-[var(--text-primary)]">{contact.email}</span>
+                </div>
+                <div>
+                  <span className="text-[var(--text-muted)] block">Contact Mobile</span>
+                  <span className="font-mono text-[var(--text-primary)]">{contact.phone}</span>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           {/* Conditions Grid */}
@@ -275,13 +340,13 @@ export const BookingReviewPanel: React.FC<BookingReviewPanelProps> = ({
               <div className="flex justify-between text-[var(--text-secondary)]">
                 <span>Flight Transportation ({trip.travelers_count || 2} travelers):</span>
                 <span className="font-mono text-[var(--text-primary)]">
-                  {formatCurrency(flightAmount, bookingCurrency)}
+                  {formatCurrency(flightAmount, flightCurrency)}
                 </span>
               </div>
               <div className="flex justify-between text-[var(--text-secondary)]">
                 <span>Boutique Accommodation ({calculateDays()}):</span>
                 <span className="font-mono text-[var(--text-primary)]">
-                  {formatCurrency(hotelAmount, bookingCurrency)}
+                  {formatCurrency(hotelAmount, hotelCurrency)}
                 </span>
               </div>
               <div className="flex justify-between text-[var(--text-secondary)]">

@@ -315,6 +315,16 @@ class MockBookingService implements IBookingService {
     return;
   }
 
+  async downloadTicketPdf(transactionId: string, bookingRef?: string): Promise<void> {
+    await this.delay(400);
+    return;
+  }
+
+  async downloadHotelVoucherPdf(transactionId: string, bookingRef?: string): Promise<void> {
+    await this.delay(400);
+    return;
+  }
+
   // Section 5B / 5C Mocks
   private mockActiveBookingIds: Map<string, string> = new Map();
 
@@ -420,6 +430,18 @@ class MockBookingService implements IBookingService {
         transaction_id: state.hotelConfirmation.transaction_id,
         confirmation_code: state.hotelConfirmation.confirmation_code,
       } : null,
+    };
+  }
+
+  async getCanonicalTrip(tripId: string): Promise<any> {
+    await this.delay(50);
+    const state = getStoredBookingState(tripId);
+    return {
+      id: tripId,
+      trip_id: tripId,
+      status: state.isApproved ? 'approved' : 'planning',
+      is_approved: state.isApproved,
+      active_revision_number: 1,
     };
   }
 }

@@ -153,6 +153,83 @@ def init_trip_tables() -> None:
     _TRIP_SCHEMA_INITIALIZED = True
 
 
+def _build_selected_flight_metadata(
+    norm_offer: Any,
+    snapshot_id: str | uuid.UUID,
+    trip: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract and build symmetrical flight offer metadata for trip persistence."""
+    f_price_val = None
+    f_currency_val = "USD"
+    f_price_inr_val = None
+    if hasattr(norm_offer, "price"):
+        f_price_val = float(norm_offer.price.total_amount)
+        f_currency_val = str(norm_offer.price.currency)
+        if getattr(norm_offer.price, "inr_reference_amount", None) is not None:
+            f_price_inr_val = float(norm_offer.price.inr_reference_amount)
+    elif isinstance(norm_offer, dict):
+        f_price_val = float(norm_offer.get("price") or norm_offer.get("total_amount") or 0)
+        f_currency_val = str(norm_offer.get("currency", "USD"))
+        f_price_inr_val = float(norm_offer["price_inr"]) if norm_offer.get("price_inr") is not None else None
+
+    carrier_name = "Airline"
+    carrier_code = ""
+    cabin_class = "economy"
+    f_slices: list[dict[str, Any]] = []
+
+    if hasattr(norm_offer, "segments") and norm_offer.segments:
+        first_seg = norm_offer.segments[0]
+        carrier_name = getattr(first_seg, "marketing_carrier_name", "Airline")
+        carrier_code = getattr(first_seg, "marketing_carrier_iata", "")
+        cabin_class = getattr(first_seg, "cabin_class", "economy")
+        seg_list = []
+        for s in norm_offer.segments:
+            seg_list.append({
+                "origin": getattr(s, "origin_iata", ""),
+                "destination": getattr(s, "destination_iata", ""),
+                "departure_time": s.departure_time.isoformat() if hasattr(s.departure_time, "isoformat") else str(s.departure_time),
+                "arrival_time": s.arrival_time.isoformat() if hasattr(s.arrival_time, "isoformat") else str(s.arrival_time),
+                "carrier_code": getattr(s, "marketing_carrier_iata", ""),
+                "carrier_name": getattr(s, "marketing_carrier_name", ""),
+                "flight_number": getattr(s, "flight_number", ""),
+                "duration_minutes": getattr(s, "duration_minutes", 0),
+                "cabin_class": getattr(s, "cabin_class", "economy"),
+            })
+        f_slices.append({
+            "origin": seg_list[0]["origin"] if seg_list else (trip.get("origin") or ""),
+            "destination": seg_list[-1]["destination"] if seg_list else (trip.get("destination") or ""),
+            "departure_time": seg_list[0]["departure_time"] if seg_list else "",
+            "arrival_time": seg_list[-1]["arrival_time"] if seg_list else "",
+            "segments": seg_list,
+            "total_duration_minutes": sum(s.get("duration_minutes", 0) for s in seg_list),
+            "stops": max(0, len(seg_list) - 1),
+        })
+    elif isinstance(norm_offer, dict):
+        carrier_name = norm_offer.get("carrier_name") or "Airline"
+        carrier_code = norm_offer.get("carrier_code") or ""
+        cabin_class = norm_offer.get("cabin_class") or "economy"
+        f_slices = norm_offer.get("slices") or []
+
+    provider_offer_id = getattr(norm_offer, "provider_offer_id", None) or (
+        norm_offer.get("offer_id") or norm_offer.get("provider_offer_id") if isinstance(norm_offer, dict) else str(snapshot_id)
+    )
+
+    return {
+        "id": str(snapshot_id),
+        "snapshot_id": str(snapshot_id),
+        "offer_id": str(provider_offer_id),
+        "price": f_price_val,
+        "total_amount": str(f_price_val) if f_price_val is not None else "0",
+        "currency": f_currency_val,
+        "price_inr": f_price_inr_val,
+        "carrier_name": carrier_name,
+        "carrier_code": carrier_code,
+        "cabin_class": cabin_class,
+        "slices": f_slices,
+        "refundable": getattr(norm_offer, "refundable", False) if hasattr(norm_offer, "refundable") else (norm_offer.get("refundable", False) if isinstance(norm_offer, dict) else False),
+    }
+
+
 class TripStore:
     """Repository for Trips and Threads with strict ownership enforcement."""
     _IN_MEMORY_TRIPS: dict[str, dict[str, Any]] = {}
@@ -356,6 +433,7 @@ class TripStore:
             ).fetchone()
             return dict(row) if row else None
 
+
     def select_offer_atomic(
         self,
         trip_id: str | uuid.UUID,
@@ -462,6 +540,7 @@ class TripStore:
                             slices[1]["departure_date"] = ret_date
                         canonical_tr_dict["slices"] = slices
                         meta["canonical_trip_request"] = canonical_tr_dict
+                    meta["selected_flight"] = _build_selected_flight_metadata(norm_offer, req.snapshot_id, trip)
                 elif req.offer_type == "hotel":
                     price_val = None
                     currency_val = "USD"
@@ -634,6 +713,7 @@ class TripStore:
                             slices[1]["departure_date"] = ret_date
                         canonical_tr_dict["slices"] = slices
                         meta["canonical_trip_request"] = canonical_tr_dict
+                    meta["selected_flight"] = _build_selected_flight_metadata(norm_offer, req.snapshot_id, trip)
                 elif req.offer_type == "hotel":
                     price_val = None
                     currency_val = "USD"
@@ -782,6 +862,48 @@ class TripStore:
                 meta["constraints"] = new_constraints
                 meta["last_feedback"] = feedback
 
+                # Mirror supported constraints into canonical metadata fields
+                if "budget" in new_constraints and new_constraints["budget"] is not None:
+                    try:
+                        meta["budget"] = float(new_constraints["budget"])
+                    except (ValueError, TypeError):
+                        pass
+                if "start_date" in new_constraints and new_constraints["start_date"]:
+                    meta["start_date"] = str(new_constraints["start_date"])[:10]
+                if "end_date" in new_constraints and new_constraints["end_date"]:
+                    meta["end_date"] = str(new_constraints["end_date"])[:10]
+                if "departure_date" in new_constraints and new_constraints["departure_date"]:
+                    meta["departure_date"] = str(new_constraints["departure_date"])[:10]
+                    meta.setdefault("start_date", meta["departure_date"])
+                if "return_date" in new_constraints and new_constraints["return_date"]:
+                    meta["return_date"] = str(new_constraints["return_date"])[:10]
+                    meta.setdefault("end_date", meta["return_date"])
+                if "travelers_count" in new_constraints and new_constraints["travelers_count"] is not None:
+                    try:
+                        meta["travelers_count"] = int(new_constraints["travelers_count"])
+                    except (ValueError, TypeError):
+                        pass
+                elif "adults" in new_constraints and new_constraints["adults"] is not None:
+                    try:
+                        meta["travelers_count"] = int(new_constraints["adults"])
+                    except (ValueError, TypeError):
+                        pass
+                elif "passengers" in new_constraints and new_constraints["passengers"] is not None:
+                    try:
+                        meta["travelers_count"] = int(new_constraints["passengers"])
+                    except (ValueError, TypeError):
+                        pass
+                if "children" in new_constraints and new_constraints["children"] is not None:
+                    try:
+                        meta["children"] = int(new_constraints["children"])
+                    except (ValueError, TypeError):
+                        pass
+                if "rooms" in new_constraints and new_constraints["rooms"] is not None:
+                    try:
+                        meta["rooms"] = int(new_constraints["rooms"])
+                    except (ValueError, TypeError):
+                        pass
+
                 old_flight = meta.get("selected_flight_snapshot_id")
                 new_flight = constraints_update.get("selected_flight_snapshot_id", old_flight)
                 flight_selection_changed = (old_flight is not None and new_flight != old_flight)
@@ -919,6 +1041,48 @@ class TripStore:
                 meta["trip_revision"] = new_revision_number
                 meta["constraints"] = new_constraints
                 meta["last_feedback"] = feedback
+
+                # Mirror supported constraints into canonical metadata fields
+                if "budget" in new_constraints and new_constraints["budget"] is not None:
+                    try:
+                        meta["budget"] = float(new_constraints["budget"])
+                    except (ValueError, TypeError):
+                        pass
+                if "start_date" in new_constraints and new_constraints["start_date"]:
+                    meta["start_date"] = str(new_constraints["start_date"])[:10]
+                if "end_date" in new_constraints and new_constraints["end_date"]:
+                    meta["end_date"] = str(new_constraints["end_date"])[:10]
+                if "departure_date" in new_constraints and new_constraints["departure_date"]:
+                    meta["departure_date"] = str(new_constraints["departure_date"])[:10]
+                    meta.setdefault("start_date", meta["departure_date"])
+                if "return_date" in new_constraints and new_constraints["return_date"]:
+                    meta["return_date"] = str(new_constraints["return_date"])[:10]
+                    meta.setdefault("end_date", meta["return_date"])
+                if "travelers_count" in new_constraints and new_constraints["travelers_count"] is not None:
+                    try:
+                        meta["travelers_count"] = int(new_constraints["travelers_count"])
+                    except (ValueError, TypeError):
+                        pass
+                elif "adults" in new_constraints and new_constraints["adults"] is not None:
+                    try:
+                        meta["travelers_count"] = int(new_constraints["adults"])
+                    except (ValueError, TypeError):
+                        pass
+                elif "passengers" in new_constraints and new_constraints["passengers"] is not None:
+                    try:
+                        meta["travelers_count"] = int(new_constraints["passengers"])
+                    except (ValueError, TypeError):
+                        pass
+                if "children" in new_constraints and new_constraints["children"] is not None:
+                    try:
+                        meta["children"] = int(new_constraints["children"])
+                    except (ValueError, TypeError):
+                        pass
+                if "rooms" in new_constraints and new_constraints["rooms"] is not None:
+                    try:
+                        meta["rooms"] = int(new_constraints["rooms"])
+                    except (ValueError, TypeError):
+                        pass
 
                 old_flight = meta.get("selected_flight_snapshot_id")
                 new_flight = constraints_update.get("selected_flight_snapshot_id", old_flight)

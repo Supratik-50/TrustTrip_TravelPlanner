@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { ArrowRight, Calendar, Users, MapPin } from 'lucide-react';
+import { ArrowRight, Calendar, Users, MapPin, Download, CheckCircle2 } from 'lucide-react';
 import { TripSummary } from '../../types/trip';
 import { getDestinationImage } from '../../lib/destinationImages';
 import { Button } from '../common/Button';
 import { formatCurrency } from '../../lib/currency';
+import { bookingService } from '../../services/bookingService';
 
 interface TripCardProps {
   trip: TripSummary;
@@ -19,7 +20,36 @@ export const TripCard: React.FC<TripCardProps> = ({
   featured = false,
 }) => {
   const [imgError, setImgError] = useState(false);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const destMeta = getDestinationImage(trip.destination);
+
+  const handleDownloadTicket = async (e: React.MouseEvent, flightId: string, bookingRef?: string) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setDownloadingId(flightId);
+    try {
+      await bookingService.downloadTicketPdf(flightId, bookingRef);
+    } catch (err) {
+      console.error('Failed to download flight ticket PDF:', err);
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
+  const handleDownloadVoucher = async (e: React.MouseEvent, hotelId: string, bookingRef?: string) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setDownloadingId(hotelId);
+    try {
+      if (bookingService.downloadHotelVoucherPdf) {
+        await bookingService.downloadHotelVoucherPdf(hotelId, bookingRef);
+      }
+    } catch (err) {
+      console.error('Failed to download hotel voucher PDF:', err);
+    } finally {
+      setDownloadingId(null);
+    }
+  };
 
   const formatDateRange = (start?: string, end?: string) => {
     if (!start) return '';
@@ -191,6 +221,55 @@ export const TripCard: React.FC<TripCardProps> = ({
               </span>
             )}
           </div>
+
+          {/* Canonical Wave 3B/3D Booking Badges */}
+          {((trip.flights && trip.flights.length > 0) || (trip.hotels && trip.hotels.length > 0)) && (
+            <div className="pt-2 space-y-1 border-t border-[var(--border-subtle)]" onClick={(e) => e.stopPropagation()}>
+              {trip.flights?.filter((f: any) => f && f.booking_status !== 'failed' && f.booking_status !== 'abandoned').map((f: any) => {
+                const isConfirmed = f.booking_status === 'booked' || f.booking_status === 'completed';
+                return (
+                  <div key={f.id} className="flex items-center justify-between text-[11px] bg-[var(--surface-subtle)] px-2 py-1 rounded">
+                    <span className="flex items-center gap-1 font-mono text-[var(--status-success)]">
+                      <CheckCircle2 className="w-3 h-3" />
+                      <span>Flight: {f.booking_reference || (isConfirmed ? 'Confirmed' : 'Pending')}</span>
+                    </span>
+                    {isConfirmed && f.id && (
+                      <button
+                        type="button"
+                        onClick={(e) => handleDownloadTicket(e, f.id, f.booking_reference)}
+                        disabled={downloadingId === f.id}
+                        data-href={`/api/trips/${encodeURIComponent(f.id)}/ticket.pdf`}
+                        className="text-[10px] text-[var(--primary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
+                        title="Download flight ticket PDF (/ticket.pdf)"
+                      >
+                        <Download className="w-3 h-3" />
+                        {downloadingId === f.id ? 'Downloading...' : 'Ticket'}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+              {trip.hotels?.map((h: any) => (
+                <div key={h.id} className="flex items-center justify-between text-[11px] bg-[var(--surface-subtle)] px-2 py-1 rounded">
+                  <span className="flex items-center gap-1 font-mono text-[var(--status-success)]">
+                    <CheckCircle2 className="w-3 h-3" />
+                    <span>Hotel: {h.booking_reference || 'Booked'}</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => handleDownloadVoucher(e, h.id, h.booking_reference)}
+                    disabled={downloadingId === h.id}
+                    data-href={`/api/trips/${encodeURIComponent(h.id)}/hotel.pdf`}
+                    className="text-[10px] text-[var(--primary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
+                    title="Download hotel voucher PDF (/hotel.pdf)"
+                  >
+                    <Download className="w-3 h-3" />
+                    {downloadingId === h.id ? 'Downloading...' : 'Voucher'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="pt-2 border-t border-[var(--border-subtle)] flex items-center justify-between text-xs font-semibold text-[var(--primary)]">

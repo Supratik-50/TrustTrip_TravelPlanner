@@ -10,6 +10,7 @@
  */
 
 import { FlightPassenger } from './flight';
+import { TripDetail } from './trip';
 
 export type JourneyApprovalStatus = 'pending_review' | 'approved' | 'rejected';
 
@@ -189,6 +190,8 @@ export interface IBookingService {
   ): Promise<HotelConfirmationRecord>;
   requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id?: string; status?: string; message: string }>;
   downloadTravelPlanPdf(tripId: string): Promise<void>;
+  downloadTicketPdf(transactionId: string, bookingRef?: string): Promise<void>;
+  downloadHotelVoucherPdf(transactionId: string, bookingRef?: string): Promise<void>;
 
   // Section 5B / 5C Authoritative Contracts
   selectFlightOffer(tripId: string, offerId: string, passengers: FlightPassenger[]): Promise<any>;
@@ -199,4 +202,5 @@ export interface IBookingService {
   getActiveBookingId(tripId: string): string | undefined;
   setActiveBookingId(tripId: string, bookingId: string): void;
   getTripBookings(tripId: string): Promise<any>;
+  getCanonicalTrip?(tripId: string): Promise<TripDetail>;
 }

@@ -31,9 +31,10 @@ import {
   getStoredBookingState,
   saveStoredBookingState,
   clearStoredBookingState,
-  DEFAULT_TRAVELER_CONTACT,
 } from '../../mock/bookingMockData';
 import { useNotification } from '../../context/NotificationContext';
+import { useAuth } from '../../context/AuthContext';
+import { FlightPassenger } from '../../types/flight';
 import { BookingProgressBar } from './BookingProgressBar';
 import { BookingReviewPanel } from './BookingReviewPanel';
 import { ApprovalCard } from './ApprovalCard';
@@ -41,6 +42,7 @@ import { FlightVerificationCard } from './FlightVerificationCard';
 import { CheckoutHandoffModal } from './CheckoutHandoffModal';
 import { HotelBookingPanel } from './HotelBookingPanel';
 import { PaymentReviewModal } from './PaymentReviewModal';
+import { TravelerModal } from './TravelerModal';
 import { TripConfirmationView } from './TripConfirmationView';
 import { Button } from '../common/Button';
 
@@ -164,7 +166,39 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   // Modals & Handoff
   const [isHandoffModalOpen, setIsHandoffModalOpen] = useState(false);
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
-  const [contact, setContact] = useState<TravelerContactInfo>(DEFAULT_TRAVELER_CONTACT);
+
+  // Wave 2: Real Traveler & Passenger State
+  const { user: currentUser } = useAuth();
+  const travelersCount = Math.max(1, Math.min(9, trip.travelers_count || 1));
+  const [travelers, setTravelers] = useState<FlightPassenger[]>([]);
+  const [isTravelerModalOpen, setIsTravelerModalOpen] = useState(false);
+
+  // Traveler validation helper
+  const isTravelerValid = (p?: FlightPassenger): boolean => {
+    if (!p) return false;
+    return Boolean(
+      p.given_name?.trim() &&
+      p.family_name?.trim() &&
+      p.born_on?.trim() &&
+      /^\d{4}-\d{2}-\d{2}$/.test(p.born_on) &&
+      p.gender &&
+      p.title
+    );
+  };
+
+  const isAllTravelersComplete = (list: FlightPassenger[], count: number): boolean => {
+    if (!list || list.length !== count) return false;
+    return list.every(isTravelerValid);
+  };
+
+  // Derive lead contact info from traveler 0 (precedence: explicit traveler email > currentUser email)
+  const leadTraveler = travelers[0];
+  const derivedContact: TravelerContactInfo = {
+    first_name: leadTraveler?.given_name || '',
+    last_name: leadTraveler?.family_name || '',
+    email: (leadTraveler?.email && leadTraveler.email.trim() !== '') ? leadTraveler.email : (currentUser?.email || ''),
+    phone: leadTraveler?.phone_number || '',
+  };
 
   // Active view section when approved: 'stages' vs 'confirmation'
   const [currentStage, setCurrentStage] = useState<'review' | 'flight_stage' | 'hotel_stage' | 'confirmed'>(
@@ -200,15 +234,174 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       setIsPlanApproved(true);
       if (saved.approvedAt) setApprovedAt(saved.approvedAt);
     }
-    setFlightState(saved.flightState === 'confirmed' ? 'idle' : saved.flightState);
+    // Initialize non-confirmed temporary UI state from localStorage
+    setFlightState(saved.flightState === 'confirmed' ? 'idle' : (saved.flightState || 'idle'));
     setFlightConfirmation(undefined);
-    setHotelState(saved.hotelState === 'confirmed' ? 'idle' : saved.hotelState);
+    setHotelState(saved.hotelState === 'confirmed' ? 'idle' : (saved.hotelState || 'idle'));
     setHotelConfirmation(undefined);
+
+    // Authoritative Server-Driven Rehydration (Wave 3B)
+    bookingService.getTripBookings(trip.trip_id)
+      .then((res: any) => {
+        if (!res) return;
+
+        let hasConfirmedFlight = false;
+        let hasConfirmedHotel = false;
+
+        if (res.flight) {
+          if (res.flight.is_booked || res.flight.status === 'completed') {
+            hasConfirmedFlight = true;
+            setIsFlightApproved(true);
+            setFlightState('confirmed');
+            const seg = res.flight.slices?.[0]?.segments?.[0];
+            const flightConf: FlightConfirmationRecord = {
+              booking_id: res.flight.booking_id,
+              booking_reference: res.flight.booking_reference || res.flight.pnr || '',
+              carrier_code: seg?.operating_carrier?.name?.slice(0, 2)?.toUpperCase() || 'TT',
+              carrier_name: seg?.operating_carrier?.name || seg?.marketing_carrier?.name || 'Confirmed Airline',
+              flight_number: seg?.marketing_carrier_flight_number || seg?.flight_number || '',
+              origin_code: seg?.origin?.iata_code || seg?.origin_iata || trip.origin?.slice(0, 3)?.toUpperCase() || '',
+              origin_city: trip.origin?.split('(')[0]?.trim() || '',
+              destination_code: seg?.destination?.iata_code || seg?.destination_iata || trip.destination?.slice(0, 3)?.toUpperCase() || '',
+              destination_city: trip.destination?.split('(')[0]?.trim() || '',
+              departure_time: seg?.departing_at || seg?.departure_time || '',
+              arrival_time: seg?.arriving_at || seg?.arrival_time || '',
+              cabin_class: 'economy',
+              travelers_count: res.flight.passengers?.length || trip.travelers_count || 1,
+              confirmed_at: res.flight.completed_at || res.flight.created_at || '',
+              status: 'ticketed',
+            };
+            setFlightConfirmation(flightConf);
+          } else if (res.flight.status === 'ready_for_booking' || res.flight.status === 'approved') {
+            setIsFlightApproved(true);
+            setFlightState('ready');
+          } else if (res.flight.in_progress || res.flight.status === 'handed_off') {
+            setFlightState('booking_in_progress');
+          }
+        }
+
+        if (res.hotel) {
+          if (res.hotel.is_booked || res.hotel.status === 'booked') {
+            hasConfirmedHotel = true;
+            setHotelState('confirmed');
+            const hotelConf: HotelConfirmationRecord = {
+              transaction_id: res.hotel.transaction_id,
+              hotel_name: res.hotel.hotel_name || 'Confirmed Hotel',
+              property_name: res.hotel.hotel_name || 'Confirmed Hotel',
+              confirmation_code: res.hotel.confirmation_code || res.hotel.transaction_id,
+              room_name: res.hotel.room_name || 'Standard Room',
+              check_in_date: res.hotel.check_in || trip.start_date || '',
+              check_out_date: res.hotel.check_out || trip.end_date || '',
+              check_in: res.hotel.check_in || trip.start_date || '',
+              check_out: res.hotel.check_out || trip.end_date || '',
+              total_price: res.hotel.amount_inr || 0,
+              currency: res.hotel.currency || 'INR',
+              confirmed_at: res.hotel.created_at || '',
+              status: 'voucher_issued',
+            };
+            setHotelConfirmation(hotelConf);
+          } else if (res.hotel.in_progress || res.hotel.status === 'booking_in_progress') {
+            setHotelState('booking_in_progress');
+          }
+        }
+
+        if (hasConfirmedFlight && hasConfirmedHotel) {
+          setCurrentStage('confirmed');
+        } else if (hasConfirmedFlight) {
+          setCurrentStage('hotel_stage');
+        } else if (saved.isApproved || trip.is_approved) {
+          setCurrentStage('flight_stage');
+        }
+      })
+      .catch((_err) => {
+        // Fall back to non-authoritative local state only if backend is unreachable
+        if (saved.flightState && saved.flightState !== 'idle') {
+          setFlightState(saved.flightState);
+          if (saved.flightConfirmation) setFlightConfirmation(saved.flightConfirmation);
+        }
+        if (saved.hotelState && saved.hotelState !== 'idle') {
+          setHotelState(saved.hotelState);
+          if (saved.hotelConfirmation) setHotelConfirmation(saved.hotelConfirmation);
+        }
+      });
+
+    // Sync saved travelers if count matches, otherwise initialize array of size travelersCount
+    if (saved.travelers && saved.travelers.length === travelersCount) {
+      setTravelers(saved.travelers);
+    } else {
+      setTravelers((prev) => {
+        if (prev.length === travelersCount && prev.some((p) => p.given_name)) {
+          return prev;
+        }
+        const initial: FlightPassenger[] = [];
+        for (let i = 0; i < travelersCount; i++) {
+          initial.push({
+            given_name: '',
+            family_name: '',
+            born_on: '',
+            title: 'mr',
+            gender: 'm',
+            email: i === 0 && currentUser?.email ? currentUser.email : '',
+            phone_number: '',
+            type: 'adult',
+          });
+        }
+        return initial;
+      });
+    }
 
     if (saved.isApproved || trip.is_approved) {
       setCurrentStage('flight_stage');
     }
-  }, [trip]);
+  }, [trip, travelersCount, currentUser?.email]);
+
+  // Synchronize traveler slots when travelersCount or auth email updates
+  useEffect(() => {
+    setTravelers((prev) => {
+      if (prev.length === travelersCount) return prev;
+      const updated: FlightPassenger[] = [];
+      for (let i = 0; i < travelersCount; i++) {
+        const existing = prev[i];
+        updated.push({
+          given_name: existing?.given_name || '',
+          family_name: existing?.family_name || '',
+          born_on: existing?.born_on || '',
+          title: existing?.title || 'mr',
+          gender: existing?.gender || 'm',
+          email: existing?.email !== undefined ? existing.email : (i === 0 && currentUser?.email ? currentUser.email : ''),
+          phone_number: existing?.phone_number || '',
+          type: existing?.type || 'adult',
+        });
+      }
+      return updated;
+    });
+  }, [travelersCount, currentUser?.email]);
+
+  // Handle saving travelers from modal (with stale booking intent invalidation)
+  const handleSaveTravelers = (updatedTravelers: FlightPassenger[]) => {
+    const hadBooking = Boolean(bookingId || bookingService.getActiveBookingId(trip.trip_id));
+    setTravelers(updatedTravelers);
+    setIsTravelerModalOpen(false);
+
+    const stored = getStoredBookingState(trip.trip_id);
+    stored.travelers = updatedTravelers;
+    saveStoredBookingState(trip.trip_id, stored);
+
+    if (hadBooking) {
+      setBookingId(undefined);
+      bookingService.setActiveBookingId(trip.trip_id, '');
+      setIsFlightApproved(false);
+      setIsFinalConfirmationChecked(false);
+      setFlightState('idle');
+      notify(
+        'Traveler details updated. Active flight booking intent invalidated; please re-verify flight for updated passengers.',
+        'info',
+        'Booking Intent Invalidated'
+      );
+    } else {
+      notify('Traveler details saved successfully.', 'success', 'Travelers Updated');
+    }
+  };
 
   useEffect(() => {
     syncFromStorage();
@@ -245,6 +438,23 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       notify('Journey plan approved! Ready for service verification.', 'success', 'Plan Approved');
     } catch (err: any) {
       if (err.statusCode === 409 || err.code === 'REVISION_CONFLICT') {
+        // Authoritative server-derived check: only treat as approved if current revision is actually approved on server
+        try {
+          const canon: any = bookingService.getCanonicalTrip ? await bookingService.getCanonicalTrip(trip.trip_id) : undefined;
+          const canonRevId = canon?.active_revision_id;
+          const isCanonApproved = Boolean(canon?.is_approved || canon?.status === 'approved');
+          if (canon && isCanonApproved && canonRevId === reviewedRevisionId) {
+            setIsPlanApproved(true);
+            if (canon.approved_at) {
+              setApprovedAt(canon.approved_at);
+            }
+            setApprovalConflict(null);
+            notify('Journey plan is already approved for the current revision.', 'info', 'Plan Approved');
+            return;
+          }
+        } catch (refreshErr) {
+          console.error('Failed to verify canonical revision approval on 409:', refreshErr);
+        }
         setApprovalConflict('Your trip has changed since this review. Active server revision does not match your baseline plan.');
         notify('Trip changed since review. Please refresh.', 'error', 'Revision Conflict (409)');
       } else {
@@ -305,6 +515,17 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
   // Section 5B / 5C: Handle Flight Verification & Revalidation
   const handleVerifyFlight = async () => {
+    if (!isAllTravelersComplete(travelers, travelersCount)) {
+      setIsTravelerModalOpen(true);
+      notify(
+        `Please complete passenger details for all ${travelersCount} traveler(s) before verifying flight.`,
+        'warning',
+        'Passenger Details Required'
+      );
+      setFlightState('idle');
+      return;
+    }
+
     setFlightState('verifying');
     setIsFinalConfirmationChecked(false);
     setErrorMessage(undefined);
@@ -315,17 +536,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       // Select offer if no booking intent exists yet
       if (!bId) {
         try {
-          const sel = await bookingService.selectFlightOffer(trip.trip_id, offerId, [
-            {
-              given_name: contact.first_name || 'Traveler',
-              family_name: contact.last_name || 'User',
-              born_on: '1990-01-01',
-              title: 'mr',
-              gender: 'm',
-              email: contact.email || 'traveler@trusttrip.com',
-              phone_number: contact.phone || '+1234567890',
-            },
-          ]);
+          const sel = await bookingService.selectFlightOffer(trip.trip_id, offerId, travelers);
           if (sel?.booking_id) {
             const activeBId = String(sel.booking_id);
             bId = activeBId;
@@ -454,20 +665,20 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
   // Section 5B / 5C: Record Explicit Human-In-The-Loop Approval
   const handleApproveFlight = async () => {
+    if (!isAllTravelersComplete(travelers, travelersCount)) {
+      setIsTravelerModalOpen(true);
+      notify(
+        `Please complete passenger details for all ${travelersCount} traveler(s) before approving flight.`,
+        'warning',
+        'Passenger Details Required'
+      );
+      return;
+    }
+
     let bId = bookingId || bookingService.getActiveBookingId(trip.trip_id);
     if (!bId) {
       const offerId = selectedFlight?.offer_id || selectedFlight?.id || 'fl_off_101';
-      const sel = await bookingService.selectFlightOffer(trip.trip_id, offerId, [
-        {
-          given_name: contact.first_name || 'Traveler',
-          family_name: contact.last_name || 'User',
-          born_on: '1990-01-01',
-          title: 'mr',
-          gender: 'm',
-          email: contact.email || 'traveler@trusttrip.com',
-          phone_number: contact.phone || '+1234567890',
-        },
-      ]);
+      const sel = await bookingService.selectFlightOffer(trip.trip_id, offerId, travelers);
       if (sel?.booking_id) {
         const activeBId = String(sel.booking_id);
         bId = activeBId;
@@ -490,6 +701,20 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       setFlightState('ready');
       notify('Human approval recorded. Please review and confirm the current fare before booking.', 'success', 'Flight Approved');
     } catch (err: any) {
+      if (err.statusCode === 409) {
+        try {
+          const bookingDetails = await bookingService.getFlightBooking(bId);
+          if (bookingDetails && (bookingDetails.status === 'ready_for_booking' || bookingDetails.status === 'approved' || bookingDetails.status === 'completed')) {
+            setIsFlightApproved(true);
+            setIsFinalConfirmationChecked(false);
+            setFlightState(bookingDetails.status === 'completed' ? 'confirmed' : 'ready');
+            notify('Flight booking is already approved.', 'info', 'Flight Approved');
+            return;
+          }
+        } catch (queryErr) {
+          console.error('Failed to verify flight booking approval on 409:', queryErr);
+        }
+      }
       notify(err.message || 'Unable to record approval.', 'error');
     }
   };
@@ -600,15 +825,57 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
   // Prepare Hotel Booking
   const handlePrepareHotel = async () => {
-    await bookingService.prepareHotelBooking(trip.trip_id, selectedHotel?.id || 'ht_off_101', selectedHotel);
+    const lead = travelers[0];
+    const guestInfo = lead && lead.given_name?.trim()
+      ? {
+          firstName: lead.given_name.trim(),
+          lastName: lead.family_name?.trim() || '',
+          email: (lead.email && lead.email.trim() !== '') ? lead.email.trim() : (currentUser?.email || ''),
+          phone: lead.phone_number?.trim() || '',
+        }
+      : undefined;
+
+    await bookingService.prepareHotelBooking(
+      trip.trip_id,
+      selectedHotel?.id || selectedHotel?.snapshot_id || '',
+      selectedHotel,
+      guestInfo
+    );
     setHotelState('payment_required');
     notify('Stay reservation prepared. Ready for payment confirmation.', 'info', 'Reservation Prepared');
+  };
+
+  // Initiate Hotel Payment Order (Razorpay)
+  const handleInitiateHotelOrder = async () => {
+    if (
+      !activeAuthorization ||
+      !activeAuthorization.revision_id ||
+      typeof activeAuthorization.revision_number !== 'number' ||
+      activeAuthorization.revision_number < 1
+    ) {
+      const authErr = new Error('Active booking authorization is required before processing hotel payment. Please authorize the plan revision first.');
+      notify(authErr.message, 'error', 'Authorization Required');
+      throw authErr;
+    }
+
+    if (!bookingService.initiateHotelPaymentOrder) {
+      throw new Error('Hotel payment initiation is not supported by booking service.');
+    }
+
+    return await bookingService.initiateHotelPaymentOrder(
+      trip.trip_id,
+      derivedContact,
+      activeAuthorization.revision_id,
+      activeAuthorization.revision_number,
+      travelers.length > 0 ? travelers : undefined
+    );
   };
 
   // Process Hotel Payment
   const handleProcessHotelPayment = async (
     method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
-    travelerContact: TravelerContactInfo
+    travelerContact: TravelerContactInfo,
+    paymentDetails?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
   ) => {
     if (
       !activeAuthorization ||
@@ -628,7 +895,9 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       method,
       travelerContact,
       revId,
-      revNum
+      revNum,
+      paymentDetails,
+      travelers.length > 0 ? travelers : undefined
     );
     setHotelConfirmation(confirmRec);
     setHotelState('confirmed');
@@ -664,6 +933,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     setHotelConfirmation(undefined);
     setPriceChange(undefined);
     setCurrentStage('review');
+    setTravelers([]);
     notify('Booking flow reset to Step 1 for interactive testing.', 'info', 'Flow Reset');
   };
 
@@ -708,6 +978,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
           trip={trip}
           flightConfirmation={flightConfirmation}
           hotelConfirmation={hotelConfirmation}
+          contactEmail={derivedContact.email || currentUser?.email || ''}
           onDownloadPdf={handleDownloadPdf}
           onRequestCancellation={handleRequestCancellation}
           onViewTrip={() => onNavigateTab('itinerary')}
@@ -733,9 +1004,11 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
             trip={trip}
             flight={selectedFlight}
             hotel={selectedHotel}
-            contact={contact}
+            contact={derivedContact}
+            travelers={travelers}
             isApproved={isPlanApproved}
             onEditSection={(section) => onNavigateTab(section)}
+            onEditTravelers={() => setIsTravelerModalOpen(true)}
           />
 
           <ApprovalCard
@@ -799,6 +1072,42 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
                 Reset demo
               </button>
             </div>
+          </div>
+
+          {/* Wave 2: Passenger / Traveler Information Bar */}
+          <div className="p-4 rounded-2xl bg-[var(--surface)] border border-[var(--border)] flex flex-wrap items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-[var(--primary)]/10 text-[var(--primary)]">
+                <Users className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="text-xs font-mono font-bold uppercase tracking-wider text-[var(--text-primary)] flex items-center gap-2">
+                  <span>Passenger Information ({travelersCount} traveler{travelersCount > 1 ? 's' : ''})</span>
+                  {isAllTravelersComplete(travelers, travelersCount) ? (
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-[10px] font-semibold border border-emerald-500/20 flex items-center gap-1">
+                      <CheckCircle2 className="w-3 h-3" /> Ready
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[10px] font-semibold border border-amber-500/20 flex items-center gap-1">
+                      <AlertTriangle className="w-3 h-3" /> Details Incomplete
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-[var(--text-secondary)] font-light mt-0.5">
+                  {isAllTravelersComplete(travelers, travelersCount)
+                    ? travelers.map((t) => `${t.title ? `${t.title.toUpperCase()} ` : ''}${t.given_name} ${t.family_name}`).join(', ')
+                    : 'Please enter passenger names and birthdates for ticketing.'}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              data-testid="edit-travelers-btn"
+              onClick={() => setIsTravelerModalOpen(true)}
+              className="px-3 py-1.5 rounded-xl text-xs font-mono font-medium bg-[var(--primary)]/10 text-[var(--primary)] hover:bg-[var(--primary)]/20 transition-colors cursor-pointer"
+            >
+              {isAllTravelersComplete(travelers, travelersCount) ? 'Edit Passengers' : 'Enter Passenger Details'}
+            </button>
           </div>
 
           {/* Service Verification Panels */}
@@ -907,15 +1216,33 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
                   View complete confirmation
                 </Button>
               ) : flightState === 'confirmed' ? (
-                <Button
-                  variant="primary"
-                  size="md"
-                  onClick={() => setIsPaymentModalOpen(true)}
-                  rightIcon={<CreditCard className="w-4 h-4" />}
-                  className="shadow-xs shrink-0"
-                >
-                  Complete hotel payment
-                </Button>
+                isBookingAuthorized ? (
+                  <Button
+                    variant="primary"
+                    size="md"
+                    onClick={() => setIsPaymentModalOpen(true)}
+                    rightIcon={<CreditCard className="w-4 h-4" />}
+                    className="shadow-xs shrink-0"
+                  >
+                    Complete hotel payment
+                  </Button>
+                ) : (
+                  <div className="flex flex-col sm:flex-row items-end sm:items-center gap-2">
+                    <span className="text-xs text-amber-500 font-medium">
+                      Booking authorization required before hotel payment
+                    </span>
+                    <Button
+                      variant="primary"
+                      size="md"
+                      disabled={!canAuthorizeBooking}
+                      onClick={handleAuthorizeBooking}
+                      rightIcon={<ShieldCheck className="w-4 h-4" />}
+                      className="shadow-xs shrink-0 bg-amber-600 hover:bg-amber-700"
+                    >
+                      Authorize for Booking
+                    </Button>
+                  </div>
+                )
               ) : null}
             </div>
           )}
@@ -933,20 +1260,31 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
         currency={selectedFlight?.currency || trip.currency || 'USD'}
       />
 
-      {/* Hotel Payment Modal (Simulated Razorpay) */}
+      {/* Hotel Payment Modal (Official Razorpay Checkout) */}
       <PaymentReviewModal
         isOpen={isPaymentModalOpen}
         onClose={() => setIsPaymentModalOpen(false)}
-        hotelName={selectedHotel?.name || ''}
-        roomName={selectedHotel?.rooms?.[0]?.name || ''}
+        hotelName={selectedHotel?.name || selectedHotel?.hotel_name || ''}
+        roomName={selectedHotel?.rooms?.[0]?.name || selectedHotel?.room_name || ''}
         startDate={trip.start_date || ''}
         endDate={trip.end_date || ''}
         guestsCount={trip.travelers_count || 0}
-        roomAmount={selectedHotel ? Number(selectedHotel.total_amount) : 0}
-        taxesAmount={Math.round((selectedHotel ? Number(selectedHotel.total_amount) : 720) * 0.1)}
+        roomAmount={selectedHotel ? Number(selectedHotel.total_amount || selectedHotel.price || 0) : 0}
+        taxesAmount={Math.round((selectedHotel ? Number(selectedHotel.total_amount || selectedHotel.price || 0) : 720) * 0.1)}
         currency={selectedHotel?.currency || trip.currency || 'USD'}
-        contact={contact}
+        contact={derivedContact}
+        onInitiateOrder={handleInitiateHotelOrder}
         onProcessPayment={handleProcessHotelPayment}
+      />
+
+      {/* Traveler / Passenger Details Modal */}
+      <TravelerModal
+        isOpen={isTravelerModalOpen}
+        onClose={() => setIsTravelerModalOpen(false)}
+        travelers={travelers}
+        travelersCount={travelersCount}
+        onSave={handleSaveTravelers}
+        defaultEmail={currentUser?.email || ''}
       />
     </div>
   );

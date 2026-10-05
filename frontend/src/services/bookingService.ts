@@ -811,6 +811,42 @@ export class TrustTripBookingService implements IBookingService {
   }
 
   /**
+   * Downloads authenticated flight ticket PDF via GET /api/trips/{transaction_id}/ticket.pdf
+   */
+  async downloadTicketPdf(transactionId: string, bookingRef?: string): Promise<void> {
+    const blob = await api.downloadTicketPdfBlob(transactionId);
+    if (typeof window !== 'undefined') {
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const refPart = bookingRef ? `_${bookingRef}` : '';
+      link.setAttribute('download', `TrustTrip_Ticket${refPart}_${transactionId}.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    }
+  }
+
+  /**
+   * Downloads authenticated hotel voucher PDF via GET /api/trips/{transaction_id}/hotel.pdf
+   */
+  async downloadHotelVoucherPdf(transactionId: string, bookingRef?: string): Promise<void> {
+    const blob = await api.downloadHotelVoucherPdfBlob(transactionId);
+    if (typeof window !== 'undefined') {
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const refPart = bookingRef ? `_${bookingRef}` : '';
+      link.setAttribute('download', `TrustTrip_Voucher${refPart}_${transactionId}.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    }
+  }
+
+  /**
    * Rehydrates canonical trip state from GET /api/trips/{trip_id}
    */
   async getCanonicalTrip(tripId: string): Promise<TripDetail> {

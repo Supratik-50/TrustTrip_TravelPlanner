@@ -1978,6 +1978,62 @@ export class ApiClient {
   async generateTravelPdf(tripId: string): Promise<Blob> {
     return await this.downloadTravelPlanPdfBlob(tripId);
   }
+
+  // --- Wave 3D-A: Authenticated Binary Flight Ticket PDF Stream ---
+  async downloadTicketPdfBlob(transactionId: string): Promise<Blob> {
+    const token = storage.getToken();
+    const headers: Record<string, string> = {
+      Accept: 'application/pdf, application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    const baseUrl = this.getBaseUrl();
+    const url = `${baseUrl}/api/trips/${encodeURIComponent(transactionId)}/ticket.pdf`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+    });
+    if (!response.ok) {
+      let message = 'Unable to download flight ticket PDF.';
+      try {
+        const errorData = await response.json();
+        message = errorData.detail || errorData.error || message;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    return await response.blob();
+  }
+
+  // --- Wave 3D-A: Authenticated Binary Hotel Voucher PDF Stream ---
+  async downloadHotelVoucherPdfBlob(transactionId: string): Promise<Blob> {
+    const token = storage.getToken();
+    const headers: Record<string, string> = {
+      Accept: 'application/pdf, application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    const baseUrl = this.getBaseUrl();
+    const url = `${baseUrl}/api/trips/${encodeURIComponent(transactionId)}/hotel.pdf`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+    });
+    if (!response.ok) {
+      let message = 'Unable to download hotel voucher PDF.';
+      try {
+        const errorData = await response.json();
+        message = errorData.detail || errorData.error || message;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    return await response.blob();
+  }
 }
 
 export const api = new ApiClient();

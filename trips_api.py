@@ -210,6 +210,23 @@ async def get_trip(
             trip["selected_hotel_offer"] = meta["selected_hotel"]
         if meta.get("selected_flight"):
             trip["selected_flight_offer"] = meta["selected_flight"]
+
+    # Wave 3D-A: Expose active booking authorization for current revision if exists
+    cur_rev_id = trip.get("current_revision_id")
+    if cur_rev_id:
+        from services.authorization_store import AuthorizationStore
+        auth = AuthorizationStore().get_booking_authorization(trip_id=trip_id, revision_id=cur_rev_id)
+        if auth and str(auth.user_id) == str(current_user.id):
+            trip["booking_authorization"] = {
+                "authorization_id": str(auth.authorization_id),
+                "trip_id": str(auth.trip_id),
+                "revision_id": str(auth.revision_id),
+                "revision_number": int(auth.revision_number),
+                "authorized_at": auth.authorized_at.isoformat() if hasattr(auth.authorized_at, "isoformat") else str(auth.authorized_at),
+                "metadata": auth.authorization_metadata or {},
+            }
+            trip["is_booking_authorized"] = True
+
     return {"success": True, "trip": trip}
 
 

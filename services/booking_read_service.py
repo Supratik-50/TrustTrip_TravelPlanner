@@ -224,14 +224,14 @@ class BookingReadService:
         results: list[dict[str, Any]] = []
         if self.use_in_memory:
             for rec in FlightBookingService._IN_MEMORY_BOOKINGS.values():
-                if str(rec.get("user_id")) == uid_str:
+                if str(rec.get("user_id")) == uid_str and str(rec.get("status") or "").upper() != "FAILED":
                     results.append(rec)
             results.sort(key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""), reverse=True)
         else:
             try:
                 with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
                     rows = conn.execute(
-                        "SELECT * FROM booking_intents WHERE user_id = %s ORDER BY updated_at DESC, created_at DESC LIMIT %s",
+                        "SELECT * FROM booking_intents WHERE user_id = %s AND UPPER(status::text) != 'FAILED' ORDER BY updated_at DESC, created_at DESC LIMIT %s",
                         (uid_str, limit),
                     ).fetchall()
                     for r in rows:
@@ -256,6 +256,10 @@ class BookingReadService:
                 status_str = "cancelled"
             else:
                 status_str = str(r.get("status") or "").lower()
+
+            # Wave 3D-A: Exclude failed flight intents from active My Trips display
+            if status_str in {"failed"}:
+                continue
 
             booking_ref = r.get("provider_reference") or meta.get("booking_reference")
             normalized.append({

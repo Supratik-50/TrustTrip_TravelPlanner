@@ -278,6 +278,8 @@ class AuthorizationStore:
                 authorization_metadata=row["authorization_metadata"] or {},
             )
 
+    get_authorization = get_booking_authorization
+
     def list_authorizations_for_trip(
         self,
         trip_id: UUID | str,
