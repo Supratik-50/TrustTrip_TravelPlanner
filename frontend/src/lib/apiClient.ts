@@ -1146,6 +1146,14 @@ export class ApiClient {
           code: 'VALIDATION_ERROR',
         } as ApiError;
       }
+      if (err.statusCode === 503) {
+        throw {
+          statusCode: 503,
+          message: err.message || err.detail || 'Upstream AI travel planning service is temporarily overloaded. Please try again shortly.',
+          code: 'SERVICE_UNAVAILABLE',
+          retryable: true,
+        } as ApiError;
+      }
       // Never silently fallback to fabricated itineraries on travel planning failure
       throw err;
     }

@@ -66,6 +66,25 @@ def _dsn() -> str:
     return value
 
 
+def _normalize_reconciled_order(order: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a raw Duffel order dictionary returned by find_order_by_offer into booking_res format."""
+    return {
+        "provider": "duffel",
+        "order_id": order.get("id"),
+        "booking_reference": order.get("booking_reference") or order.get("id"),
+        "status": order.get("type") or "confirmed",
+        "order_type": order.get("type"),
+        "total_amount": order.get("total_amount"),
+        "total_currency": order.get("total_currency"),
+        "payment_required_by": order.get("payment_required_by"),
+        "live_mode": order.get("live_mode", False),
+        "documents": order.get("documents") or [],
+        "slices": order.get("slices") or [],
+        "pnr": order.get("booking_reference"),
+        "raw": order,
+    }
+
+
 class FareChangedException(Exception):
     """Raised when revalidation detects price or schedule change during legacy handoff."""
 
@@ -620,6 +639,31 @@ class FlightBookingService:
 
         # 1. State guards & duplicate / in-progress confirmation protection
         if current_status == BookingStatus.HANDED_OFF.value:
+            # Check if an existing provider order was already created on a prior attempt
+            snapshot_id = intent.get("selected_offer_snapshot_id")
+            snapshot = self.store.get_snapshot(snapshot_id, user_id) if snapshot_id else None
+            raw_provider_offer_id = snapshot.provider_offer_id if snapshot else None
+            if raw_provider_offer_id and hasattr(self.flight_service, "find_order_by_offer"):
+                try:
+                    existing_order = await asyncio.to_thread(
+                        self.flight_service.find_order_by_offer, raw_provider_offer_id
+                    )
+                    if existing_order and (existing_order.get("id") or existing_order.get("booking_reference")):
+                        logger.info(
+                            "Found existing provider order %s for HANDED_OFF intent %s; reconciling.",
+                            existing_order.get("id"), booking_id
+                        )
+                        booking_res = _normalize_reconciled_order(existing_order)
+                        return self._finalize_completed_booking(
+                            intent=intent,
+                            snapshot=snapshot,
+                            booking_res=booking_res,
+                            expected_amount=float(intent["expected_amount"]),
+                            currency=str(intent["currency"]).upper(),
+                            passengers=intent.get("metadata", {}).get("passengers", []),
+                        )
+                except Exception as rec_err:
+                    logger.warning("Reconciliation query failed for HANDED_OFF intent %s: %s", booking_id, rec_err)
             raise DuplicateBookingError(
                 "Duplicate confirmation blocked: Booking confirmation is currently in progress (HANDED_OFF)."
             )
@@ -755,6 +799,7 @@ class FlightBookingService:
 
         # 6. Execute booking call via provider abstraction
         passengers = intent.get("metadata", {}).get("passengers", [])
+        booking_res = None
         try:
             booking_res = await asyncio.to_thread(
                 self.flight_service.provider.book,
@@ -763,23 +808,71 @@ class FlightBookingService:
                 payment=payment,
                 payment_mode=payment_mode,
             )
-        except FlightProviderTimeout as exc:
-            intent["status"] = BookingStatus.FAILED.value
-            intent["metadata"]["failure_reason"] = f"Timeout: {exc}"
-            self._save_intent(intent)
-            raise ProviderBookingError(f"Flight provider timed out during booking: {exc}")
-        except FlightProviderError as exc:
-            intent["status"] = BookingStatus.FAILED.value
-            intent["metadata"]["failure_reason"] = f"Provider error: {exc}"
-            self._save_intent(intent)
-            raise ProviderBookingError(f"Flight provider booking failed: {exc}")
         except Exception as exc:
-            intent["status"] = BookingStatus.FAILED.value
-            intent["metadata"]["failure_reason"] = f"Unexpected error: {exc}"
-            self._save_intent(intent)
-            raise ProviderBookingError(f"Booking execution failed: {exc}")
+            # Ambiguous provider exception: Duffel order creation is non-transactional
+            # with respect to network drops/timeouts/500s. Attempt to locate an existing order
+            # before marking intent as failed.
+            recovered_order = None
+            rec_lookup_failed = False
+            if hasattr(self.flight_service, "find_order_by_offer"):
+                try:
+                    recovered_order = await asyncio.to_thread(
+                        self.flight_service.find_order_by_offer, raw_provider_offer_id
+                    )
+                except Exception as rec_err:
+                    rec_lookup_failed = True
+                    logger.warning(
+                        "Reconciliation lookup failed for offer %s after error %s: %s",
+                        raw_provider_offer_id, exc, rec_err
+                    )
+
+            if recovered_order and (recovered_order.get("id") or recovered_order.get("booking_reference")):
+                logger.info(
+                    "Reconciled existing provider order %s for intent %s after booking exception: %s",
+                    recovered_order.get("id"), booking_id, exc
+                )
+                booking_res = _normalize_reconciled_order(recovered_order)
+            elif rec_lookup_failed:
+                # Both provider booking and reconciliation lookup failed; state is strictly ambiguous.
+                # Keep intent in HANDED_OFF to block duplicate booking until status can be verified.
+                intent["metadata"]["failure_reason"] = f"Ambiguous provider response: {exc}. Reconciliation lookup also failed."
+                self._save_intent(intent)
+                raise ProviderBookingError(
+                    f"Flight provider response was ambiguous ({exc}) and status could not be verified. "
+                    "Booking remains in progress. Please check booking status before retrying."
+                ) from exc
+            else:
+                # Reconciliation lookup succeeded and confirmed NO provider order was created.
+                # Safe to mark the intent as FAILED.
+                intent["status"] = BookingStatus.FAILED.value
+                intent["metadata"]["failure_reason"] = f"{type(exc).__name__}: {exc}"
+                self._save_intent(intent)
+                if isinstance(exc, FlightProviderTimeout):
+                    raise ProviderBookingError(f"Flight provider timed out during booking: {exc}") from exc
+                elif isinstance(exc, FlightProviderError):
+                    raise ProviderBookingError(f"Flight provider booking failed: {exc}") from exc
+                else:
+                    raise ProviderBookingError(f"Booking execution failed: {exc}") from exc
 
         # 7. Transition to COMPLETED
+        return self._finalize_completed_booking(
+            intent=intent,
+            snapshot=snapshot,
+            booking_res=booking_res,
+            expected_amount=expected_amount,
+            currency=currency,
+            passengers=passengers,
+        )
+
+    def _finalize_completed_booking(
+        self,
+        intent: dict[str, Any],
+        snapshot: Any,
+        booking_res: dict[str, Any],
+        expected_amount: float,
+        currency: str,
+        passengers: list[dict[str, Any]],
+    ) -> FlightBookingConfirmationResponse:
         booking_ref = (
             booking_res.get("booking_reference")
             or booking_res.get("reference")
@@ -879,6 +972,29 @@ class FlightBookingService:
     async def get_booking(self, user_id: UUID | str, booking_id: UUID | str) -> dict[str, Any]:
         """Query booking status strictly shielding raw provider IDs."""
         intent = self._get_intent(booking_id, user_id)
+        if intent.get("status") == BookingStatus.HANDED_OFF.value:
+            snapshot_id = intent.get("selected_offer_snapshot_id")
+            snapshot = self.store.get_snapshot(snapshot_id, user_id) if snapshot_id else None
+            raw_provider_offer_id = snapshot.provider_offer_id if snapshot else None
+            if raw_provider_offer_id and hasattr(self.flight_service, "find_order_by_offer"):
+                try:
+                    existing_order = await asyncio.to_thread(
+                        self.flight_service.find_order_by_offer, raw_provider_offer_id
+                    )
+                    if existing_order and (existing_order.get("id") or existing_order.get("booking_reference")):
+                        booking_res = _normalize_reconciled_order(existing_order)
+                        self._finalize_completed_booking(
+                            intent=intent,
+                            snapshot=snapshot,
+                            booking_res=booking_res,
+                            expected_amount=float(intent["expected_amount"]),
+                            currency=str(intent["currency"]).upper(),
+                            passengers=intent.get("metadata", {}).get("passengers", []),
+                        )
+                        intent = self._get_intent(booking_id, user_id)
+                except Exception as rec_err:
+                    logger.warning("Reconciliation lookup in get_booking failed for intent %s: %s", booking_id, rec_err)
+
         meta = intent.get("metadata") or {}
         booking_ref = intent.get("provider_reference") or meta.get("booking_reference")
         return {

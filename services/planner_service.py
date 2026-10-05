@@ -131,12 +131,49 @@ class PlannerService:
                     meta = {}
             meta = dict(meta)
 
-            start_date = meta.get("start_date") or meta.get("departure_date")
-            end_date = meta.get("end_date") or meta.get("return_date")
-            travelers_count = int(meta.get("travelers_count") or meta.get("passengers") or meta.get("adults") or 1)
-            budget_val = meta.get("budget") or meta.get("budget_amount")
-            currency_val = meta.get("currency") or "INR"
-            style_val = meta.get("travel_style") or meta.get("style") or ""
+            constraints_dict = meta.get("constraints") or {}
+            if not isinstance(constraints_dict, dict):
+                constraints_dict = {}
+
+            start_date = (
+                constraints_dict.get("start_date")
+                or constraints_dict.get("departure_date")
+                or meta.get("start_date")
+                or meta.get("departure_date")
+            )
+            end_date = (
+                constraints_dict.get("end_date")
+                or constraints_dict.get("return_date")
+                or meta.get("end_date")
+                or meta.get("return_date")
+            )
+            travelers_count = int(
+                constraints_dict.get("travelers_count")
+                or constraints_dict.get("passengers")
+                or constraints_dict.get("adults")
+                or meta.get("travelers_count")
+                or meta.get("passengers")
+                or meta.get("adults")
+                or 1
+            )
+            budget_val = (
+                constraints_dict.get("budget")
+                or constraints_dict.get("budget_amount")
+                or meta.get("budget")
+                or meta.get("budget_amount")
+            )
+            currency_val = (
+                constraints_dict.get("currency")
+                or meta.get("currency")
+                or "INR"
+            )
+            style_val = (
+                constraints_dict.get("travel_style")
+                or constraints_dict.get("style")
+                or meta.get("travel_style")
+                or meta.get("style")
+                or ""
+            )
             rev_num = canonical_trip_record.get("current_revision_number", 0)
 
             orig_code, orig_city, orig_country = _resolve_place(origin_raw) if origin_raw else (None, None, None)
@@ -449,6 +486,11 @@ class PlannerService:
         # value — doing so would manufacture a match for a field the planner never
         # actually produced.
         if has_canonical_constraints and canonical_trip_record and canonical_constraints:
+            # If planning was blocked due to an upstream LLM outage, bypass destination validation
+            # so the structured outage status can reach the API caller.
+            if serialized.get("planning_blocked") or serialized.get("plan_json", {}).get("status") == "unavailable":
+                return serialized
+
             plan_json = serialized.get("plan_json") or {}
 
             def _plan_val(key: str):

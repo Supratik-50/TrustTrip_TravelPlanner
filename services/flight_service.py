@@ -144,8 +144,10 @@ class FlightService:
         return self.provider.get_order(order_id)
 
     def find_order_by_offer(self, offer_id: str) -> dict[str, Any] | None:
+        if hasattr(self.provider, "find_order_by_offer"):
+            return self.provider.find_order_by_offer(offer_id)
         if not isinstance(self.provider, DuffelProvider):
-            raise FlightProviderError("Order lookup is supported by the Duffel provider only.")
+            return None
         return self.provider.find_order_by_offer(offer_id)
 
 

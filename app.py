@@ -229,11 +229,35 @@ async def travel_planner(
 
         if not planner_success:
             err_msg = result.get("error") or result.get("guardrail_reason") or "Travel planning failed."
-            status_code = result.get("status_code", 422 if result.get("guardrail_allowed") is False else 500)
+            outage_code = result.get("status_code") or result.get("outage_status_code")
+            if not outage_code:
+                outage_code = 422 if result.get("guardrail_allowed") is False else 500
+
+            if outage_code == 503 or (result.get("planning_blocked") and result.get("outage_status_code") == 503):
+                out_dict["success"] = False
+                out_dict["error"] = "Upstream AI travel planning service is temporarily overloaded. Please try again shortly."
+                out_dict["retryable"] = True
+                out_dict["status_code"] = 503
+                return JSONResponse(
+                    status_code=503,
+                    content=jsonable_encoder(out_dict),
+                    headers={"Retry-After": "5"},
+                )
+
+            if outage_code == 429 or (result.get("planning_blocked") and result.get("outage_status_code") == 429):
+                out_dict["success"] = False
+                out_dict["error"] = "AI planning rate limit exceeded. Please wait before retrying."
+                out_dict["retryable"] = False
+                out_dict["status_code"] = 429
+                return JSONResponse(
+                    status_code=429,
+                    content=jsonable_encoder(out_dict),
+                )
+
             out_dict["success"] = False
             out_dict["error"] = err_msg
             return JSONResponse(
-                status_code=status_code,
+                status_code=outage_code,
                 content=jsonable_encoder(out_dict)
             )
 
@@ -425,6 +449,31 @@ async def travel_planner(
     except HTTPException:
         raise
     except Exception as exc:
+        err_str = str(exc)
+        err_code = getattr(exc, "status_code", getattr(exc, "code", None))
+        if err_code == 503 or "503" in err_str or "Service Unavailable" in err_str or "overloaded" in err_str.lower():
+            logger.warning("Upstream AI provider 503 in travel_planner: %s", exc)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "error": "Upstream AI travel planning service is temporarily overloaded. Please try again shortly.",
+                    "retryable": True,
+                    "provider": "gemini",
+                },
+                headers={"Retry-After": "5"},
+            )
+        if err_code == 429 or "429" in err_str or "ResourceExhausted" in err_str or "rate limit" in err_str.lower():
+            logger.warning("Upstream AI provider 429 in travel_planner: %s", exc)
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "success": False,
+                    "error": "AI planning rate limit exceeded. Please wait before retrying.",
+                    "retryable": False,
+                    "provider": "gemini",
+                },
+            )
         logger.exception("Error processing travel request: %s", exc)
         return JSONResponse(
             status_code=500,

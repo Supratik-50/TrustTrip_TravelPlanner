@@ -130,11 +130,12 @@ class DuffelProvider(FlightProvider):
         **kwargs: Any,
     ) -> dict[str, Any]:
         timeout = request_timeout or self.timeout
+        req_headers = {**self.headers, **kwargs.pop("headers", {})}
         try:
             response = requests.request(
                 method,
                 f"{self.BASE_URL}{path}",
-                headers=self.headers,
+                headers=req_headers,
                 timeout=timeout,
                 **kwargs,
             )
@@ -366,6 +367,7 @@ class DuffelProvider(FlightProvider):
         passengers: list[dict[str, Any]],
         payment: dict[str, Any] | None = None,
         payment_mode: str = "auto",
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Create an order after the application has obtained final confirmation.
 
@@ -484,10 +486,15 @@ class DuffelProvider(FlightProvider):
                 "payments": [payment],
             }
 
+        extra_headers = {}
+        if idempotency_key:
+            extra_headers["Idempotency-Key"] = str(idempotency_key)
+
         result = self._request(
             "POST",
             "/air/orders",
             request_timeout=self.order_timeout,
+            headers=extra_headers,
             json={"data": data},
         )
         order = result.get("data") or {}

@@ -60,10 +60,13 @@ class TravelPlan(BaseModel):
     destination: str | None = None
     origin_airport: str | None = None
     destination_airport: str | None = None
+    departure_date: str | None = None
+    return_date: str | None = None
     adults: int | None = None
     children: int | None = None
     infants: int | None = None
     passenger_count: int | None = None
+    travelers: int | None = None
     selected_flight_id: str | None = None
     selected_hotel_id: str | None = None
     revision_number: int | None = None
@@ -71,6 +74,8 @@ class TravelPlan(BaseModel):
     # Outage policy fields (Phase 8 Invariant)
     status: str = "success"  # "success" | "unavailable"
     planning_unavailable: bool = False
+    outage_status_code: int | None = None
+    retryable: bool = False
 
 
 SYSTEM_PROMPT = """
@@ -326,10 +331,14 @@ class PlannerOutageError(RuntimeError):
         *,
         errors: list[str] | None = None,
         plan: TravelPlan | None = None,
+        status_code: int = 503,
+        retryable: bool = True,
     ) -> None:
         super().__init__(message)
         self.errors = errors or []
         self.plan = plan
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 def _build_unavailable_plan(
@@ -373,6 +382,18 @@ def _build_unavailable_plan(
     sel_hotel = constraints.get("selected_hotel_id") or rec_ht.get("id") or rec_ht.get("offer_id")
     rev = constraints.get("current_revision_number") if constraints.get("current_revision_number") is not None else constraints.get("revision_number")
 
+    dep = constraints.get("departure_date") or constraints.get("start_date")
+    ret = constraints.get("return_date") or constraints.get("end_date")
+    pax = (
+        constraints.get("passenger_count")
+        or constraints.get("passengers")
+        or constraints.get("travelers")
+        or constraints.get("travelers_count")
+        or constraints.get("adults")
+    )
+    if isinstance(pax, list):
+        pax = len(pax)
+
     return TravelPlan(
         status="unavailable",
         planning_unavailable=True,
@@ -393,10 +414,13 @@ def _build_unavailable_plan(
         destination=destination,
         origin_airport=constraints.get("origin_airport") or constraints.get("origin_code"),
         destination_airport=constraints.get("destination_airport") or constraints.get("destination_code"),
+        departure_date=str(dep)[:10] if dep else None,
+        return_date=str(ret)[:10] if ret else None,
         adults=constraints.get("adults"),
         children=constraints.get("children"),
         infants=constraints.get("infants"),
         passenger_count=constraints.get("passenger_count"),
+        travelers=int(pax) if pax is not None else None,
         selected_flight_id=str(sel_flight) if sel_flight else None,
         selected_hotel_id=str(sel_hotel) if sel_hotel else None,
         revision_number=int(rev) if rev is not None else None,
@@ -439,6 +463,18 @@ def _deterministic_fallback(*, constraints, flight_offers, hotel_offers, budget,
     sel_hotel = constraints.get("selected_hotel_id") or rec_ht.get("id") or rec_ht.get("offer_id")
     rev = constraints.get("current_revision_number") if constraints.get("current_revision_number") is not None else constraints.get("revision_number")
 
+    dep = constraints.get("departure_date") or constraints.get("start_date")
+    ret = constraints.get("return_date") or constraints.get("end_date")
+    pax = (
+        constraints.get("passenger_count")
+        or constraints.get("passengers")
+        or constraints.get("travelers")
+        or constraints.get("travelers_count")
+        or constraints.get("adults")
+    )
+    if isinstance(pax, list):
+        pax = len(pax)
+
     return TravelPlan(
         trip_summary=f"A {duration}-day trip from {origin} to {destination} for {constraints.get('passenger_count',1)} traveller(s).",
         route=f"{origin} → {destination}", duration_days=duration, travel_dates=travel_dates,
@@ -453,10 +489,13 @@ def _deterministic_fallback(*, constraints, flight_offers, hotel_offers, budget,
         destination=destination,
         origin_airport=constraints.get("origin_airport") or constraints.get("origin_code"),
         destination_airport=constraints.get("destination_airport") or constraints.get("destination_code"),
+        departure_date=str(dep)[:10] if dep else None,
+        return_date=str(ret)[:10] if ret else None,
         adults=constraints.get("adults"),
         children=constraints.get("children"),
         infants=constraints.get("infants"),
         passenger_count=constraints.get("passenger_count"),
+        travelers=int(pax) if pax is not None else None,
         selected_flight_id=str(sel_flight) if sel_flight else None,
         selected_hotel_id=str(sel_hotel) if sel_hotel else None,
         revision_number=int(rev) if rev is not None else None,
@@ -622,6 +661,17 @@ def enforce_complete_canonical_invariants(
             plan.infants = int(infants)
 
     canonical_passengers = ctx.get("passenger_count")
+    if canonical_passengers is None:
+        p_val = ctx.get("passengers")
+        if isinstance(p_val, list):
+            canonical_passengers = len(p_val)
+        elif p_val is not None:
+            try:
+                canonical_passengers = int(p_val)
+            except (ValueError, TypeError):
+                pass
+    if canonical_passengers is None:
+        canonical_passengers = ctx.get("travelers") or ctx.get("travelers_count")
     if canonical_passengers is None and adults is not None:
         canonical_passengers = (adults or 0) + (children or 0) + (infants or 0)
 
@@ -681,15 +731,38 @@ def enforce_complete_canonical_invariants(
             plan.revision_number = int(canonical_rev)
 
     # 6. CANONICAL NORMALIZATION: Dates, Duration, One-way & Budget Target
-    dep = ctx.get("departure_date")
-    ret = ctx.get("return_date")
+    dep = ctx.get("departure_date") or ctx.get("start_date")
+    ret = ctx.get("return_date") or ctx.get("end_date")
     is_one_way = bool(ctx.get("is_one_way", False)) or (dep and not ret)
 
+    if dep:
+        plan.departure_date = str(dep)[:10]
+    else:
+        plan.departure_date = None
+
+    if ret:
+        plan.return_date = str(ret)[:10]
+    else:
+        plan.return_date = None
+
+    canonical_travelers = (
+        canonical_passengers
+        if canonical_passengers is not None
+        else (ctx.get("travelers") or ctx.get("travelers_count") or ctx.get("adults"))
+    )
+    if canonical_travelers is not None:
+        try:
+            plan.travelers = int(canonical_travelers)
+        except (ValueError, TypeError):
+            plan.travelers = None
+    else:
+        plan.travelers = None
+
     if dep and is_one_way:
-        plan.travel_dates = f"{dep} (one-way)"
+        plan.travel_dates = f"{str(dep)[:10]} (one-way)"
         plan.duration_days = 1
     elif dep and ret:
-        plan.travel_dates = f"{dep} to {ret}"
+        plan.travel_dates = f"{str(dep)[:10]} to {str(ret)[:10]}"
         try:
             d1 = date.fromisoformat(str(dep)[:10])
             d2 = date.fromisoformat(str(ret)[:10])
@@ -805,8 +878,38 @@ def generate_travel_plan(
         selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,
     )
     plan = _attach_advisory(plan)
+
+    # Classify upstream outage: 503 (temporary unavailability, retryable) vs 429 (rate/quota limit)
+    has_503 = False
+    has_429 = False
+    for err_msg in errors:
+        msg_lower = err_msg.lower()
+        if "503" in err_msg or "service unavailable" in msg_lower or "overloaded" in msg_lower:
+            has_503 = True
+        elif "429" in err_msg or "resourceexhausted" in msg_lower or "rate limit" in msg_lower or "quota" in msg_lower:
+            has_429 = True
+
+    if has_503:
+        outage_status_code = 503
+        is_retryable = True
+    elif has_429:
+        outage_status_code = 429
+        is_retryable = False
+    else:
+        outage_status_code = 500
+        is_retryable = False
+
+    plan.outage_status_code = outage_status_code
+    plan.retryable = is_retryable
+
     if raise_on_outage:
-        raise PlannerOutageError(outage_reason, errors=errors, plan=plan)
+        raise PlannerOutageError(
+            outage_reason,
+            errors=errors,
+            plan=plan,
+            status_code=outage_status_code,
+            retryable=is_retryable,
+        )
     return plan, "unavailable"
 
 

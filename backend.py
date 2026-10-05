@@ -773,6 +773,8 @@ def itinerary_agent(state: TravelState):
         plan_json = plan.model_dump()
         itinerary = plan_to_markdown(plan)
         if getattr(plan, "planning_unavailable", False) or provider == "unavailable":
+            outage_code = getattr(plan, "outage_status_code", 503 if any("503" in str(w) for w in (getattr(plan, "warnings", []) or [])) else 500)
+            is_retryable = bool(getattr(plan, "retryable", outage_code == 503))
             return {
                 "itinerary": itinerary,
                 "plan_json": plan_json,
@@ -780,6 +782,8 @@ def itinerary_agent(state: TravelState):
                 "llm_calls": state.get("llm_calls", 0) + 1,
                 "planning_blocked": True,
                 "planning_feedback": plan.warnings,
+                "outage_status_code": outage_code,
+                "retryable": is_retryable,
                 "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
                 "messages": [AIMessage(content=itinerary)],
             }
@@ -801,6 +805,8 @@ def itinerary_agent(state: TravelState):
         else:
             plan_json = {"status": "unavailable", "planning_unavailable": True, "warnings": exc.errors}
             itinerary = "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified evidence has been preserved."
+        outage_code = getattr(exc, "status_code", 503)
+        is_retryable = getattr(exc, "retryable", outage_code == 503)
         return {
             "itinerary": itinerary,
             "plan_json": plan_json,
@@ -808,6 +814,8 @@ def itinerary_agent(state: TravelState):
             "llm_calls": state.get("llm_calls", 0) + 1,
             "planning_blocked": True,
             "planning_feedback": exc.errors,
+            "outage_status_code": outage_code,
+            "retryable": is_retryable,
             "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
             "messages": [AIMessage(content=itinerary)],
         }
@@ -1071,6 +1079,13 @@ def _serialize_result(
         "revision_count": result.get("revision_count", 0),
         "planning_blocked": result.get("planning_blocked", False),
         "planning_feedback": result.get("planning_feedback", []),
+        "outage_status_code": result.get("outage_status_code"),
+        "status_code": (
+            result.get("outage_status_code")
+            if result.get("planning_blocked")
+            else (422 if result.get("guardrail_allowed") is False else 200)
+        ),
+        "retryable": result.get("retryable", False),
         "flight_search_status": result.get("flight_search_status", "ok"),
         "flight_search_errors": result.get("flight_search_errors", []),
         "flight_provider": os.getenv("FLIGHT_PROVIDER", "duffel").strip().lower(),
