@@ -23,6 +23,7 @@ import {
   TravelerContactInfo,
   CancellationRequest,
 } from '../types/bookingFrontend';
+import { FlightPassenger } from '../types/flight';
 
 const STORAGE_PREFIX = 'trusttrip_booking_state_';
 
@@ -35,15 +36,8 @@ export interface TripBookingStateStore {
   hotelConfirmation?: HotelConfirmationRecord;
   hasPriceChanged: boolean;
   isFlightUnavailable: boolean;
+  travelers?: FlightPassenger[];
 }
-
-export const DEFAULT_TRAVELER_CONTACT: TravelerContactInfo = {
-  first_name: 'Ananya',
-  last_name: 'Roy',
-  email: 'ananya.roy@example.travel',
-  phone: '+91 98301 23456',
-  special_requests: 'Quiet room away from elevator, vegetarian meal on long-haul sectors.',
-};
 
 /**
  * Generates realistic flight confirmation vouchers
@@ -306,11 +300,10 @@ class MockBookingService implements IBookingService {
     return confirmation;
   }
 
-  async requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id: string; message: string }> {
+  async requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id?: string; status?: string; message: string }> {
     await this.delay(700);
-    const ticketId = `CN-${Math.floor(100000 + Math.random() * 900000)}`;
     return {
-      ticket_id: ticketId,
+      status: request.booking_type === 'hotel' ? 'cancellation_requested' : 'cancelled',
       message: `Your cancellation request for ${request.booking_type} has been submitted. Our concierge team will review partner terms and contact ${request.contact_email} within 4 hours.`,
     };
   }
@@ -407,6 +400,27 @@ class MockBookingService implements IBookingService {
 
   setActiveBookingId(tripId: string, bookingId: string): void {
     this.mockActiveBookingIds.set(tripId, bookingId);
+  }
+
+  async getTripBookings(tripId: string): Promise<any> {
+    await this.delay(100);
+    const state = getStoredBookingState(tripId);
+    return {
+      success: true,
+      trip_id: tripId,
+      flight: state.flightConfirmation ? {
+        is_booked: state.flightState === 'confirmed',
+        status: state.flightState,
+        booking_id: state.flightConfirmation.booking_id,
+        booking_reference: state.flightConfirmation.booking_reference,
+      } : null,
+      hotel: state.hotelConfirmation ? {
+        is_booked: state.hotelState === 'confirmed',
+        status: state.hotelState,
+        transaction_id: state.hotelConfirmation.transaction_id,
+        confirmation_code: state.hotelConfirmation.confirmation_code,
+      } : null,
+    };
   }
 }
 

@@ -9,6 +9,8 @@
  * - Final Journey Confirmation & Travel Documents
  */
 
+import { FlightPassenger } from './flight';
+
 export type JourneyApprovalStatus = 'pending_review' | 'approved' | 'rejected';
 
 export type FlightVerificationState =
@@ -36,6 +38,7 @@ export type HotelBookingState =
   | 'payment_processing'
   | 'payment_success'
   | 'payment_failed'
+  | 'booking_in_progress'
   | 'confirmed';
 
 export type OverallBookingStatus =
@@ -82,6 +85,7 @@ export interface ExternalCheckoutHandoff {
 }
 
 export interface FlightConfirmationRecord {
+  booking_id?: string;
   booking_reference: string;
   ticket_number?: string;
   carrier_code: string;
@@ -100,12 +104,18 @@ export interface FlightConfirmationRecord {
 }
 
 export interface HotelConfirmationRecord {
+  transaction_id?: string;
   confirmation_code: string;
   property_name?: string;
   property_address?: string;
+  hotel_name?: string;
   room_name?: string;
   check_in_date?: string;
   check_out_date?: string;
+  check_in?: string;
+  check_out?: string;
+  total_price?: number;
+  currency?: string;
   nights_count?: number;
   guests_count?: number;
   cancellation_policy?: string;
@@ -143,7 +153,7 @@ export interface CancellationRequest {
 export interface IBookingService {
   approvePlan(tripId: string, expectedRevision: number, revisionId: string): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }>;
   authorizeBooking?(tripId: string, expectedRevision: number, revisionId: string, notes?: string): Promise<{ authorized: boolean; authorized_at: string; authorization_id: string; revision_number: number }>;
-  verifyFlight(tripId: string, offerId: string): Promise<{
+  verifyFlight(tripId: string, offerId: string, passengers?: FlightPassenger[]): Promise<{
     state: FlightVerificationState;
     current_amount: number;
     currency: string;
@@ -153,24 +163,40 @@ export interface IBookingService {
   acceptPriceChange(tripId: string, offerId: string): Promise<boolean>;
   initiateFlightHandoff(tripId: string, offerId: string): Promise<ExternalCheckoutHandoff>;
   confirmFlightHandoffReturn(tripId: string, handoffToken: string): Promise<FlightConfirmationRecord>;
-  prepareHotelBooking(tripId: string, hotelId: string, offerData?: any): Promise<{ required_amount: number; currency: string; prebook_id?: string }>;
+  prepareHotelBooking(tripId: string, hotelId: string, offerData?: any, guestInfo?: { name?: string; email?: string; firstName?: string; lastName?: string; phone?: string }): Promise<{ required_amount: number; currency: string; prebook_id?: string }>;
+  initiateHotelPaymentOrder?(
+    tripId: string,
+    contact: TravelerContactInfo,
+    revisionId: string,
+    expectedRevisionNumber: number,
+    allTravelers?: FlightPassenger[]
+  ): Promise<{
+    transaction_id: string;
+    razorpay_order_id: string;
+    amount_inr: number;
+    currency: string;
+    key_id: string;
+    hotel_name?: string;
+  }>;
   processHotelPayment(
     tripId: string,
     paymentMethod: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
     contact: TravelerContactInfo,
     revisionId?: string,
     expectedRevisionNumber?: number,
-    paymentDetails?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
+    paymentDetailsOrTravelers?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
+    allTravelers?: FlightPassenger[]
   ): Promise<HotelConfirmationRecord>;
-  requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id: string; message: string }>;
+  requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id?: string; status?: string; message: string }>;
   downloadTravelPlanPdf(tripId: string): Promise<void>;
 
   // Section 5B / 5C Authoritative Contracts
-  selectFlightOffer(tripId: string, offerId: string, passengers: any[]): Promise<any>;
+  selectFlightOffer(tripId: string, offerId: string, passengers: FlightPassenger[]): Promise<any>;
   revalidateFlightContract(bookingId: string, acceptedPrice?: number): Promise<any>;
   approveFlightBooking(bookingId: string, notes?: string): Promise<any>;
   confirmFlightBooking(bookingId: string): Promise<any>;
   getFlightBooking(bookingId: string): Promise<any>;
   getActiveBookingId(tripId: string): string | undefined;
   setActiveBookingId(tripId: string, bookingId: string): void;
+  getTripBookings(tripId: string): Promise<any>;
 }

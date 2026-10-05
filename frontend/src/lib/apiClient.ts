@@ -150,24 +150,40 @@ const saveMockPlan = (tripId: string, plan: TravelPlanResponse) => {
 
 export function normalizeBackendTrip(raw: any): TripSummary {
   if (!raw) return {} as TripSummary;
-  const meta = raw.metadata || {};
+  let meta = raw.metadata || {};
+  if (typeof meta === 'string') {
+    try {
+      meta = JSON.parse(meta);
+    } catch {
+      meta = {};
+    }
+  }
+  const constraints = meta.constraints || {};
   const tripId = raw.id || raw.trip_id;
   return {
     id: raw.id || tripId,
     trip_id: tripId,
-    title: raw.title || `${raw.destination} Journey`,
-    origin: raw.origin || meta.origin || '',
-    destination: raw.destination || meta.destination || '',
-    start_date: raw.start_date || meta.start_date || '',
-    end_date: raw.end_date || meta.end_date || '',
+    title: raw.title || (raw.destination ? `${raw.destination} Journey` : (meta.destination ? `${meta.destination} Journey` : 'Trip Journey')),
+    origin: raw.origin || meta.origin || constraints.origin || '',
+    destination: raw.destination || meta.destination || constraints.destination || '',
+    start_date: raw.start_date || meta.start_date || constraints.start_date || constraints.departure_date || '',
+    end_date: raw.end_date || meta.end_date || constraints.end_date || constraints.return_date || '',
     status: raw.status || 'draft',
-    active_revision_number: raw.current_revision_number ?? raw.active_revision_number ?? 1,
-    active_revision_id: raw.active_revision_id || `rev_${tripId}_01`,
+    active_revision_number: raw.current_revision_number ?? raw.active_revision_number ?? meta.revision ?? meta.trip_revision ?? 1,
+    // FIX 3: Never fabricate revision IDs. If backend doesn't supply one, leave undefined.
+    active_revision_id: raw.active_revision_id || raw.current_revision_id || meta.active_revision_id || undefined,
     thread_id: raw.thread_id || meta.thread_id,
-    travelers_count: raw.travelers_count ?? meta.travelers_count ?? 1,
-    budget: raw.budget ?? meta.budget,
-    currency: raw.currency || meta.currency || 'INR',
+    travelers_count: raw.travelers_count ?? meta.travelers_count ?? constraints.travelers_count ?? constraints.adults ?? 1,
+    budget: raw.budget ?? meta.budget ?? constraints.budget ?? constraints.budget_amount,
+    currency: raw.currency || meta.currency || constraints.currency || 'INR',
     preferences: raw.preferences || meta.preferences || [],
+    metadata: meta,
+    flight_count: raw.flight_count ?? (Array.isArray(raw.flights) ? raw.flights.length : 0),
+    hotel_count: raw.hotel_count ?? (Array.isArray(raw.hotels) ? raw.hotels.length : 0),
+    flights: Array.isArray(raw.flights) ? raw.flights : [],
+    hotels: Array.isArray(raw.hotels) ? raw.hotels : [],
+    is_booking_authorized: Boolean(raw.is_booking_authorized ?? meta.is_booking_authorized),
+    booking_authorization: raw.booking_authorization ?? meta.booking_authorization ?? null,
     created_at: raw.created_at || new Date().toISOString(),
     updated_at: raw.updated_at || new Date().toISOString(),
   };
@@ -394,41 +410,41 @@ export function normalizeBackendPlanResponse(
 }
 
 export function normalizeBackendTripDetail(raw: any): TripDetail {
+  if (!raw) return {} as TripDetail;
+  let meta = raw.metadata || {};
+  if (typeof meta === 'string') {
+    try {
+      meta = JSON.parse(meta);
+    } catch {
+      meta = {};
+    }
+  }
   const summary = normalizeBackendTrip(raw);
+  // FIX 3: Never synthesize revision identity. Revisions must come exclusively
+  // from the backend. Fabricating revision_id values (e.g. rev_<tripId>_01)
+  // creates a P0 identity-integrity risk: approval/rejection/authorization
+  // endpoints require real UUID revision IDs and will reject or mis-route
+  // requests that carry a frontend-invented ID.
   const revisions: TripRevision[] = Array.isArray(raw.revisions) && raw.revisions.length > 0
     ? raw.revisions
-    : [
-        {
-          revision_id: summary.active_revision_id || `rev_${summary.trip_id}_01`,
-          revision_number: summary.active_revision_number || 1,
-          trip_id: summary.trip_id,
-          created_at: summary.created_at,
-          change_summary: 'Initial trip parameters established.',
-          is_approved: summary.status === 'approved',
-          origin: summary.origin,
-          destination: summary.destination,
-          start_date: summary.start_date,
-          end_date: summary.end_date,
-          travelers_count: summary.travelers_count,
-          budget: summary.budget,
-          currency: summary.currency,
-          preferences: summary.preferences,
-        },
-      ];
+    : [];
 
   const plan = raw.plan
     ? normalizeBackendPlanResponse(raw.plan, summary.trip_id, summary.thread_id || raw.thread_id || `th_${summary.trip_id}`)
-    : raw.metadata?.plan
-    ? normalizeBackendPlanResponse(raw.metadata.plan, summary.trip_id, summary.thread_id || raw.metadata?.thread_id || `th_${summary.trip_id}`)
+    : meta?.plan
+    ? normalizeBackendPlanResponse(meta.plan, summary.trip_id, summary.thread_id || meta?.thread_id || `th_${summary.trip_id}`)
     : undefined;
+
+  const selectedFlightOffer = raw.selected_flight_offer || meta.selected_flight || (meta.selected_flight_snapshot_id ? { id: meta.selected_flight_snapshot_id, snapshot_id: meta.selected_flight_snapshot_id, offer_id: meta.selected_flight_snapshot_id } : undefined);
+  const selectedHotelOffer = raw.selected_hotel_offer || meta.selected_hotel || (meta.selected_hotel_snapshot_id ? { id: meta.selected_hotel_snapshot_id, snapshot_id: meta.selected_hotel_snapshot_id } : undefined);
 
   return {
     ...summary,
     revisions,
     current_revision: raw.current_revision || revisions[revisions.length - 1],
     is_approved: summary.status === 'approved',
-    selected_flight_offer: raw.selected_flight_offer,
-    selected_hotel_offer: raw.selected_hotel_offer,
+    selected_flight_offer: selectedFlightOffer,
+    selected_hotel_offer: selectedHotelOffer,
     plan,
   };
 }
@@ -892,28 +908,6 @@ export class ApiClient {
       return intent as unknown as T;
     }
 
-    // --- Part 5B: Booking Cancellation Intent ---
-    if (endpoint.includes('/cancel-intent') && method === 'POST') {
-      const parts = endpoint.split('/');
-      const bookingId = parts[3];
-      return {
-        ticket_id: `CN-${Math.floor(100000 + Math.random() * 900000)}`,
-        booking_id: bookingId,
-        status: 'cancellation_requested',
-        message: 'Your cancellation request has been received. Our concierge team will review partner terms and notify you.',
-        submitted_at: new Date().toISOString(),
-      } as unknown as T;
-    }
-
-    // --- Part 5B: Travel PDF Generation ---
-    if (endpoint === '/api/travel/pdf' && method === 'POST') {
-      return {
-        download_url: '/api/travel/pdf/export.pdf',
-        filename: 'TrustTrip_Journey_Voucher.pdf',
-        success: true,
-      } as unknown as T;
-    }
-
     return null;
   }
 
@@ -1035,6 +1029,20 @@ export class ApiClient {
           method: 'GET',
         });
         if (mock) return normalizeBackendTripDetail(mock);
+      }
+      throw err;
+    }
+  }
+
+  async getTripBookings(tripId: string): Promise<any> {
+    try {
+      const response = await this.request<any>(`/api/trips/${encodeURIComponent(tripId)}/bookings`, {
+        method: 'GET',
+      });
+      return response;
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR' && this.isDemoMode()) {
+        return { success: true, trip_id: tripId, flight: null, hotel: null };
       }
       throw err;
     }
@@ -1214,17 +1222,19 @@ export class ApiClient {
   // --- Canonical Offer Selection (Part 3) ---
   async selectTripOffer(tripId: string, selection: TripOfferSelection): Promise<TripDetail> {
     try {
-      return await this.request<TripDetail>(`/api/trips/${tripId}/select-offer`, {
+      const response = await this.request<any>(`/api/trips/${tripId}/select-offer`, {
         method: 'POST',
         body: JSON.stringify(selection),
       });
+      const rawTrip = response?.trip || response;
+      return normalizeBackendTripDetail(rawTrip);
     } catch (err: any) {
       if (err.code === 'NETWORK_ERROR') {
         const mock = this.handleMockFallback<TripDetail>(`/api/trips/${tripId}/select-offer`, {
           method: 'POST',
           body: JSON.stringify(selection),
         });
-        if (mock) return mock;
+        if (mock) return normalizeBackendTripDetail(mock);
       }
       throw err;
     }
@@ -1874,59 +1884,99 @@ export class ApiClient {
     });
   }
 
-  // --- Part 5B: Booking Cancellation Intent ---
+  // --- Part 5B: Booking Cancellation Intent (Uncompleted drafts) ---
   async cancelBookingIntent(
     bookingId: string,
     request: { reason: string; contact_email: string; cancel_scope?: 'all' | 'flight' | 'hotel' }
   ): Promise<{
-    ticket_id: string;
+    ticket_id?: string;
     booking_id: string;
     status: string;
     message: string;
     submitted_at: string;
   }> {
-    try {
-      return await this.request<any>(`/api/bookings/${bookingId}/cancel-intent`, {
-        method: 'POST',
-        body: JSON.stringify(request),
-      });
-    } catch (err: any) {
-      if (err.code === 'NETWORK_ERROR') {
-        const mock = this.handleMockFallback<any>(`/api/bookings/${bookingId}/cancel-intent`, {
-          method: 'POST',
-          body: JSON.stringify(request),
-        });
-        if (mock) return mock;
-      }
-      throw err;
-    }
+    return await this.request<any>(`/api/bookings/${bookingId}/cancel-intent`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
   }
 
-  // --- Part 5B: Travel PDF Generation ---
-  async generateTravelPdf(
-    tripId: string
-  ): Promise<{ download_url?: string; filename?: string; success: boolean }> {
-    try {
-      return await this.request<{ download_url?: string; filename?: string; success: boolean }>(
-        '/api/travel/pdf',
-        {
-          method: 'POST',
-          body: JSON.stringify({ trip_id: tripId }),
-        }
-      );
-    } catch (err: any) {
-      if (err.code === 'NETWORK_ERROR') {
-        const mock = this.handleMockFallback<{ download_url?: string; filename?: string; success: boolean }>(
-          '/api/travel/pdf',
-          {
-            method: 'POST',
-            body: JSON.stringify({ trip_id: tripId }),
-          }
-        );
-        if (mock) return mock;
-      }
-      throw err;
+  // --- Wave 3C: Canonical Trip & Booking Cancellation ---
+  async cancelTripBookings(
+    tripId: string,
+    request: { booking_type: 'all' | 'flight' | 'hotel'; reason: string; contact_email?: string }
+  ): Promise<{
+    success: boolean;
+    trip_id: string;
+    scope: string;
+    status: string;
+    message: string;
+    components?: Record<string, any>;
+  }> {
+    return await this.request<any>(`/api/trips/${tripId}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async cancellationQuote(transactionId: string): Promise<any> {
+    return await this.request<any>('/api/trips/cancel/quote', {
+      method: 'POST',
+      body: JSON.stringify({ transaction_id: transactionId, final_confirmation: true }),
+    });
+  }
+
+  async cancellationConfirm(transactionId: string, cancellationId: string): Promise<any> {
+    return await this.request<any>('/api/trips/cancel/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ transaction_id: transactionId, cancellation_id: cancellationId, final_confirmation: true }),
+    });
+  }
+
+  async cancelHotelBooking(
+    transactionId: string,
+    tripId?: string,
+    reason?: string,
+    contactEmail?: string
+  ): Promise<any> {
+    return await this.request<any>('/api/trips/cancel/hotel', {
+      method: 'POST',
+      body: JSON.stringify({ transaction_id: transactionId, trip_id: tripId, reason, contact_email: contactEmail }),
+    });
+  }
+
+  // --- Wave 3C: Authoritative Binary Travel PDF Stream ---
+  async downloadTravelPlanPdfBlob(tripId: string): Promise<Blob> {
+    const token = storage.getToken();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/pdf, application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
+    const baseUrl = this.getBaseUrl();
+    const url = `${baseUrl}/api/travel/pdf`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ trip_id: tripId }),
+    });
+    if (!response.ok) {
+      let message = 'Unable to generate travel PDF.';
+      try {
+        const errorData = await response.json();
+        message = errorData.detail || errorData.error || message;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    return await response.blob();
+  }
+
+  async generateTravelPdf(tripId: string): Promise<Blob> {
+    return await this.downloadTravelPlanPdfBlob(tripId);
   }
 }
 

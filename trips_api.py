@@ -6,11 +6,12 @@ Endpoints require get_current_user dependency; tenant enumeration is blocked.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from fastapi.responses import Response
 
@@ -26,6 +27,8 @@ from services.razorpay_service import RazorpayService, RazorpayError
 from services.ticket_service import build_booking_pdf
 from services.hotel_booking_pdf import build_hotel_booking_pdf
 from services.hotel_transaction_store import HotelTransactionStore
+from services.booking_read_service import BookingReadService
+from services.flight_booking_service import FlightBookingService, BookingNotFoundError, BookingPermissionError
 from services.trip_store import (
     TripStore,
     OfferSelectionError,
@@ -84,13 +87,67 @@ async def list_trips(
     """Return only the authenticated user's trips and transaction records."""
     user_id_str = str(current_user.id)
     canonical_trips = trip_store.list_trips(current_user.id, limit=50)
-    flights = _store().list_recent(50, customer_ref=user_id_str)
-    hotels = HotelTransactionStore().list_recent(50, customer_ref=user_id_str)
+
+    # Wave 3B: Use canonical booking_intents for flight bookings
+    read_service = BookingReadService()
+    flights = read_service.list_recent_flights_for_user(current_user.id, limit=50)
+    # If no flights found in booking_intents, fall back to legacy flight_transactions for backward compatibility
+    if not flights:
+        flights = _store().list_recent(50, customer_ref=user_id_str)
+
+    try:
+        hotels = HotelTransactionStore().list_recent(50, customer_ref=user_id_str)
+    except Exception:
+        hotels = []
+    if not hotels and BookingReadService._IN_MEMORY_HOTEL_BOOKINGS:
+        hotels = [
+            h for h in BookingReadService._IN_MEMORY_HOTEL_BOOKINGS.values()
+            if str(h.get("customer_ref")) == user_id_str
+        ]
+
+    # Build lookup of flight and hotel bookings by trip_id to attach to canonical trips
+    flights_by_trip: dict[str, list[dict[str, Any]]] = {}
+    for f in flights:
+        tid = str(f.get("trip_id") or "")
+        if tid:
+            flights_by_trip.setdefault(tid, []).append(f)
+
+    hotels_by_trip: dict[str, list[dict[str, Any]]] = {}
+    for h in hotels:
+        tid = str(h.get("trip_id") or "")
+        if tid:
+            hotels_by_trip.setdefault(tid, []).append(h)
 
     normalized = []
     for t in canonical_trips:
         item = dict(t)
         item["record_type"] = "trip"
+        trip_id = str(item.get("id") or item.get("trip_id") or "")
+        trip_flights = flights_by_trip.get(trip_id, [])
+        trip_hotels = hotels_by_trip.get(trip_id, [])
+        item["flight_count"] = len(trip_flights)
+        item["hotel_count"] = len(trip_hotels)
+        item["flights"] = trip_flights
+        item["hotels"] = [
+            {
+                "id": str(h.get("id")),
+                "booking_reference": (
+                    (h.get("booking_json") or {}).get("confirmation_code")
+                    or (h.get("booking_json") or {}).get("booking_id")
+                    or str(h.get("id"))
+                ),
+                "confirmation_code": (
+                    (h.get("booking_json") or {}).get("confirmation_code")
+                    or (h.get("booking_json") or {}).get("booking_id")
+                    or str(h.get("id"))
+                ),
+                "booking_status": str(h.get("booking_status")),
+                "hotel_name": h.get("hotel_name"),
+                "amount": float(h.get("amount_inr") or 0.0),
+                "currency": str(h.get("currency") or "INR"),
+            }
+            for h in trip_hotels
+        ]
         normalized.append(item)
     for tx in flights:
         item = dict(tx)
@@ -154,6 +211,47 @@ async def get_trip(
         if meta.get("selected_flight"):
             trip["selected_flight_offer"] = meta["selected_flight"]
     return {"success": True, "trip": trip}
+
+
+@router.get(
+    "/{trip_id}/bookings",
+    summary="Get authoritative booking status (flight & hotel) for an owned trip",
+)
+async def get_trip_bookings(
+    trip_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Return authoritative flight and hotel booking state for a trip owned by current user."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        # Check whether trip exists under another user to distinguish 403 vs 404
+        all_trips = trip_store._memory_trips if (trip_store.use_in_memory or not os.getenv("DATABASE_URL")) else None
+        exists_for_other = False
+        if all_trips is not None:
+            exists_for_other = str(trip_id) in all_trips
+        else:
+            try:
+                with trip_store._connect() as conn:
+                    row = conn.execute("SELECT id FROM trips WHERE id = %s", (str(trip_id),)).fetchone()
+                    exists_for_other = bool(row)
+            except Exception:
+                pass
+        if exists_for_other:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this trip.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trip not found.",
+        )
+    read_service = BookingReadService()
+    bookings = read_service.get_trip_bookings(trip_id=trip_id, user_id=current_user.id)
+    return {
+        "success": True,
+        **bookings,
+    }
 
 
 @router.delete(
@@ -272,23 +370,93 @@ async def download_ticket(
     current_user: UserResponse = Depends(get_current_user),
 ):
     user_id_str = str(current_user.id)
-    tx = _store().get(transaction_id)
-    if not tx or tx.get("customer_ref") != user_id_str or tx.get("booking_status") != "booked" or not tx.get("duffel_order_id"):
+    order: dict[str, Any] = {}
+    tx: dict[str, Any] = {}
+
+    # 1. Attempt lookup in canonical booking_intents (production Duffel path)
+    flight_booking_service = FlightBookingService()
+    intent = None
+    try:
+        intent = flight_booking_service._get_intent(transaction_id, current_user.id)
+    except BookingPermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to this ticket.",
+        )
+    except BookingNotFoundError:
+        intent = None
+    except Exception as exc:
+        logger.warning("Could not query booking_intents for ticket %s: %s", transaction_id, exc)
+        intent = None
+
+    if intent:
+        status_str = str(intent.get("status") or "").upper()
+        if status_str != "COMPLETED":
+            raise HTTPException(
+                status_code=404,
+                detail="A completed flight booking owned by you is required before downloading the ticket.",
+            )
+        meta = intent.get("metadata") or {}
+        pnr = intent.get("provider_reference") or meta.get("booking_reference") or meta.get("pnr")
+        duffel_order_id = meta.get("order_id") or str(pnr)
+
+        order = {
+            "id": duffel_order_id,
+            "booking_reference": str(pnr) if pnr else None,
+            "documents": meta.get("documents", []),
+            "slices": meta.get("slices", []),
+            "passengers": meta.get("passengers", []),
+            "total_amount": float(intent.get("expected_amount") or 0.0),
+            "total_currency": str(intent.get("currency") or "INR"),
+            "created_at": meta.get("completed_at") or intent.get("created_at"),
+            "live_mode": False,
+        }
+        tx = {
+            "id": str(intent["id"]),
+            "customer_ref": user_id_str,
+            "booking_reference": str(pnr) if pnr else None,
+            "duffel_order_id": duffel_order_id,
+            "booking_status": "booked",
+            "amount": float(intent.get("expected_amount") or 0.0),
+            "currency": str(intent.get("currency") or "INR"),
+            "passenger_json": json.dumps(meta.get("passengers", [])),
+        }
+        # Attempt upstream refresh from Duffel if duffel_order_id is available
+        if duffel_order_id and duffel_order_id.startswith("ord_"):
+            try:
+                live_order = await asyncio.to_thread(FlightService().get_order, duffel_order_id)
+                if live_order and isinstance(live_order, dict):
+                    order.update(live_order)
+            except Exception as exc:
+                logger.info("Using persisted booking metadata for ticket PDF (upstream Duffel refresh skipped: %s)", exc)
+
+    # 2. Fall back to legacy TransactionStore (flight_transactions)
+    if not tx:
+        tx_rec = _store().get(transaction_id)
+        if tx_rec and tx_rec.get("customer_ref") == user_id_str and tx_rec.get("booking_status") == "booked" and tx_rec.get("duffel_order_id"):
+            tx = tx_rec
+            try:
+                order = await asyncio.to_thread(FlightService().get_order, tx["duffel_order_id"])
+            except FlightProviderError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not tx:
         raise HTTPException(
             status_code=404,
             detail="A completed flight booking owned by you is required before downloading the ticket.",
         )
+
     try:
-        order = await asyncio.to_thread(FlightService().get_order, tx["duffel_order_id"])
         pdf = await asyncio.to_thread(build_booking_pdf, order, tx)
-        filename = f"Trust-Trip-MAS-{tx.get('booking_reference') or tx['duffel_order_id']}.pdf"
+        filename = f"Trust-Trip-MAS-{tx.get('booking_reference') or tx.get('duffel_order_id') or 'flight'}.pdf"
         return Response(
             content=pdf,
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
-    except FlightProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Failed to build booking PDF: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not generate flight ticket PDF.")
 
 
 @router.post(
@@ -360,10 +528,68 @@ async def refresh_booking(
 async def cancellation_quote(
     request: CancelQuote,
     current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
 ):
     if not request.final_confirmation:
         return {"success": False, "requires_final_confirmation": True}
     user_id_str = str(current_user.id)
+
+    # 1. Try canonical booking_intent first
+    fb_service = FlightBookingService()
+    intent = None
+    try:
+        intent = fb_service._get_intent(request.transaction_id, current_user.id)
+    except (BookingNotFoundError, BookingPermissionError, ValueError, Exception):
+        intent = None
+
+    if intent:
+        if str(intent.get("user_id")) != user_id_str:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: Booking intent does not belong to you.",
+            )
+        trip_id = intent.get("trip_id")
+        if trip_id:
+            trip = trip_store.get_trip(trip_id, current_user.id)
+            if not trip:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Parent trip not found or does not belong to you.",
+                )
+
+        status_str = str(intent.get("status") or "").upper()
+        meta = intent.get("metadata") or {}
+        if status_str == "CANCELLED" or meta.get("status") == "CANCELLED" or meta.get("cancellation"):
+            raise HTTPException(
+                status_code=409,
+                detail="Booking is already cancelled.",
+            )
+        if status_str != "COMPLETED":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only completed bookings can be cancelled (current status: {status_str}).",
+            )
+
+        order_id = meta.get("order_id") or intent.get("provider_reference")
+        if not order_id:
+            raise HTTPException(
+                status_code=400,
+                detail="No provider order found for this booking intent.",
+            )
+        try:
+            quote = await asyncio.to_thread(FlightService().cancellation_quote, order_id)
+            return {
+                "success": True,
+                "transaction_id": request.transaction_id,
+                "booking_id": request.transaction_id,
+                "quote": quote,
+            }
+        except FlightProviderTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except FlightProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # 2. Legacy Section 10 fallback
     tx = _store().get(request.transaction_id)
     if not tx or tx.get("customer_ref") != user_id_str or not tx.get("duffel_order_id"):
         raise HTTPException(
@@ -386,10 +612,108 @@ async def cancellation_quote(
 async def cancellation_confirm(
     request: CancelConfirm,
     current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
 ):
     if not request.final_confirmation:
         return {"success": False, "requires_final_confirmation": True}
     user_id_str = str(current_user.id)
+
+    # 1. Try canonical booking_intent first
+    fb_service = FlightBookingService()
+    intent = None
+    try:
+        intent = fb_service._get_intent(request.transaction_id, current_user.id)
+    except (BookingNotFoundError, BookingPermissionError, ValueError, Exception):
+        intent = None
+
+    if intent:
+        if str(intent.get("user_id")) != user_id_str:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: Booking intent does not belong to you.",
+            )
+        trip_id = intent.get("trip_id")
+        if trip_id:
+            trip = trip_store.get_trip(trip_id, current_user.id)
+            if not trip:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Parent trip not found or does not belong to you.",
+                )
+
+        status_str = str(intent.get("status") or "").upper()
+        meta = intent.get("metadata") or {}
+        if status_str == "CANCELLED" or meta.get("status") == "CANCELLED" or meta.get("cancellation"):
+            raise HTTPException(
+                status_code=409,
+                detail="Booking is already cancelled.",
+            )
+        if status_str != "COMPLETED":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only completed bookings can be cancelled (current status: {status_str}).",
+            )
+
+        try:
+            result = await asyncio.to_thread(FlightService().confirm_cancellation, request.cancellation_id)
+        except FlightProviderTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except FlightProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        # Provider cancellation succeeded; update local state
+        now_iso = datetime.now(timezone.utc).isoformat()
+        meta["cancellation"] = result
+        meta["cancelled_at"] = now_iso
+        meta["status"] = "CANCELLED"
+        intent["status"] = "CANCELLED"
+        intent["metadata"] = meta
+
+        refund = None
+        payment_id = meta.get("razorpay_payment_id")
+        refund_amount = result.get("refund_amount")
+        if payment_id and refund_amount is not None:
+            try:
+                refund_currency = str(result.get("refund_currency") or result.get("currency") or "INR").upper()
+                customer_amount = float(intent.get("expected_amount") or 0)
+                if refund_currency == "INR":
+                    customer_refund_amount = float(refund_amount)
+                else:
+                    stored_rate = meta.get("fx_rate")
+                    if stored_rate is not None:
+                        customer_refund_amount = float(refund_amount) * float(stored_rate)
+                    else:
+                        customer_refund_amount = float(refund_amount)
+                customer_refund_amount = min(customer_refund_amount, customer_amount)
+                if customer_refund_amount > 0:
+                    refund = await asyncio.to_thread(
+                        RazorpayService().refund,
+                        payment_id,
+                        customer_refund_amount,
+                        f"cancel-refund-{request.transaction_id}",
+                    )
+            except Exception as exc:
+                logger.warning("Refund processing for canonical booking %s failed: %s", request.transaction_id, exc)
+
+        try:
+            fb_service._save_intent(intent)
+        except Exception as exc:
+            if "booking_status_enum" in str(exc):
+                intent["status"] = "ABANDONED"
+                fb_service._save_intent(intent)
+            else:
+                logger.error("Failed to save cancelled intent: %s", exc)
+
+        return {
+            "success": True,
+            "status": "cancelled",
+            "cancellation": result,
+            "refund": refund,
+            "transaction_id": request.transaction_id,
+            "booking_id": request.transaction_id,
+        }
+
+    # 2. Legacy Section 10 fallback
     tx = _store().get(request.transaction_id)
     if not tx or tx.get("customer_ref") != user_id_str:
         raise HTTPException(
@@ -449,6 +773,279 @@ async def cancellation_confirm(
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except FlightProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+class CancelHotelRequest(BaseModel):
+    transaction_id: str
+    trip_id: str | None = None
+    reason: str = "User requested cancellation"
+    contact_email: str | None = None
+
+
+@router.post(
+    "/cancel/hotel",
+    summary="Submit hotel booking cancellation request for concierge review",
+)
+async def cancel_hotel_booking(
+    request: CancelHotelRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    user_id_str = str(current_user.id)
+    hotel_tx = None
+    try:
+        hotel_tx = HotelTransactionStore().get(request.transaction_id)
+    except Exception:
+        hotel_tx = None
+    if not hotel_tx and BookingReadService._IN_MEMORY_HOTEL_BOOKINGS:
+        hotel_tx = BookingReadService._IN_MEMORY_HOTEL_BOOKINGS.get(request.transaction_id)
+
+    if not hotel_tx:
+        raise HTTPException(
+            status_code=404,
+            detail="Hotel booking transaction not found.",
+        )
+
+    # Ownership check
+    tx_cust = str(hotel_tx.get("customer_ref") or "")
+    if tx_cust != user_id_str:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Hotel booking does not belong to you.",
+        )
+
+    # Trip ownership check
+    tx_trip_id = str(hotel_tx.get("trip_id") or request.trip_id or "")
+    if tx_trip_id:
+        trip = trip_store.get_trip(tx_trip_id, current_user.id)
+        if not trip:
+            raise HTTPException(
+                status_code=404,
+                detail="Parent trip not found or does not belong to you.",
+            )
+
+    current_status = str(hotel_tx.get("booking_status") or "").lower()
+    if current_status == "cancelled":
+        raise HTTPException(
+            status_code=409,
+            detail="Hotel booking is already cancelled.",
+        )
+    if current_status == "cancellation_requested":
+        return {
+            "success": True,
+            "status": "cancellation_requested",
+            "provider_cancelled": False,
+            "message": "A cancellation request is already pending concierge review for this hotel booking.",
+            "transaction_id": request.transaction_id,
+        }
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cancellation_request = {
+        "requested_at": now_iso,
+        "reason": request.reason,
+        "contact_email": request.contact_email or current_user.email,
+        "status": "cancellation_requested",
+    }
+
+    # Update in DB
+    try:
+        raw_bjson = hotel_tx.get("booking_json") or {}
+        if isinstance(raw_bjson, str):
+            raw_bjson = json.loads(raw_bjson)
+        raw_bjson["cancellation_request"] = cancellation_request
+        HotelTransactionStore().update(
+            request.transaction_id,
+            booking_status="cancellation_requested",
+            booking_json=raw_bjson,
+        )
+    except Exception as exc:
+        logger.warning("Failed to update HotelTransactionStore: %s", exc)
+
+    # Update in memory
+    if request.transaction_id in BookingReadService._IN_MEMORY_HOTEL_BOOKINGS:
+        mem_rec = BookingReadService._IN_MEMORY_HOTEL_BOOKINGS[request.transaction_id]
+        mem_rec["booking_status"] = "cancellation_requested"
+        bjson = mem_rec.get("booking_json") or {}
+        if isinstance(bjson, str):
+            bjson = json.loads(bjson)
+        bjson["cancellation_request"] = cancellation_request
+        mem_rec["booking_json"] = bjson
+
+    return {
+        "success": True,
+        "status": "cancellation_requested",
+        "provider_cancelled": False,
+        "message": "Your hotel cancellation request has been submitted for concierge review. Our support team will process this with the property.",
+        "transaction_id": request.transaction_id,
+        "submitted_at": now_iso,
+    }
+
+
+class TripCancelRequest(BaseModel):
+    booking_type: str = Field(default="all", pattern="^(all|flight|hotel)$")
+    reason: str = "User requested cancellation"
+    contact_email: str | None = None
+    final_confirmation: bool = True
+
+
+@router.post(
+    "/{trip_id}/cancel",
+    summary="Request cancellation for trip bookings (flight, hotel, or all)",
+)
+async def cancel_trip_bookings(
+    trip_id: str,
+    request: TripCancelRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    user_id_str = str(current_user.id)
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(
+            status_code=404,
+            detail="Trip not found or does not belong to you.",
+        )
+
+    read_service = BookingReadService()
+    bookings = read_service.get_trip_bookings(trip_id=trip_id, user_id=current_user.id)
+    flight_booking = bookings.get("flight")
+    hotel_booking = bookings.get("hotel")
+
+    results: dict[str, Any] = {
+        "success": True,
+        "trip_id": trip_id,
+        "scope": request.booking_type,
+        "components": {},
+    }
+
+    # 1. Flight cancellation
+    if request.booking_type in ("all", "flight"):
+        if flight_booking and flight_booking.get("is_booked"):
+            flight_id = flight_booking.get("booking_id")
+            order_id = flight_booking.get("order_id")
+            if order_id:
+                try:
+                    quote = await asyncio.to_thread(FlightService().cancellation_quote, order_id)
+                    cancel_res = await asyncio.to_thread(FlightService().confirm_cancellation, quote["id"])
+
+                    fb_service = FlightBookingService()
+                    intent = fb_service._get_intent(flight_id, current_user.id)
+                    meta = intent.get("metadata") or {}
+                    meta["cancellation"] = cancel_res
+                    meta["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+                    meta["status"] = "CANCELLED"
+                    intent["status"] = "CANCELLED"
+                    intent["metadata"] = meta
+
+                    refund = None
+                    if meta.get("razorpay_payment_id") and cancel_res.get("refund_amount") is not None:
+                        try:
+                            refund = await asyncio.to_thread(
+                                RazorpayService().refund,
+                                meta["razorpay_payment_id"],
+                                float(cancel_res["refund_amount"]),
+                                f"cancel-refund-{flight_id}",
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        fb_service._save_intent(intent)
+                    except Exception:
+                        intent["status"] = "ABANDONED"
+                        fb_service._save_intent(intent)
+
+                    results["components"]["flight"] = {
+                        "status": "cancelled",
+                        "provider_cancelled": True,
+                        "cancellation": cancel_res,
+                        "refund": refund,
+                    }
+                except Exception as exc:
+                    results["components"]["flight"] = {
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+            else:
+                results["components"]["flight"] = {
+                    "status": "not_applicable",
+                    "message": "No active provider order ID for flight.",
+                }
+        else:
+            results["components"]["flight"] = {
+                "status": "none_found",
+                "message": "No active confirmed flight booking to cancel.",
+            }
+
+    # 2. Hotel cancellation
+    if request.booking_type in ("all", "hotel"):
+        if hotel_booking and hotel_booking.get("is_booked"):
+            hotel_id = hotel_booking.get("booking_id")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cancellation_req = {
+                "requested_at": now_iso,
+                "reason": request.reason,
+                "contact_email": request.contact_email or current_user.email,
+                "status": "cancellation_requested",
+            }
+            try:
+                raw_bjson = hotel_booking.get("booking_json") or {}
+                if isinstance(raw_bjson, str):
+                    raw_bjson = json.loads(raw_bjson)
+                raw_bjson["cancellation_request"] = cancellation_req
+                HotelTransactionStore().update(
+                    hotel_id,
+                    booking_status="cancellation_requested",
+                    booking_json=raw_bjson,
+                )
+            except Exception:
+                pass
+            if hotel_id in BookingReadService._IN_MEMORY_HOTEL_BOOKINGS:
+                BookingReadService._IN_MEMORY_HOTEL_BOOKINGS[hotel_id]["booking_status"] = "cancellation_requested"
+
+            results["components"]["hotel"] = {
+                "status": "cancellation_requested",
+                "provider_cancelled": False,
+                "message": "Hotel cancellation request submitted for concierge review.",
+            }
+        else:
+            results["components"]["hotel"] = {
+                "status": "none_found",
+                "message": "No active confirmed hotel booking to cancel.",
+            }
+
+    # Summary message & truthful status
+    flight_res = results["components"].get("flight", {})
+    hotel_res = results["components"].get("hotel", {})
+
+    if request.booking_type == "flight":
+        if flight_res.get("status") == "cancelled":
+            results["message"] = "Flight booking has been successfully cancelled with the carrier."
+            results["status"] = "cancelled"
+        else:
+            results["message"] = flight_res.get("error") or flight_res.get("message") or "Flight cancellation failed."
+            results["status"] = "failed"
+    elif request.booking_type == "hotel":
+        if hotel_res.get("status") == "cancellation_requested":
+            results["message"] = "Hotel cancellation request submitted for concierge review."
+            results["status"] = "cancellation_requested"
+        else:
+            results["message"] = hotel_res.get("message") or "No hotel booking found to cancel."
+            results["status"] = "none_found"
+    else:  # all
+        if flight_res.get("status") == "cancelled" and hotel_res.get("status") == "cancellation_requested":
+            results["message"] = "Flight cancelled with carrier; hotel cancellation submitted for concierge review."
+            results["status"] = "partially_cancelled"
+        elif flight_res.get("status") == "cancelled":
+            results["message"] = "Flight cancelled with carrier."
+            results["status"] = "partially_cancelled"
+        elif hotel_res.get("status") == "cancellation_requested":
+            results["message"] = "Hotel cancellation request submitted for concierge review."
+            results["status"] = "cancellation_requested"
+        else:
+            results["message"] = "No confirmed bookings were eligible for cancellation."
+            results["status"] = "none_found"
+
+    return results
 
 
 class OfferSelectionRequest(BaseModel):

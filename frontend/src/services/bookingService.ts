@@ -212,7 +212,8 @@ export class TrustTripBookingService implements IBookingService {
    */
   async verifyFlight(
     tripId: string,
-    offerId: string
+    offerId: string,
+    passengers?: FlightPassenger[]
   ): Promise<{
     state: FlightVerificationState;
     current_amount: number;
@@ -225,19 +226,16 @@ export class TrustTripBookingService implements IBookingService {
     // 1. Try authoritative Section 5B contract if booking_id exists or can be initiated
     let bookingId = this.activeBookingIds.get(tripId);
 
-    // If no booking_id yet, select the offer on the live backend
+    // If no booking_id yet, select the offer on the live backend using supplied passengers
     if (!bookingId) {
+      if (!passengers || passengers.length === 0) {
+        throw Object.assign(
+          new Error('Passenger details are required to verify and select flight offer.'),
+          { code: 'PASSENGERS_REQUIRED', statusCode: 400 }
+        );
+      }
       try {
-        const selectRes = await this.selectFlightOffer(tripId, offerId, [
-          {
-            given_name: 'Ananya',
-            family_name: 'Roy',
-            born_on: '1992-05-15',
-            title: 'ms',
-            gender: 'f',
-            email: 'traveler@trusttrip.com',
-          },
-        ]);
+        const selectRes = await this.selectFlightOffer(tripId, offerId, passengers);
         bookingId = selectRes.booking_id;
       } catch (selErr: any) {
         if (selErr.statusCode === 410) {
@@ -247,7 +245,7 @@ export class TrustTripBookingService implements IBookingService {
             currency: 'USD',
           };
         }
-        // Fall back to legacy flow if Section 5 select is unsupported in this context
+        throw selErr;
       }
     }
 
@@ -470,16 +468,26 @@ export class TrustTripBookingService implements IBookingService {
   async prepareHotelBooking(
     tripId: string,
     hotelId: string,
-    offerData?: any
+    offerData?: any,
+    guestInfo?: { name?: string; email?: string; firstName?: string; lastName?: string; phone?: string }
   ): Promise<{ required_amount: number; currency: string; prebook_id: string }> {
+    const derivedName = guestInfo?.name
+      || (guestInfo?.firstName ? `${guestInfo.firstName} ${guestInfo.lastName || ''}`.trim() : undefined)
+      || offerData?.guest_name
+      || 'Lead Guest';
+    const guestName = derivedName;
+    const guestEmail = guestInfo?.email || offerData?.guest_email || 'guest@example.com';
+    const snapshotId = offerData?.snapshot_id || (typeof offerData?.id === 'string' && offerData.id.includes('-') ? offerData.id : undefined);
     const res = await api.prebookHotel({
+      trip_id: tripId,
+      snapshot_id: snapshotId,
       hotel_id: hotelId,
       room_id: offerData?.room_id || `rm_${hotelId}_01`,
       check_in_date: offerData?.check_in_date || offerData?.checkin || '',
       check_out_date: offerData?.check_out_date || offerData?.checkout || '',
       guests: offerData?.adults_count || 2,
-      guest_name: 'Ananya Roy',
-      guest_email: 'traveler@trusttrip.com',
+      guest_name: guestName,
+      guest_email: guestEmail,
     });
 
     this.activePrebookIds.set(tripId, res.prebook_id);
@@ -503,6 +511,99 @@ export class TrustTripBookingService implements IBookingService {
   }
 
   /**
+   * Initiates hotel payment order via POST /api/hotel-payments/create-order
+   * Returns order metadata required for Razorpay Checkout SDK.
+   */
+  async initiateHotelPaymentOrder(
+    tripId: string,
+    contact: TravelerContactInfo,
+    revisionId: string,
+    expectedRevisionNumber: number,
+    allTravelers?: FlightPassenger[]
+  ): Promise<{
+    transaction_id: string;
+    razorpay_order_id: string;
+    amount_inr: number;
+    currency: string;
+    key_id: string;
+    hotel_name?: string;
+  }> {
+    const prebookId = this.activePrebookIds.get(tripId);
+    if (!prebookId) {
+      throw new Error('No authoritative hotel prebook exists for this trip.');
+    }
+    const prebook = this.activePrebookData.get(tripId) || {
+      prebook_id: prebookId,
+      status: 'confirmed',
+    };
+    const cachedOffer = this.activeHotelOffers.get(tripId);
+    const offer = cachedOffer || {
+      id: prebook.hotel_id,
+      provider_offer_id: prebook.hotel_id,
+      provider: prebook.provider || 'liteapi',
+      hotel_name: prebook.hotel_name,
+      price: prebook.amount,
+      currency: prebook.currency || 'INR',
+      price_inr: prebook.amount,
+    };
+    const firstName = contact?.first_name?.trim();
+    const lastName = contact?.last_name?.trim();
+    if (!firstName || !lastName) {
+      throw Object.assign(
+        new Error('Valid traveler first and last name are required for hotel payment.'),
+        { code: 'MISSING_TRAVELER_NAME', statusCode: 400 }
+      );
+    }
+    const holder = {
+      firstName,
+      lastName,
+      email: contact.email?.trim() || '',
+      phone: contact.phone?.trim() || '',
+    };
+    const guests = (allTravelers && allTravelers.length > 0)
+      ? allTravelers.map((t, idx) => ({
+          occupancyNumber: idx + 1,
+          firstName: t.given_name.trim(),
+          lastName: t.family_name.trim(),
+          email: t.email?.trim() || contact.email?.trim() || '',
+          phone: t.phone_number?.trim() || contact.phone?.trim() || '',
+        }))
+      : [{
+          occupancyNumber: 1,
+          firstName,
+          lastName,
+          email: contact.email?.trim() || '',
+          phone: contact.phone?.trim() || '',
+        }];
+
+    const idempotencyKey = `idem_ht_${tripId.replace(/-/g, '').slice(0, 16)}_${Date.now()}`;
+    const orderRes = await api.createHotelPaymentOrder({
+      offer,
+      prebook,
+      holder,
+      guests,
+      trip_id: tripId,
+      revision_id: revisionId,
+      expected_revision_number: expectedRevisionNumber,
+      payment_idempotency_key: idempotencyKey,
+      final_confirmation: true,
+    });
+
+    if (!orderRes || !orderRes.transaction_id || !orderRes.success || !orderRes.razorpay_order_id) {
+      throw new Error('Hotel payment order creation failed: ' + ((orderRes as any)?.detail || 'Server rejected order'));
+    }
+
+    return {
+      transaction_id: orderRes.transaction_id,
+      razorpay_order_id: orderRes.razorpay_order_id,
+      amount_inr: orderRes.amount_inr,
+      currency: orderRes.currency,
+      key_id: orderRes.key_id || '',
+      hotel_name: orderRes.hotel_name || prebook.hotel_name,
+    };
+  }
+
+  /**
    * Processes hotel payment via POST /api/hotel-payments/create-order and /verify-and-book
    */
   async processHotelPayment(
@@ -511,8 +612,19 @@ export class TrustTripBookingService implements IBookingService {
     contact: TravelerContactInfo,
     revisionId?: string,
     expectedRevisionNumber?: number,
-    paymentDetails?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
+    paymentDetailsOrTravelers?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
+    allTravelersParam?: FlightPassenger[]
   ): Promise<HotelConfirmationRecord> {
+    let paymentDetails: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | undefined;
+    let allTravelers: FlightPassenger[] | undefined;
+
+    if (Array.isArray(paymentDetailsOrTravelers)) {
+      allTravelers = paymentDetailsOrTravelers;
+    } else {
+      paymentDetails = paymentDetailsOrTravelers;
+      allTravelers = allTravelersParam;
+    }
+
     const prebookId = this.activePrebookIds.get(tripId);
     if (!prebookId) {
       throw new Error('No authoritative hotel prebook exists for this trip.');
@@ -548,21 +660,35 @@ export class TrustTripBookingService implements IBookingService {
       price_inr: prebook.amount,
     };
 
-    const firstName = contact.first_name || 'Traveler';
-    const lastName = contact.last_name || 'Traveler';
+    const firstName = contact?.first_name?.trim();
+    const lastName = contact?.last_name?.trim();
+    if (!firstName || !lastName) {
+      throw Object.assign(
+        new Error('Valid traveler first and last name are required for hotel payment.'),
+        { code: 'MISSING_TRAVELER_NAME', statusCode: 400 }
+      );
+    }
     const holder = {
       firstName,
       lastName,
-      email: contact.email || 'traveler@trusttrip.com',
-      phone: contact.phone || '+919876543210',
+      email: contact.email?.trim() || '',
+      phone: contact.phone?.trim() || '',
     };
-    const guests = [{
-      occupancyNumber: 1,
-      firstName,
-      lastName,
-      email: contact.email || 'traveler@trusttrip.com',
-      phone: contact.phone || '+919876543210',
-    }];
+    const guests = (allTravelers && allTravelers.length > 0)
+      ? allTravelers.map((t, idx) => ({
+          occupancyNumber: idx + 1,
+          firstName: t.given_name.trim(),
+          lastName: t.family_name.trim(),
+          email: t.email?.trim() || contact.email?.trim() || '',
+          phone: t.phone_number?.trim() || contact.phone?.trim() || '',
+        }))
+      : [{
+          occupancyNumber: 1,
+          firstName,
+          lastName,
+          email: contact.email?.trim() || '',
+          phone: contact.phone?.trim() || '',
+        }];
 
     // 1. Create order via POST /api/hotel-payments/create-order
     const idempotencyKey = `idem_ht_${tripId.replace(/-/g, '').slice(0, 16)}_${Date.now()}`;
@@ -582,12 +708,18 @@ export class TrustTripBookingService implements IBookingService {
       throw new Error('Hotel payment order creation failed: ' + ((orderRes as any)?.detail || 'Server rejected order'));
     }
 
+    // W3-FIND-02: Strict genuine Razorpay signature requirement.
+    // The browser must never generate synthetic signatures (pay_/sig_).
+    if (!paymentDetails?.razorpay_payment_id || !paymentDetails?.razorpay_signature) {
+      throw new Error('Valid Razorpay payment confirmation (payment_id and signature) is required. Synthetic payment signatures are strictly prohibited.');
+    }
+
     // 2. Verify and book hotel via POST /api/hotel-payments/verify-and-book
     const verifyRes = await api.verifyAndBookHotel({
       transaction_id: orderRes.transaction_id,
-      razorpay_order_id: paymentDetails?.razorpay_order_id || orderRes.razorpay_order_id || `order_${orderRes.transaction_id}`,
-      razorpay_payment_id: paymentDetails?.razorpay_payment_id || `pay_${orderRes.transaction_id}`,
-      razorpay_signature: paymentDetails?.razorpay_signature || `sig_${orderRes.transaction_id}`,
+      razorpay_order_id: paymentDetails.razorpay_order_id || orderRes.razorpay_order_id || '',
+      razorpay_payment_id: paymentDetails.razorpay_payment_id,
+      razorpay_signature: paymentDetails.razorpay_signature,
       offer,
       prebook,
       holder,
@@ -648,15 +780,15 @@ export class TrustTripBookingService implements IBookingService {
   async requestCancellation(
     tripId: string,
     request: CancellationRequest
-  ): Promise<{ ticket_id: string; message: string }> {
-    const res = await api.cancelBookingIntent(`bkg_${tripId}`, {
+  ): Promise<{ ticket_id?: string; status?: string; message: string }> {
+    const res = await api.cancelTripBookings(tripId, {
+      booking_type: request.booking_type,
       reason: request.reason,
       contact_email: request.contact_email,
-      cancel_scope: request.booking_type,
     });
 
     return {
-      ticket_id: res.ticket_id,
+      status: res.status,
       message: res.message,
     };
   }
@@ -665,14 +797,16 @@ export class TrustTripBookingService implements IBookingService {
    * Requests PDF travel plan generation via POST /api/travel/pdf
    */
   async downloadTravelPlanPdf(tripId: string): Promise<void> {
-    const res = await api.generateTravelPdf(tripId);
-    if (res.download_url && typeof window !== 'undefined') {
+    const blob = await api.downloadTravelPlanPdfBlob(tripId);
+    if (typeof window !== 'undefined') {
+      const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = res.download_url;
-      link.setAttribute('download', res.filename || 'TrustTrip_Journey.pdf');
+      link.href = url;
+      link.setAttribute('download', `TrustTrip_Plan_${tripId}.pdf`);
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
     }
   }
 
@@ -681,6 +815,13 @@ export class TrustTripBookingService implements IBookingService {
    */
   async getCanonicalTrip(tripId: string): Promise<TripDetail> {
     return await api.getTrip(tripId);
+  }
+
+  /**
+   * Rehydrates canonical booking records from GET /api/trips/{trip_id}/bookings
+   */
+  async getTripBookings(tripId: string): Promise<any> {
+    return await api.getTripBookings(tripId);
   }
 }
 

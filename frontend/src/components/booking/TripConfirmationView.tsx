@@ -19,13 +19,15 @@ import { FlightConfirmationRecord, HotelConfirmationRecord, CancellationRequest 
 import { getDestinationImage } from '../../lib/destinationImages';
 import { Button } from '../common/Button';
 import { useNotification } from '../../context/NotificationContext';
+import { useAuth } from '../../context/AuthContext';
 
 interface TripConfirmationViewProps {
   trip: TripDetail;
   flightConfirmation?: FlightConfirmationRecord;
   hotelConfirmation?: HotelConfirmationRecord;
+  contactEmail?: string;
   onDownloadPdf: () => Promise<void>;
-  onRequestCancellation: (request: CancellationRequest) => Promise<{ ticket_id: string; message: string }>;
+  onRequestCancellation: (request: CancellationRequest) => Promise<{ ticket_id?: string; status?: string; message: string }>;
   onViewTrip: () => void;
   onBackToTrips: () => void;
 }
@@ -34,6 +36,7 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
   trip,
   flightConfirmation,
   hotelConfirmation,
+  contactEmail,
   onDownloadPdf,
   onRequestCancellation,
   onViewTrip,
@@ -45,6 +48,9 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
   const [cancellationReason, setCancellationReason] = useState('');
   const [isSubmittingCancellation, setIsSubmittingCancellation] = useState(false);
   const { notify } = useNotification();
+  const { user: currentUser } = useAuth();
+
+  const effectiveContactEmail = (contactEmail && contactEmail.trim()) || currentUser?.email || '';
 
   const destMeta = getDestinationImage(trip.destination);
   const destinationCity = trip.destination.split(',')[0].toUpperCase();
@@ -72,13 +78,21 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
       const res = await onRequestCancellation({
         booking_type: cancellationType,
         reason: cancellationReason,
-        contact_email: 'traveler@trusttrip.com',
+        contact_email: effectiveContactEmail,
         acknowledged_terms: true,
       });
-      notify(res.message, 'info', `Ticket ${res.ticket_id}`);
+      notify(
+        res.message,
+        'info',
+        res.ticket_id
+          ? `Ticket ${res.ticket_id}`
+          : res.status === 'cancellation_requested'
+          ? 'Request Submitted'
+          : undefined
+      );
       setIsCancellationModalOpen(false);
-    } catch {
-      notify('Unable to submit cancellation request.', 'error');
+    } catch (err: any) {
+      notify(err?.message || 'Unable to submit cancellation request.', 'error');
     } finally {
       setIsSubmittingCancellation(false);
     }

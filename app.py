@@ -35,7 +35,7 @@ from offers_api import router as offers_router
 from research_api import router as research_router
 from flight_booking_api import router as flight_booking_router
 from services.travel_plan_pdf import build_travel_plan_pdf
-from dependencies.auth import get_current_user
+from dependencies.auth import get_current_user, get_optional_current_user
 from domain.user import UserResponse
 
 # This is kept from the original project to allow the existing synchronous
@@ -140,7 +140,8 @@ class TravelRequest(BaseModel):
 
 
 class TravelPlanPDFRequest(BaseModel):
-    plan: dict
+    plan: dict | None = None
+    trip_id: str | None = None
 
 
 class ApprovalRequest(BaseModel):
@@ -272,6 +273,139 @@ async def travel_planner(
                         f"Failed to persist travel plan to trip {target_trip_id}: {store_err}"
                     ) from store_err
 
+                # ------------------------------------------------------------------
+                # Wave 1A — Canonical airport identity (Part F)
+                #
+                # Store destination_airport and origin_airport IATA codes into the
+                # trip metadata WITHOUT changing trip.destination / trip.origin text.
+                #
+                # Resolution priority:
+                #   1. plan_json["destination_airport"] / ["origin_airport"]
+                #      (structured output from the chat planner — most authoritative)
+                #   2. _resolve_place(trip.destination) / _resolve_place(trip.origin)
+                #      (deterministic catalog resolver — fallback only)
+                #
+                # "Darjeeling, India" resolves via _resolve_place to the gateway
+                # airport (IXB) which is then stored in metadata["destination_airport"].
+                # The flight search resolver (resolve_canonical_trip_criteria) already
+                # reads meta["destination_airport"] as its second-highest priority.
+                # ------------------------------------------------------------------
+                from services.travel_planner import _resolve_place as _rp
+
+                plan_json_out = result.get("plan_json") or {}
+
+                # Destination airport
+                dest_iata: str | None = None
+                _plan_da = str(plan_json_out.get("destination_airport") or "").strip().upper()
+                if len(_plan_da) == 3 and _plan_da.isalpha():
+                    dest_iata = _plan_da
+                if not dest_iata:
+                    _dest_raw = trip_record.get("destination") or ""
+                    if _dest_raw:
+                        _rc, _, _ = _rp(_dest_raw)
+                        if _rc and len(_rc) == 3 and _rc.isalpha():
+                            dest_iata = _rc.upper()
+
+                # Origin airport
+                orig_iata: str | None = None
+                _plan_oa = str(plan_json_out.get("origin_airport") or "").strip().upper()
+                if len(_plan_oa) == 3 and _plan_oa.isalpha():
+                    orig_iata = _plan_oa
+                if not orig_iata:
+                    _orig_raw = trip_record.get("origin") or ""
+                    if _orig_raw:
+                        _ro, _, _ = _rp(_orig_raw)
+                        if _ro and len(_ro) == 3 and _ro.isalpha():
+                            orig_iata = _ro.upper()
+
+                if dest_iata or orig_iata:
+                    _fresh = ts.get_trip(target_trip_id, current_user.id)
+                    if _fresh:
+                        _fm = _fresh.get("metadata") or {}
+                        if isinstance(_fm, str):
+                            import json as _j
+                            _fm = _j.loads(_fm)
+                        _fm = dict(_fm)
+                        if dest_iata:
+                            _fm["destination_airport"] = dest_iata
+                        if orig_iata:
+                            _fm["origin_airport"] = orig_iata
+                        ts.update_trip(target_trip_id, current_user.id, metadata=_fm)
+                        logger.info(
+                            "Wave1A: trip %s airports stored dest=%s orig=%s",
+                            target_trip_id, dest_iata, orig_iata,
+                        )
+
+                # ------------------------------------------------------------------
+                # Wave 1B — Create canonical PROPOSED revision (Parts A, B, C, D)
+                #
+                # CONTRACT:
+                #   - Every successfully generated plan MUST produce a real revision
+                #     row in plan_revisions (EvidenceRevisionStore).
+                #   - Status is PROPOSED (never auto-approved).
+                #   - First plan (current_revision_number == 0) → Revision #1 PROPOSED.
+                #   - Re-plan (current_revision_number == N) → Revision N+1 PROPOSED.
+                #   - Uses create_revision_atomic: row-locked, 409 on stale conflict,
+                #     no duplicate on retry (caller must not retry on success).
+                #   - Failure here is a hard error — the frontend cannot approve or
+                #     book without a real revision_id.
+                # ------------------------------------------------------------------
+                try:
+                    _trip_now = ts.get_trip(target_trip_id, current_user.id)
+                    _cur_rev = int((_trip_now or trip_record).get("current_revision_number") or 0)
+
+                    # Merge resolved airport codes into the constraint snapshot so the
+                    # revision record carries canonical airport identity.
+                    _constraint_update: dict = {}
+                    if dest_iata:
+                        _constraint_update["destination_airport"] = dest_iata
+                        _constraint_update["destination_code"] = dest_iata
+                    if orig_iata:
+                        _constraint_update["origin_airport"] = orig_iata
+                        _constraint_update["origin_code"] = orig_iata
+
+                    _rev_result = ts.create_revision_atomic(
+                        trip_id=target_trip_id,
+                        user_id=current_user.id,
+                        feedback=(
+                            "First plan generated by AI planner." if _cur_rev == 0
+                            else "Plan regenerated by AI planner."
+                        ),
+                        updated_constraints=_constraint_update,
+                        # No expected_base_revision constraint — we accept the current
+                        # authoritative revision and advance from it.  The row lock
+                        # inside create_revision_atomic prevents races.
+                    )
+
+                    _new_rev_id = _rev_result.get("revision_id")
+                    _new_rev_num = _rev_result.get("revision_number")
+                    logger.info(
+                        "Wave1B: trip %s PROPOSED revision created id=%s number=%s",
+                        target_trip_id, _new_rev_id, _new_rev_num,
+                    )
+
+                    # Surface revision identity in the API response so the frontend
+                    # can use the real revision_id immediately without a follow-up GET.
+                    out_dict["revision_id"] = _new_rev_id
+                    out_dict["revision_number"] = _new_rev_num
+                    out_dict["revision_status"] = "PROPOSED"
+                    out_dict["current_revision_id"] = _new_rev_id
+                    out_dict["current_revision_number"] = _new_rev_num
+                    if dest_iata:
+                        out_dict["destination_airport"] = dest_iata
+                    if orig_iata:
+                        out_dict["origin_airport"] = orig_iata
+
+                except Exception as _rev_err:
+                    logger.error(
+                        "Wave1B: revision creation failed for trip %s: %s",
+                        target_trip_id, _rev_err, exc_info=True,
+                    )
+                    raise RuntimeError(
+                        f"Plan generated and stored but revision creation failed for trip "
+                        f"{target_trip_id}: {_rev_err}"
+                    ) from _rev_err
+
         out_dict["success"] = True
         return JSONResponse(
             content=jsonable_encoder(out_dict)
@@ -302,14 +436,73 @@ async def travel_planner(
 
 
 @app.post("/api/travel/pdf")
-async def download_travel_plan_pdf(request_data: TravelPlanPDFRequest):
+async def download_travel_plan_pdf(
+    request_data: TravelPlanPDFRequest,
+    current_user: UserResponse | None = Depends(get_optional_current_user),
+):
     try:
-        pdf = build_travel_plan_pdf(request_data.plan)
+        plan = None
+        if request_data.plan:
+            plan = request_data.plan
+        elif request_data.trip_id:
+            if not current_user:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authentication required to export travel plan by trip ID.",
+                )
+            from services.trip_store import TripStore
+            from services.evidence_store import EvidenceRevisionStore
+
+            ts = TripStore()
+            trip = ts.get_trip(request_data.trip_id, current_user.id)
+            if not trip:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Trip not found or does not belong to you.",
+                )
+
+            ev_store = EvidenceRevisionStore()
+            current_rev_id = trip.get("current_revision_id")
+            if current_rev_id:
+                rev = ev_store.get_revision(str(current_rev_id), current_user.id)
+                if rev and rev.plan_snapshot:
+                    plan = rev.plan_snapshot
+
+            if not plan:
+                meta = trip.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                plan = (
+                    meta.get("generated_plan")
+                    or meta.get("plan")
+                    or meta.get("plan_json")
+                    or {
+                        "title": trip.get("title") or "Travel Plan",
+                        "destination": trip.get("destination") or "Destination",
+                        "origin": trip.get("origin") or "Origin",
+                        "itinerary": meta.get("itinerary") or [],
+                        "hotels": meta.get("hotels") or ([meta.get("selected_hotel")] if meta.get("selected_hotel") else []),
+                        "flights": meta.get("flights") or ([meta.get("selected_flight")] if meta.get("selected_flight") else []),
+                    }
+                )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 'plan' or 'trip_id' must be provided.",
+            )
+
+        pdf = build_travel_plan_pdf(plan)
+        filename = f"trust-trip-plan-{request_data.trip_id or 'export'}.pdf"
         return Response(
             content=pdf,
             media_type="application/pdf",
-            headers={"Content-Disposition": 'attachment; filename="trust-trip-travel-plan.pdf"'},
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Travel plan PDF generation failed: %s", exc)
         return JSONResponse(
