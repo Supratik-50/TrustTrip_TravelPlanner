@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import date
 import os
 from typing import Any
 import requests
@@ -56,6 +57,14 @@ class LiteAPIProvider:
             body["aiSearch"] = str(request.get("destination") or "")
         data = self._request("POST", self.SEARCH_URL, json=body)
         hotels = {str(h.get("id")): h for h in (data.get("hotels") or []) if isinstance(h, dict)}
+        # Compute stay nights from checkin and checkout dates
+        try:
+            d_in = date.fromisoformat(str(request.get("checkin") or "").split("T")[0])
+            d_out = date.fromisoformat(str(request.get("checkout") or "").split("T")[0])
+            nights = max(1, (d_out - d_in).days)
+        except Exception:
+            nights = 1
+
         offers: list[dict[str, Any]] = []
         for item in data.get("data") or []:
             if not isinstance(item, dict):
@@ -119,6 +128,9 @@ class LiteAPIProvider:
                 "cancellation": cancellation,
                 "refundable": refundable,
                 "price": amount,
+                "total_price": amount,
+                "pricing_basis": "full_stay",
+                "nights": nights,
                 "currency": currency,
                 "rooms": rooms,
                 "adults": int(request.get("adults", 1)),
