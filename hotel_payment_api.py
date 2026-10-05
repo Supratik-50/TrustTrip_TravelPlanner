@@ -85,6 +85,7 @@ class HotelPaymentOrder(BaseModel):
     expected_revision_number: int = Field(ge=1)
     payment_idempotency_key: str = Field(min_length=8, max_length=128)
     final_confirmation: bool = False
+    snapshot_id: str | None = None
 
 class HotelVerifyBook(BaseModel):
     transaction_id: str
@@ -118,12 +119,61 @@ async def create_order(
             status_code=409,
             detail="Hotel prebook returned a simulated reference. Cannot create a real payment order without an authoritative supplier hold.",
         )
-    amount_inr=offer.get("price_inr")
-    if amount_inr is None:
+
+    # HRP-02: Derive authoritative payment amount from server-side snapshot if available
+    from services.search_session_store import SearchSessionStore
+    from services.trip_store import TripStore
+
+    snap_id = req.snapshot_id or (offer.get("snapshot_id") if isinstance(offer, dict) else None)
+    if not snap_id and isinstance(pre, dict):
+        snap_id = pre.get("snapshot_id")
+    if not snap_id:
         try:
-            amount_inr=float(offer["price"])*float(CurrencyConverter().get_rate(offer["currency"],"INR")["rate"])
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"Unable to determine INR payment amount: {exc}")
+            trip_rec = TripStore().get_trip(req.trip_id, current_user.id)
+            if trip_rec:
+                t_meta = trip_rec.get("metadata") or {}
+                if isinstance(t_meta, str):
+                    try: t_meta = json.loads(t_meta)
+                    except Exception: t_meta = {}
+                snap_id = t_meta.get("selected_hotel_snapshot_id") or (t_meta.get("selected_hotel") or {}).get("snapshot_id")
+        except Exception:
+            pass
+
+    snapshot = None
+    if snap_id:
+        snap_store = SearchSessionStore()
+        snapshot = snap_store.get_snapshot(snap_id, current_user.id)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail=f"Hotel offer snapshot '{snap_id}' not found or access denied.")
+
+    if snapshot:
+        # Enforce server-authoritative snapshot price breakdown
+        auth_offer = snapshot.normalized_offer
+        auth_inr = auth_offer.price.inr_reference_amount
+        if auth_inr is not None:
+            amount_inr = float(auth_inr)
+        else:
+            try:
+                converter = CurrencyConverter()
+                rate_info = converter.get_rate(str(auth_offer.price.currency), "INR")
+                amount_inr = float(auth_offer.price.total_amount) * float(rate_info["rate"])
+            except Exception:
+                amount_inr = float(auth_offer.price.total_amount) * 85.0
+        # Overwrite offer dictionary so client cannot tamper with stored prices
+        offer["price_inr"] = round(amount_inr, 2)
+        offer["price"] = float(auth_offer.price.total_amount)
+        offer["currency"] = str(auth_offer.price.currency)
+        offer["snapshot_id"] = str(snapshot.snapshot_id)
+    else:
+        amount_inr = offer.get("price_inr")
+        if amount_inr is None:
+            try:
+                amount_inr = float(offer["price"]) * float(CurrencyConverter().get_rate(offer["currency"], "INR")["rate"])
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"Unable to determine INR payment amount: {exc}")
+        if float(amount_inr) <= 0:
+            raise HTTPException(status_code=422, detail="Hotel payment amount must be strictly positive.")
+
     from services.authorization_store import AuthorizationStore
     try:
         AuthorizationStore().assert_booking_eligible(
@@ -196,6 +246,45 @@ async def verify_and_book(
     if str(pending.get("booking_status") or "").lower() == "booked" and pending.get("booking_json"):
         return {"success": True, "transaction_id": req.transaction_id, "payment_captured": True, "booking": pending.get("booking_json"), "amount_inr": float(pending["amount_inr"]), "already_booked": True, "pdf_available": True}
 
+    if str(pending.get("payment_status") or "").lower() == "refunded":
+        return {
+            "success": False,
+            "transaction_id": req.transaction_id,
+            "payment_captured": True,
+            "refunded": True,
+            "requires_refund": False,
+            "error": pending.get("error") or "Payment was refunded because hotel booking could not be completed.",
+        }
+
+    if str(pending.get("booking_status") or "").lower() == "reconciliation_pending":
+        rec_status, rec_booking = HotelService().reconcile(pending.get("offer_json") or req.offer, req.transaction_id)
+        if rec_status == "CONFIRMED" and rec_booking:
+            store.update(req.transaction_id, payment_status="captured", booking_status="booked",
+                         razorpay_payment_id=req.razorpay_payment_id or pending.get("razorpay_payment_id"),
+                         booking_json=rec_booking, error=None)
+            return {"success": True, "transaction_id": req.transaction_id, "payment_captured": True,
+                    "booking": rec_booking, "amount_inr": float(pending["amount_inr"]), "already_booked": False,
+                    "reconciled": True, "pdf_available": True}
+        elif rec_status == "NOT_FOUND":
+            # Confirmed supplier did not create booking -> process refund
+            rz = RazorpayService()
+            refund_res = None
+            try:
+                refund_res = rz.refund(
+                    payment_id=req.razorpay_payment_id or pending.get("razorpay_payment_id"),
+                    amount_rupees=float(pending["amount_inr"]),
+                    idempotency_key=f"ref_ht_{req.transaction_id.replace('-', '')[:32]}",
+                )
+            except Exception:
+                pass
+            if refund_res and str(refund_res.get("status", "")).lower() in {"processed", "captured", "refunded"}:
+                store.update(req.transaction_id, payment_status="refunded", booking_status="booking_failed",
+                             booking_json={"refund": refund_res})
+                return {"success": False, "transaction_id": req.transaction_id, "payment_captured": True,
+                        "refunded": True, "refund_id": refund_res.get("id"), "requires_refund": False,
+                        "error": "Supplier confirmed no booking exists. Payment has been refunded."}
+        raise HTTPException(status_code=409, detail="Hotel booking verification is still pending supplier confirmation. Please wait or refresh.")
+
     if str(pending.get("booking_status") or "").lower() == "booking_in_progress":
         raise HTTPException(status_code=409, detail="Hotel booking is already in progress for this transaction. Please wait or refresh.")
 
@@ -227,6 +316,30 @@ async def verify_and_book(
         latest = store.get(req.transaction_id) or {}
         if str(latest.get("booking_status") or "").lower() == "booked":
             return {"success": True, "transaction_id": req.transaction_id, "payment_captured": True, "booking": latest.get("booking_json"), "amount_inr": float(latest.get("amount_inr") or 0), "already_booked": True, "pdf_available": True}
+        if str(latest.get("booking_status") or "").lower() == "reconciliation_pending":
+            rec_status, rec_booking = HotelService().reconcile(latest.get("offer_json") or req.offer, req.transaction_id)
+            if rec_status == "CONFIRMED" and rec_booking:
+                store.update(req.transaction_id, payment_status="captured", booking_status="booked",
+                             booking_json=rec_booking, error=None)
+                return {"success": True, "transaction_id": req.transaction_id, "payment_captured": True, "booking": rec_booking, "amount_inr": float(latest.get("amount_inr") or 0), "already_booked": False, "reconciled": True, "pdf_available": True}
+            elif rec_status == "NOT_FOUND":
+                refund_res = None
+                try:
+                    refund_res = rz.refund(
+                        payment_id=req.razorpay_payment_id,
+                        amount_rupees=float(latest["amount_inr"]),
+                        idempotency_key=f"ref_ht_{req.transaction_id.replace('-', '')[:32]}",
+                    )
+                except Exception:
+                    pass
+                if refund_res and str(refund_res.get("status", "")).lower() in {"processed", "captured", "refunded"}:
+                    store.update(req.transaction_id, payment_status="refunded", booking_status="booking_failed",
+                                 booking_json={"refund": refund_res})
+                    return {"success": False, "payment_captured": True, "refunded": True, "requires_refund": False,
+                            "transaction_id": req.transaction_id, "error": "Supplier confirmed no booking exists. Payment has been refunded."}
+            raise HTTPException(status_code=409, detail="Hotel booking verification is still pending supplier confirmation. Please wait or refresh.")
+        if str(latest.get("payment_status") or "").lower() == "refunded":
+            return {"success": False, "transaction_id": req.transaction_id, "payment_captured": True, "refunded": True, "requires_refund": False, "error": latest.get("error") or "Payment was refunded because hotel booking could not be completed."}
         raise HTTPException(status_code=409, detail="Hotel booking is already in progress or already processed.")
 
     try:
@@ -269,15 +382,74 @@ async def verify_and_book(
                 "error": "Trip revision changed after payment capture. Booking requires manual review.",
             }
         raise
+
     try:
         booking = HotelService().book(req.offer, req.prebook, req.holder, req.guests, req.transaction_id)
         store.update(req.transaction_id, payment_status="captured", booking_status="booked", razorpay_payment_id=req.razorpay_payment_id, booking_json=booking, error=None)
-    except HotelProviderError as exc:
-        store.update(req.transaction_id, payment_status="captured", booking_status="booking_failed", razorpay_payment_id=req.razorpay_payment_id, error=str(exc))
-        return {"success": False, "payment_captured": True, "booking_pending": False, "requires_refund": True, "transaction_id": req.transaction_id, "error": f"Payment succeeded but hotel booking failed: {exc}"}
-    except Exception:
-        store.update(req.transaction_id, payment_status="captured", booking_status="booking_failed", razorpay_payment_id=req.razorpay_payment_id, error="Hotel booking failed after payment capture; reconciliation/refund is required.")
-        return {"success": False, "payment_captured": True, "booking_pending": False, "requires_refund": True, "transaction_id": req.transaction_id, "error": "Payment succeeded but the hotel booking could not be completed. Reconciliation/refund is required."}
+    except Exception as exc:
+        # HRP-04: Reconcile before failing or refunding
+        rec_status, rec_booking = HotelService().reconcile(req.offer, req.transaction_id)
+        if rec_status == "CONFIRMED" and rec_booking:
+            booking = rec_booking
+            store.update(req.transaction_id, payment_status="captured", booking_status="booked",
+                         razorpay_payment_id=req.razorpay_payment_id, booking_json=booking, error=None)
+        elif rec_status == "UNCERTAIN":
+            # Response lost / connection ambiguous. Maintain recoverable reconciliation state
+            store.update(req.transaction_id, payment_status="captured", booking_status="reconciliation_pending",
+                         razorpay_payment_id=req.razorpay_payment_id,
+                         error=f"Supplier booking response lost, status uncertain: {exc}")
+            return {
+                "success": False,
+                "payment_captured": True,
+                "booking_pending": True,
+                "reconciliation_pending": True,
+                "requires_refund": False,
+                "transaction_id": req.transaction_id,
+                "error": "Supplier booking status is uncertain after network interruption. Verification is pending supplier confirmation.",
+            }
+        else:
+            # rec_status == "NOT_FOUND": Confirmed no booking upstream -> HRP-03: execute automated refund
+            refund_res = None
+            refund_err = None
+            try:
+                refund_res = rz.refund(
+                    payment_id=req.razorpay_payment_id,
+                    amount_rupees=float(pending["amount_inr"]),
+                    idempotency_key=f"ref_ht_{req.transaction_id.replace('-', '')[:32]}",
+                )
+            except Exception as rz_exc:
+                refund_err = str(rz_exc)
+
+            if refund_res and str(refund_res.get("status", "")).lower() in {"processed", "captured", "refunded"}:
+                store.update(req.transaction_id, payment_status="refunded", booking_status="booking_failed",
+                             razorpay_payment_id=req.razorpay_payment_id,
+                             booking_json={"refund": refund_res},
+                             error=f"Hotel booking failed: {exc}. Payment refunded: {refund_res.get('id')}")
+                return {
+                    "success": False,
+                    "payment_captured": True,
+                    "booking_pending": False,
+                    "refunded": True,
+                    "refund_id": refund_res.get("id"),
+                    "requires_refund": False,
+                    "transaction_id": req.transaction_id,
+                    "error": f"Payment refunded because hotel booking could not be completed: {exc}",
+                }
+            else:
+                store.update(req.transaction_id,
+                             payment_status="refund_failed" if refund_err else "refund_pending",
+                             booking_status="booking_failed",
+                             razorpay_payment_id=req.razorpay_payment_id,
+                             error=f"Hotel booking failed: {exc}. Refund attempt pending: {refund_err or 'unprocessed'}")
+                return {
+                    "success": False,
+                    "payment_captured": True,
+                    "booking_pending": False,
+                    "refunded": False,
+                    "requires_refund": True,
+                    "transaction_id": req.transaction_id,
+                    "error": f"Payment succeeded but hotel booking could not be completed: {exc}. Refund is pending reconciliation.",
+                }
 
     # Separate PDF generation lifecycle: failure must NOT invalidate confirmed booking
     pdf_available = False

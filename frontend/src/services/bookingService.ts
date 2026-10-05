@@ -47,6 +47,7 @@ export class TrustTripBookingService implements IBookingService {
   private activePrebookIds: Map<string, string> = new Map();
   private activePrebookData: Map<string, any> = new Map();
   private activeHotelOffers: Map<string, any> = new Map();
+  private activeHotelTransactions: Map<string, any> = new Map();
 
   /**
    * Approves canonical journey plan via POST /api/trips/{trip_id}/approve.
@@ -576,6 +577,7 @@ export class TrustTripBookingService implements IBookingService {
           phone: contact.phone?.trim() || '',
         }];
 
+    const snapshotId = offer?.snapshot_id || cachedOffer?.snapshot_id || prebook?.snapshot_id || (typeof offer?.id === 'string' && offer.id.includes('-') ? offer.id : undefined);
     const idempotencyKey = `idem_ht_${tripId.replace(/-/g, '').slice(0, 16)}_${Date.now()}`;
     const orderRes = await api.createHotelPaymentOrder({
       offer,
@@ -587,11 +589,21 @@ export class TrustTripBookingService implements IBookingService {
       expected_revision_number: expectedRevisionNumber,
       payment_idempotency_key: idempotencyKey,
       final_confirmation: true,
+      snapshot_id: snapshotId,
     });
 
     if (!orderRes || !orderRes.transaction_id || !orderRes.success || !orderRes.razorpay_order_id) {
       throw new Error('Hotel payment order creation failed: ' + ((orderRes as any)?.detail || 'Server rejected order'));
     }
+
+    this.activeHotelTransactions.set(tripId, {
+      ...orderRes,
+      snapshot_id: snapshotId,
+      offer,
+      prebook,
+      holder,
+      guests,
+    });
 
     return {
       transaction_id: orderRes.transaction_id,
@@ -612,10 +624,10 @@ export class TrustTripBookingService implements IBookingService {
     contact: TravelerContactInfo,
     revisionId?: string,
     expectedRevisionNumber?: number,
-    paymentDetailsOrTravelers?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
+    paymentDetailsOrTravelers?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
     allTravelersParam?: FlightPassenger[]
   ): Promise<HotelConfirmationRecord> {
-    let paymentDetails: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | undefined;
+    let paymentDetails: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | undefined;
     let allTravelers: FlightPassenger[] | undefined;
 
     if (Array.isArray(paymentDetailsOrTravelers)) {
@@ -690,22 +702,38 @@ export class TrustTripBookingService implements IBookingService {
           phone: contact.phone?.trim() || '',
         }];
 
-    // 1. Create order via POST /api/hotel-payments/create-order
-    const idempotencyKey = `idem_ht_${tripId.replace(/-/g, '').slice(0, 16)}_${Date.now()}`;
-    const orderRes = await api.createHotelPaymentOrder({
-      offer,
-      prebook,
-      holder,
-      guests,
-      trip_id: tripId,
-      revision_id: revId,
-      expected_revision_number: revNum,
-      payment_idempotency_key: idempotencyKey,
-      final_confirmation: true,
-    });
+    // HRP-01: Exactly one authoritative payment order/transaction per checkout attempt.
+    // If an order was already created via initiateHotelPaymentOrder, reuse it directly
+    // instead of creating a second transaction after customer has already paid.
+    const activeTx = this.activeHotelTransactions.get(tripId);
+    const existingTxId = paymentDetails?.transaction_id || (activeTx?.razorpay_order_id === paymentDetails?.razorpay_order_id ? activeTx?.transaction_id : undefined);
+    const existingOrderId = paymentDetails?.razorpay_order_id || activeTx?.razorpay_order_id;
 
-    if (!orderRes || !orderRes.transaction_id || !orderRes.success) {
-      throw new Error('Hotel payment order creation failed: ' + ((orderRes as any)?.detail || 'Server rejected order'));
+    let transactionId = existingTxId;
+    let rzpOrderId = existingOrderId;
+
+    if (!transactionId) {
+      // Standalone execution (e.g. direct test call): create order once
+      const snapshotId = offer?.snapshot_id || cachedOffer?.snapshot_id || prebook?.snapshot_id || (typeof offer?.id === 'string' && offer.id.includes('-') ? offer.id : undefined);
+      const idempotencyKey = `idem_ht_${tripId.replace(/-/g, '').slice(0, 16)}_${Date.now()}`;
+      const orderRes = await api.createHotelPaymentOrder({
+        offer,
+        prebook,
+        holder,
+        guests,
+        trip_id: tripId,
+        revision_id: revId,
+        expected_revision_number: revNum,
+        payment_idempotency_key: idempotencyKey,
+        final_confirmation: true,
+        snapshot_id: snapshotId,
+      });
+
+      if (!orderRes || !orderRes.transaction_id || !orderRes.success) {
+        throw new Error('Hotel payment order creation failed: ' + ((orderRes as any)?.detail || 'Server rejected order'));
+      }
+      transactionId = orderRes.transaction_id;
+      rzpOrderId = orderRes.razorpay_order_id || rzpOrderId;
     }
 
     // W3-FIND-02: Strict genuine Razorpay signature requirement.
@@ -714,10 +742,10 @@ export class TrustTripBookingService implements IBookingService {
       throw new Error('Valid Razorpay payment confirmation (payment_id and signature) is required. Synthetic payment signatures are strictly prohibited.');
     }
 
-    // 2. Verify and book hotel via POST /api/hotel-payments/verify-and-book
+    // 2. Verify and book hotel via POST /api/hotel-payments/verify-and-book using the authoritative transaction
     const verifyRes = await api.verifyAndBookHotel({
-      transaction_id: orderRes.transaction_id,
-      razorpay_order_id: paymentDetails.razorpay_order_id || orderRes.razorpay_order_id || '',
+      transaction_id: transactionId,
+      razorpay_order_id: rzpOrderId || '',
       razorpay_payment_id: paymentDetails.razorpay_payment_id,
       razorpay_signature: paymentDetails.razorpay_signature,
       offer,
@@ -733,6 +761,9 @@ export class TrustTripBookingService implements IBookingService {
     if (!verifyRes.success || !verifyRes.booking || !verifyRes.payment_captured) {
       throw new Error(verifyRes.error || 'Authoritative hotel booking confirmation data unavailable from server.');
     }
+
+    // Clean up active transaction memory upon successful booking
+    this.activeHotelTransactions.delete(tripId);
 
     const booking = verifyRes.booking;
     const confirmationCode = booking.confirmation_code || booking.booking_id || booking.id;

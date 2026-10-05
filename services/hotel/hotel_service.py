@@ -76,3 +76,12 @@ class HotelService:
 
     def book(self, offer, prebook, holder, guests, client_reference):
         return self._provider_for(offer).book(prebook, holder, guests, client_reference)
+
+    def reconcile(self, offer: dict[str, Any], client_reference: str) -> tuple[str, dict[str, Any] | None]:
+        try:
+            provider = self._provider_for(offer)
+            if hasattr(provider, "reconcile"):
+                return provider.reconcile(client_reference)
+            return ("UNCERTAIN", None)
+        except Exception:
+            return ("UNCERTAIN", None)

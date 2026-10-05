@@ -14,6 +14,7 @@ import {
 import { TravelerContactInfo } from '../../types/bookingFrontend';
 import { Button } from '../common/Button';
 import { formatCurrency } from '../../lib/currency';
+import { loadRazorpayScript } from '../../lib/razorpay';
 
 interface PaymentReviewModalProps {
   isOpen: boolean;
@@ -29,8 +30,17 @@ interface PaymentReviewModalProps {
   contact: TravelerContactInfo;
   onProcessPayment: (
     method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
-    contact: TravelerContactInfo
+    contact: TravelerContactInfo,
+    paymentDetails?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
   ) => Promise<void>;
+  onInitiateOrder?: () => Promise<{
+    transaction_id: string;
+    razorpay_order_id: string;
+    amount_inr: number;
+    currency: string;
+    key_id: string;
+    hotel_name?: string;
+  }>;
 }
 
 export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
@@ -46,9 +56,11 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
   currency = 'USD',
   contact,
   onProcessPayment,
+  onInitiateOrder,
 }) => {
   const [paymentMethod, setPaymentMethod] = useState<'card' | 'upi' | 'netbanking' | 'pay_at_property'>('card');
   const [processingState, setProcessingState] = useState<'idle' | 'processing' | 'success' | 'failed'>('idle');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [simulateFailure, setSimulateFailure] = useState(false);
 
   if (!isOpen) return null;
@@ -58,21 +70,92 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setProcessingState('processing');
+    setErrorMessage(null);
 
     try {
       if (simulateFailure) {
-        await new Promise((r) => setTimeout(r, 1200));
+        await new Promise((r) => setTimeout(r, 800));
         setProcessingState('failed');
+        setErrorMessage('Simulated network payment failure.');
         return;
       }
 
+      if (onInitiateOrder) {
+        // 1. Server-side order creation
+        const orderData = await onInitiateOrder();
+        if (!orderData || !orderData.razorpay_order_id) {
+          throw new Error('Failed to create hotel payment order on server.');
+        }
+
+        // 2. Load official Razorpay Checkout SDK
+        const scriptLoaded = await loadRazorpayScript();
+        if (!scriptLoaded || !(window as any).Razorpay) {
+          throw new Error('Razorpay Checkout SDK could not be loaded. Please check your internet connection.');
+        }
+
+        // 3. Launch official Checkout modal
+        const rzp = new (window as any).Razorpay({
+          key: orderData.key_id,
+          amount: Math.round(orderData.amount_inr * 100),
+          currency: orderData.currency || 'INR',
+          name: 'TrustTrip',
+          description: `Hotel Reservation - ${orderData.hotel_name || hotelName || 'Hotel'}`,
+          order_id: orderData.razorpay_order_id,
+          handler: async (response: {
+            razorpay_payment_id: string;
+            razorpay_order_id: string;
+            razorpay_signature: string;
+          }) => {
+            try {
+              setProcessingState('processing');
+              await onProcessPayment(paymentMethod, contact, {
+                transaction_id: orderData.transaction_id,
+                razorpay_order_id: response.razorpay_order_id || orderData.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+              });
+              setProcessingState('success');
+              setTimeout(() => {
+                onClose();
+              }, 1000);
+            } catch (err: any) {
+              setProcessingState('failed');
+              setErrorMessage(err.message || 'Payment verification or hotel booking failed.');
+            }
+          },
+          modal: {
+            ondismiss: () => {
+              setProcessingState('idle');
+            },
+          },
+          prefill: {
+            name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim() || undefined,
+            email: contact.email || undefined,
+            contact: contact.phone || undefined,
+          },
+          theme: {
+            color: '#0d9488',
+          },
+        });
+
+        rzp.on('payment.failed', (response: any) => {
+          setProcessingState('failed');
+          setErrorMessage(response?.error?.description || 'Payment was declined by payment gateway.');
+        });
+
+        rzp.open();
+        return;
+      }
+
+      // Fallback for direct test calls without order initiation
       await onProcessPayment(paymentMethod, contact);
       setProcessingState('success');
       setTimeout(() => {
         onClose();
       }, 1000);
-    } catch {
+    } catch (err: any) {
       setProcessingState('failed');
+      setErrorMessage(err.message || 'Payment processing failed.');
     }
   };
 
@@ -141,8 +224,7 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                 We couldn't complete the payment
               </div>
               <p className="text-[var(--text-primary)] leading-relaxed">
-                The simulated transaction could not be completed by the banking network. No funds
-                were charged.
+                {errorMessage || 'The transaction could not be completed by the banking network. No funds were charged.'}
               </p>
             </div>
 
@@ -152,6 +234,7 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                 size="md"
                 onClick={() => {
                   setSimulateFailure(false);
+                  setErrorMessage(null);
                   setProcessingState('idle');
                 }}
               >
@@ -264,7 +347,7 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
             {/* Zero card data guarantee note */}
             <div className="text-[11px] text-[var(--text-muted)] flex items-center gap-1.5 font-light">
               <ShieldCheck className="w-3.5 h-3.5 text-[var(--primary)] shrink-0" />
-              <span>Simulated prototype boundary. In production, Razorpay handles credentials with zero sensitive card storage.</span>
+              <span>Secured by official Razorpay Checkout. Zero sensitive card or credential data is stored on TrustTrip servers.</span>
             </div>
 
             {/* Actions */}

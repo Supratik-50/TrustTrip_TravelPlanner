@@ -185,7 +185,7 @@ export interface IBookingService {
     contact: TravelerContactInfo,
     revisionId?: string,
     expectedRevisionNumber?: number,
-    paymentDetailsOrTravelers?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
+    paymentDetailsOrTravelers?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
     allTravelers?: FlightPassenger[]
   ): Promise<HotelConfirmationRecord>;
   requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id?: string; status?: string; message: string }>;

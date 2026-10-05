@@ -138,3 +138,25 @@ class HotelbedsProvider:
         data = self._request("POST", "/hotel-api/1.0/bookings", json={"holder": holder, "rooms": rooms, "clientReference": client_reference, "remark": "Trust Trip MAS"})
         booking = data.get("booking") or data
         return {"provider": self.name, "booking_id": booking.get("reference"), "confirmation_code": booking.get("reference"), "status": "CONFIRMED", "raw": data}
+
+    def reconcile(self, client_reference: str) -> tuple[str, dict[str, Any] | None]:
+        """Inquire supplier for existing booking by clientReference (HRP-04)."""
+        try:
+            data = self._request("GET", "/hotel-api/1.0/bookings", params={"clientReference": client_reference})
+        except Exception:
+            return ("UNCERTAIN", None)
+
+        b_obj = data.get("bookings") if isinstance(data, dict) else None
+        bookings = b_obj.get("bookings") if isinstance(b_obj, dict) else (b_obj if isinstance(b_obj, list) else [])
+        if bookings:
+            target = bookings[0]
+            status = str(target.get("status") or "CONFIRMED").upper()
+            if status in {"CONFIRMED", "BOOKED"}:
+                return ("CONFIRMED", {
+                    "provider": self.name,
+                    "booking_id": target.get("reference"),
+                    "confirmation_code": target.get("reference"),
+                    "status": "CONFIRMED",
+                    "raw": target,
+                })
+        return ("NOT_FOUND", None)

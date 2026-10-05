@@ -875,7 +875,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   const handleProcessHotelPayment = async (
     method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
     travelerContact: TravelerContactInfo,
-    paymentDetails?: { razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
+    paymentDetails?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
   ) => {
     if (
       !activeAuthorization ||

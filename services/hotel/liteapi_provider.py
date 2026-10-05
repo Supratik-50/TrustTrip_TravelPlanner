@@ -171,3 +171,25 @@ class LiteAPIProvider:
             "status": d.get("status") or "CONFIRMED",
             "raw": data,
         }
+
+    def reconcile(self, client_reference: str) -> tuple[str, dict[str, Any] | None]:
+        """Inquire supplier for existing booking by clientReference (HRP-04)."""
+        try:
+            data = self._request("GET", f"{self.BOOK_URL}/bookings", params={"clientReference": client_reference})
+        except Exception:
+            return ("UNCERTAIN", None)
+
+        d = data.get("data") if isinstance(data, dict) else data
+        bookings = d if isinstance(d, list) else ([d] if isinstance(d, dict) and d.get("bookingId") else [])
+        if bookings:
+            target = bookings[0]
+            status = str(target.get("status") or "CONFIRMED").upper()
+            if status in {"CONFIRMED", "BOOKED", "SUCCESS"}:
+                return ("CONFIRMED", {
+                    "provider": self.name,
+                    "booking_id": target.get("bookingId"),
+                    "confirmation_code": target.get("hotelConfirmationCode") or target.get("confirmationCode") or target.get("bookingId"),
+                    "status": "CONFIRMED",
+                    "raw": target,
+                })
+        return ("NOT_FOUND", None)
