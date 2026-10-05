@@ -281,6 +281,11 @@ export const HotelCard: React.FC<HotelCardProps> = ({
                   total
                 </span>
               </div>
+              {hotel.currency?.toUpperCase() !== 'INR' && hotel.price_inr !== undefined && hotel.price_inr !== null && !isNaN(Number(hotel.price_inr)) && (
+                <div className="text-xs sm:text-sm font-semibold text-[var(--text-secondary)] font-mono flex items-center gap-1">
+                  <span>≈ {formatCurrency(hotel.price_inr, 'INR')}</span>
+                </div>
+              )}
               {effectiveNightly != null && stayNights != null && (
                 <p className="text-[11px] text-[var(--text-muted)]">
                   {formatCurrency(effectiveNightly, hotel.currency)} / night for {stayNights} {stayNights === 1 ? 'night' : 'nights'} stay

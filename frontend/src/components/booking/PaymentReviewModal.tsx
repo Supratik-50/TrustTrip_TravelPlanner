@@ -25,8 +25,10 @@ interface PaymentReviewModalProps {
   endDate: string;
   guestsCount: number;
   roomAmount: number;
-  taxesAmount: number;
+  taxesAmount?: number;
   currency?: string;
+  priceInr?: number;
+  exchangeRate?: number;
   contact: TravelerContactInfo;
   onProcessPayment: (
     method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
@@ -52,8 +54,10 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
   endDate,
   guestsCount,
   roomAmount,
-  taxesAmount,
+  taxesAmount = 0,
   currency = 'USD',
+  priceInr,
+  exchangeRate,
   contact,
   onProcessPayment,
   onInitiateOrder,
@@ -65,7 +69,11 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
 
   if (!isOpen) return null;
 
-  const grandTotal = roomAmount + taxesAmount;
+  const isForeign = currency.toUpperCase() !== 'INR';
+  const payableAmountInr = priceInr != null && !isNaN(Number(priceInr)) ? priceInr : (!isForeign ? roomAmount : undefined);
+  const buttonPayableText = isForeign && payableAmountInr != null
+    ? formatCurrency(payableAmountInr, 'INR')
+    : formatCurrency(roomAmount, currency);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -264,23 +272,32 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                 </span>
               </div>
               <div className="pt-2 border-t border-[var(--border)]/60 flex justify-between items-center text-[var(--text-secondary)]">
-                <span>Room Charges:</span>
+                <span>Hotel price:</span>
                 <span className="font-mono text-[var(--text-primary)]">
                   {formatCurrency(roomAmount, currency)}
                 </span>
               </div>
-              <div className="flex justify-between items-center text-[var(--text-secondary)]">
-                <span>Taxes & Tourism Fees:</span>
-                <span className="font-mono text-[var(--text-primary)]">
-                  {formatCurrency(taxesAmount, currency)}
-                </span>
-              </div>
+              {isForeign && exchangeRate != null && !isNaN(Number(exchangeRate)) && (
+                <div className="flex justify-between items-center text-[var(--text-secondary)] text-[11px]">
+                  <span>FX rate:</span>
+                  <span className="font-mono text-[var(--text-primary)]">
+                    1 {currency.toUpperCase()} = ₹{Number(exchangeRate).toFixed(2)}
+                  </span>
+                </div>
+              )}
               <div className="pt-2 border-t border-[var(--border)]/60 flex justify-between items-baseline font-bold text-sm">
-                <span className="text-[var(--text-primary)]">Total:</span>
+                <span className="text-[var(--text-primary)]">Amount to pay:</span>
                 <span className="text-lg font-editorial text-[var(--primary)] font-bold">
-                  {formatCurrency(grandTotal, currency)}
+                  {isForeign && payableAmountInr != null
+                    ? formatCurrency(payableAmountInr, 'INR')
+                    : formatCurrency(roomAmount, currency)}
                 </span>
               </div>
+              {isForeign && (
+                <p className="text-[11px] text-[var(--text-muted)] italic text-right">
+                  Payment processed in INR through Razorpay.
+                </p>
+              )}
             </div>
 
             {/* Payment Method Selector */}
@@ -363,7 +380,7 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                 rightIcon={<ArrowRight className="w-4 h-4" />}
                 className="w-full sm:w-auto shadow-xs"
               >
-                Confirm & Pay (${grandTotal.toLocaleString()})
+                Confirm & Pay ({buttonPayableText})
               </Button>
             </div>
 

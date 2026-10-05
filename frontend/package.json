@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx src/__tests__/hotelTruthfulness.test.tsx && tsx src/__tests__/researchIntegration.test.tsx && tsx src/__tests__/section8RevisionClient.test.tsx && tsx src/__tests__/section9BookingAuthClient.test.tsx && tsx src/__tests__/section10HotelPayment.test.tsx"
+    "test": "tsx src/__tests__/hotelTruthfulness.test.tsx && tsx src/__tests__/researchIntegration.test.tsx && tsx src/__tests__/section8RevisionClient.test.tsx && tsx src/__tests__/section9BookingAuthClient.test.tsx && tsx src/__tests__/section10HotelPayment.test.tsx && tsx src/__tests__/tripDetailHookOrder.test.tsx && tsx src/__tests__/flightCurrencyDisplay.test.tsx && tsx src/__tests__/tripConstraintPersistence.test.tsx && tsx src/__tests__/selectTripOfferNormalization.test.tsx && tsx src/__tests__/wave2TravelerIdentity.test.tsx && tsx src/__tests__/wave3aHotelCheckout.test.tsx && tsx src/__tests__/wave3bBookingPersistence.test.tsx && tsx src/__tests__/hotelCurrencyDisplay.test.tsx"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

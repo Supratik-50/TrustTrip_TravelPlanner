@@ -538,14 +538,28 @@ export class TrustTripBookingService implements IBookingService {
       status: 'confirmed',
     };
     const cachedOffer = this.activeHotelOffers.get(tripId);
-    const offer = cachedOffer || {
+    const offerCurrency = (cachedOffer?.currency || prebook.currency || 'INR').toUpperCase();
+    let authoritativePriceInr: number | undefined = cachedOffer?.price_inr;
+    if (authoritativePriceInr == null && offerCurrency === 'INR') {
+      authoritativePriceInr = prebook.amount ?? cachedOffer?.price;
+    }
+    if (authoritativePriceInr == null || isNaN(Number(authoritativePriceInr)) || Number(authoritativePriceInr) <= 0) {
+      throw Object.assign(
+        new Error(`Authoritative INR payment amount is missing for ${offerCurrency} hotel offer. Payment cannot proceed without an authoritative INR reference.`),
+        { code: 'MISSING_AUTHORITATIVE_INR_PRICE', statusCode: 422 }
+      );
+    }
+    const offer = cachedOffer ? {
+      ...cachedOffer,
+      price_inr: authoritativePriceInr,
+    } : {
       id: prebook.hotel_id,
       provider_offer_id: prebook.hotel_id,
       provider: prebook.provider || 'liteapi',
       hotel_name: prebook.hotel_name,
       price: prebook.amount,
-      currency: prebook.currency || 'INR',
-      price_inr: prebook.amount,
+      currency: offerCurrency,
+      price_inr: authoritativePriceInr,
     };
     const firstName = contact?.first_name?.trim();
     const lastName = contact?.last_name?.trim();
@@ -661,15 +675,36 @@ export class TrustTripBookingService implements IBookingService {
       prebook_id: prebookId,
       status: 'confirmed',
     };
+    // HRP-01: Exactly one authoritative payment order/transaction per checkout attempt.
+    // If an order was already created via initiateHotelPaymentOrder, reuse it directly
+    // instead of creating a second transaction after customer has already paid.
+    const activeTx = this.activeHotelTransactions.get(tripId);
+    const existingTxId = paymentDetails?.transaction_id || (activeTx?.razorpay_order_id === paymentDetails?.razorpay_order_id ? activeTx?.transaction_id : undefined);
+    const existingOrderId = paymentDetails?.razorpay_order_id || activeTx?.razorpay_order_id;
+
     const cachedOffer = this.activeHotelOffers.get(tripId);
-    const offer = cachedOffer || {
+    const offerCurrency = (cachedOffer?.currency || prebook.currency || 'INR').toUpperCase();
+    let authoritativePriceInr: number | undefined = cachedOffer?.price_inr;
+    if (authoritativePriceInr == null && offerCurrency === 'INR') {
+      authoritativePriceInr = prebook.amount ?? cachedOffer?.price;
+    }
+    if (!existingTxId && (authoritativePriceInr == null || isNaN(Number(authoritativePriceInr)) || Number(authoritativePriceInr) <= 0)) {
+      throw Object.assign(
+        new Error(`Authoritative INR payment amount is missing for ${offerCurrency} hotel offer. Payment cannot proceed without an authoritative INR reference.`),
+        { code: 'MISSING_AUTHORITATIVE_INR_PRICE', statusCode: 422 }
+      );
+    }
+    const offer = cachedOffer ? {
+      ...cachedOffer,
+      price_inr: authoritativePriceInr,
+    } : {
       id: prebook.hotel_id,
       provider_offer_id: prebook.hotel_id,
       provider: prebook.provider || 'liteapi',
       hotel_name: prebook.hotel_name,
       price: prebook.amount,
-      currency: prebook.currency || 'INR',
-      price_inr: prebook.amount,
+      currency: offerCurrency,
+      price_inr: authoritativePriceInr,
     };
 
     const firstName = contact?.first_name?.trim();
@@ -701,13 +736,6 @@ export class TrustTripBookingService implements IBookingService {
           email: contact.email?.trim() || '',
           phone: contact.phone?.trim() || '',
         }];
-
-    // HRP-01: Exactly one authoritative payment order/transaction per checkout attempt.
-    // If an order was already created via initiateHotelPaymentOrder, reuse it directly
-    // instead of creating a second transaction after customer has already paid.
-    const activeTx = this.activeHotelTransactions.get(tripId);
-    const existingTxId = paymentDetails?.transaction_id || (activeTx?.razorpay_order_id === paymentDetails?.razorpay_order_id ? activeTx?.transaction_id : undefined);
-    const existingOrderId = paymentDetails?.razorpay_order_id || activeTx?.razorpay_order_id;
 
     let transactionId = existingTxId;
     let rzpOrderId = existingOrderId;
