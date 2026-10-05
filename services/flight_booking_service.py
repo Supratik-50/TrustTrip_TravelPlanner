@@ -272,6 +272,27 @@ class FlightBookingService:
             else:
                 raise ValueError("Invalid passenger data.")
 
+        # Validate passenger count against trip constraints if set
+        meta = trip.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        constraints = meta.get("constraints") or {}
+        expected_travelers = constraints.get("travelers_count") or meta.get("travelers_count") or trip.get("travelers_count")
+        if expected_travelers is not None:
+            try:
+                exp_count = int(expected_travelers)
+                if exp_count > 0 and len(normalized_passengers) != exp_count:
+                    raise ValueError(
+                        f"Passenger count mismatch: trip requires {exp_count} passenger(s), "
+                        f"but {len(normalized_passengers)} passenger(s) were supplied."
+                    )
+            except (TypeError, ValueError) as exc:
+                if "Passenger count mismatch" in str(exc):
+                    raise
+
         # 7. Create booking intent
         booking_id = uuid4()
         idempotency_key = f"book_{booking_id}"
@@ -766,16 +787,60 @@ class FlightBookingService:
             or "CONFIRMED"
         )
         order_id = booking_res.get("order_id") or booking_res.get("id")
+        raw_res = booking_res.get("raw") if isinstance(booking_res.get("raw"), dict) else {}
+
+        # Extract documents and e-ticket numbers safely
+        documents = booking_res.get("documents") or raw_res.get("documents") or []
+        eticket_val = booking_res.get("e_ticket")
+        if not eticket_val and documents:
+            for doc in documents:
+                for key in ("ticket_number", "document_number", "number", "unique_identifier"):
+                    val = doc.get(key)
+                    if val:
+                        eticket_val = str(val)
+                        break
+                if eticket_val:
+                    break
+
+        pnr_val = booking_res.get("pnr")
+
+        # Extract slices / itinerary for persistent ticket generation without Duffel dependency
+        slices = booking_res.get("slices") or raw_res.get("slices") or []
+        if not slices and hasattr(snapshot, "normalized_offer") and snapshot.normalized_offer:
+            norm_offer = snapshot.normalized_offer
+            if hasattr(norm_offer, "segments") and norm_offer.segments:
+                seg_list = []
+                for s in norm_offer.segments:
+                    s_dict = s.model_dump() if hasattr(s, "model_dump") else (s if isinstance(s, dict) else dict(s))
+                    seg_list.append({
+                        "origin": {"iata_code": s_dict.get("origin_iata"), "name": s_dict.get("origin_iata")},
+                        "destination": {"iata_code": s_dict.get("destination_iata"), "name": s_dict.get("destination_iata")},
+                        "origin_iata": s_dict.get("origin_iata"),
+                        "destination_iata": s_dict.get("destination_iata"),
+                        "operating_carrier": {"name": s_dict.get("operating_carrier_name") or s_dict.get("marketing_carrier_name") or "Airline"},
+                        "marketing_carrier": {"name": s_dict.get("marketing_carrier_name") or "Airline"},
+                        "marketing_carrier_name": s_dict.get("marketing_carrier_name") or "Airline",
+                        "marketing_carrier_flight_number": s_dict.get("flight_number") or "",
+                        "flight_number": s_dict.get("flight_number") or "",
+                        "departing_at": s_dict.get("departure_time").isoformat() if hasattr(s_dict.get("departure_time"), "isoformat") else str(s_dict.get("departure_time") or ""),
+                        "arriving_at": s_dict.get("arrival_time").isoformat() if hasattr(s_dict.get("arrival_time"), "isoformat") else str(s_dict.get("arrival_time") or ""),
+                        "departure_time": str(s_dict.get("departure_time") or ""),
+                        "arrival_time": str(s_dict.get("arrival_time") or ""),
+                    })
+                slices = [{"segments": seg_list}]
 
         completed_intent = copy.deepcopy(intent)
         completed_intent["status"] = BookingStatus.COMPLETED.value
         completed_intent["provider_reference"] = str(booking_ref)
-        pnr_val = booking_res.get("pnr")
-        eticket_val = booking_res.get("e_ticket")
+        if "metadata" not in completed_intent or not isinstance(completed_intent["metadata"], dict):
+            completed_intent["metadata"] = {}
         completed_intent["metadata"]["booking_reference"] = str(booking_ref)
         completed_intent["metadata"]["order_id"] = str(order_id) if order_id else None
         completed_intent["metadata"]["pnr"] = str(pnr_val) if pnr_val else None
         completed_intent["metadata"]["e_ticket"] = str(eticket_val) if eticket_val else None
+        completed_intent["metadata"]["documents"] = documents
+        completed_intent["metadata"]["slices"] = slices
+        completed_intent["metadata"]["passengers"] = passengers or completed_intent["metadata"].get("passengers", [])
         completed_intent["metadata"]["completed_at"] = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -815,6 +880,7 @@ class FlightBookingService:
         """Query booking status strictly shielding raw provider IDs."""
         intent = self._get_intent(booking_id, user_id)
         meta = intent.get("metadata") or {}
+        booking_ref = intent.get("provider_reference") or meta.get("booking_reference")
         return {
             "booking_id": str(intent["id"]),
             "trip_id": str(intent["trip_id"]),
@@ -824,12 +890,19 @@ class FlightBookingService:
             "currency": intent["currency"],
             "approved": bool(meta.get("approved", False)),
             "approved_at": meta.get("approved_at"),
-            "passenger_count": meta.get("passenger_count", 1),
-            "booking_reference": meta.get("booking_reference"),
+            "passenger_count": meta.get("passenger_count", len(meta.get("passengers", [])) or 1),
+            "booking_reference": str(booking_ref) if booking_ref else None,
             "order_id": meta.get("order_id"),
             "pnr": meta.get("pnr"),
             "e_ticket": meta.get("e_ticket"),
-            "created_at": intent["created_at"].isoformat() if hasattr(intent["created_at"], "isoformat") else str(intent["created_at"]),
+            "documents": meta.get("documents", []),
+            "slices": meta.get("slices", []),
+            "passengers": meta.get("passengers", []),
+            "created_at": (
+                intent.get("created_at").isoformat()
+                if hasattr(intent.get("created_at"), "isoformat")
+                else str(intent.get("created_at") or "")
+            ),
         }
 
     # ========================================================================
