@@ -16,6 +16,11 @@ class CanonicalInvariantViolation(ValueError):
     pass
 
 
+class TripDurationUnsupportedError(ValueError):
+    """Raised when requested trip duration exceeds supported planner limits (1–7 days)."""
+    pass
+
+
 class DayPlan(BaseModel):
     day: int
     title: str
@@ -78,7 +83,7 @@ class TravelPlan(BaseModel):
     retryable: bool = False
 
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_BASE = """
 You are Trust Trip's production travel-planning engine.
 
 Produce a realistic structured itinerary from the user's request and the VERIFIED evidence supplied by the application.
@@ -94,7 +99,50 @@ NON-NEGOTIABLE:
 8. Output only data matching the requested schema.
 9. For flight_suggestion, accommodation_plan and weather_guidance, use Markdown emphasis for important factual values. Keep explanatory words normal weight. Never put the whole sentence in bold.
 10. If the user asks for general/global flight information without a concrete route, provide useful general guidance in the available fields and do not invent current prices, schedules or availability.
-"""
+""".strip()
+
+COMPACT_RULES = """
+TOKEN EFFICIENCY & COMPACTNESS RULES (MANDATORY):
+- Keep all fields short, compact, and concise. Avoid narrative exposition, filler words ("You can", "Start your day by", "Take some time to"), and repeated facts.
+- In DayPlan:
+  - title: 2 to 4 words (e.g., "Colaba & Heritage").
+  - morning, afternoon, evening: exactly 1 concise sentence each (under 10 words, e.g., "Visit Gateway of India and walk Marine Drive.").
+  - notes: empty list [] unless an essential destination alert is required (max 1 short item under 8 words).
+- In trip_summary: exactly 1 concise sentence (under 15 words).
+- In flight_suggestion, accommodation_plan, weather_guidance: exactly 1 concise sentence each (under 18 words).
+- In assumptions: max 1 short item or empty [].
+- In warnings: empty [] unless budget exceeded or live offer missing (max 1 short item).
+- In changes_from_feedback: empty [] if no feedback.
+""".strip()
+
+ULTRA_COMPACT_RULES = """
+TOKEN EFFICIENCY & ULTRA-COMPACT RULES (MANDATORY FOR LONG ITINERARIES):
+- Complete every required TravelPlan field before adding optional descriptive detail.
+- You must preserve EVERY requested itinerary day in daily_plan.
+- Use short factual phrases. Avoid introductions, narratives, and conversational filler.
+- In DayPlan:
+  - title: maximum 3 words (e.g., "Colaba Heritage").
+  - morning: maximum 5 words (e.g., "Gateway of India visit.").
+  - afternoon: maximum 5 words (e.g., "Explore Colaba Causeway.").
+  - evening: maximum 5 words (e.g., "Dinner in Bandra.").
+  - notes: [] unless an essential alert is genuinely required.
+- In trip_summary: maximum 12 words.
+- In flight_suggestion: maximum 12 words.
+- In accommodation_plan: maximum 12 words.
+- In weather_guidance: maximum 12 words.
+- In assumptions: [] unless genuinely required.
+- In warnings: [] unless genuinely required.
+- In changes_from_feedback: [] when no feedback exists.
+""".strip()
+
+
+def _get_system_prompt(duration_days: int = 5) -> str:
+    if duration_days >= 7:
+        return SYSTEM_PROMPT_BASE + "\n\n" + ULTRA_COMPACT_RULES
+    return SYSTEM_PROMPT_BASE + "\n\n" + COMPACT_RULES
+
+
+SYSTEM_PROMPT = _get_system_prompt(5)
 
 
 def _json(value: Any, limit: int = 6000) -> str:
@@ -103,8 +151,7 @@ def _json(value: Any, limit: int = 6000) -> str:
 
 
 def _groq_model() -> str:
-    # GPT-OSS 20B is the safer default for the user's 8K TPM environment.
-    return os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    return os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 
 
 def _gemini_model() -> str:
@@ -198,24 +245,46 @@ HUMAN FEEDBACK:
 
 REVISION: {revision}
 
-Return the complete structured travel plan. Preserve provider facts exactly.
+Return the complete structured travel plan. Preserve provider facts exactly. Follow brevity limits strictly.
 """.strip()
 
 
-def _groq_plan(prompt: str) -> TravelPlan:
+def _resolve_duration_days(constraints: dict[str, Any]) -> int:
+    dep = constraints.get("departure_date") or constraints.get("start_date")
+    ret = constraints.get("return_date") or constraints.get("end_date")
+    is_one_way = bool(constraints.get("is_one_way", False)) or (dep and not ret)
+    if dep and is_one_way:
+        return 1
+    if dep and ret:
+        try:
+            from datetime import date
+            d1 = date.fromisoformat(str(dep)[:10])
+            d2 = date.fromisoformat(str(ret)[:10])
+            return (d2 - d1).days + 1
+        except Exception:
+            pass
+    if constraints.get("duration_days") is not None:
+        try:
+            return int(constraints["duration_days"])
+        except (ValueError, TypeError):
+            pass
+    return 1
+
+
+def _groq_plan(prompt: str, system_prompt: str = SYSTEM_PROMPT) -> TravelPlan:
     key = os.getenv("GROQ_API_KEY", "").strip().strip('"')
     if not key:
         raise RuntimeError("GROQ_API_KEY is not configured")
     llm = ChatGroq(
         model=_groq_model(), api_key=key, temperature=0.12,
-        # Keep total requested TPM comfortably below the user's 8K limit.
-        max_tokens=1700, reasoning_effort="low",
+        # Bounded token budget to fit comfortably below the 1000 OTPM account limit.
+        max_tokens=980, reasoning_effort="none",
     )
     structured = llm.with_structured_output(TravelPlan, method="json_schema")
-    return structured.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)])
+    return structured.invoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
 
 
-def _gemini_plan(prompt: str) -> TravelPlan:
+def _gemini_plan(prompt: str, system_prompt: str = SYSTEM_PROMPT) -> TravelPlan:
     key = os.getenv("GEMINI_API_KEY", "").strip().strip('"')
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
@@ -228,7 +297,7 @@ def _gemini_plan(prompt: str) -> TravelPlan:
     chat = client.chats.create(
         model=_gemini_model(),
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_prompt,
             temperature=0.12, max_output_tokens=1700,
             response_mime_type="application/json", response_schema=_gemini_response_schema(),
         ),
@@ -801,6 +870,13 @@ def generate_travel_plan(
     allow_deterministic_test_fallback: bool = False,
     raise_on_outage: bool = False,
 ) -> tuple[TravelPlan, str]:
+    duration = _resolve_duration_days(constraints)
+    if duration > 7:
+        raise TripDurationUnsupportedError(
+            "Trips longer than 7 days are not currently supported by the planner. "
+            "Please choose a trip duration of 7 days or fewer."
+        )
+
     prompt = _compact_context(
         constraints,
         flight_results,
@@ -827,9 +903,11 @@ def generate_travel_plan(
     sel_flight = live_flight_offers[0] if live_flight_offers else None
     sel_hotel = live_hotel_offers[0] if live_hotel_offers else None
 
+    sys_prompt = _get_system_prompt(duration)
+
     errors: list[str] = []
     try:
-        raw_plan = _groq_plan(prompt)
+        raw_plan = _groq_plan(prompt, system_prompt=sys_prompt)
         plan = enforce_complete_canonical_invariants(
             raw_plan, constraints,
             selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,
@@ -838,7 +916,7 @@ def generate_travel_plan(
     except Exception as exc:
         errors.append(f"groq: {type(exc).__name__}: {exc}")
     try:
-        raw_plan = _gemini_plan(prompt)
+        raw_plan = _gemini_plan(prompt, system_prompt=sys_prompt)
         plan = enforce_complete_canonical_invariants(
             raw_plan, constraints,
             selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,

@@ -28,7 +28,7 @@ from langchain_core.messages import (
 from services.flight_service import FlightService
 from services.hotel.hotel_service import HotelService
 from services.travel_planner import parse_trip_request, candidate_dates, budget_from_live_data, _provider_text, _resolve_place
-from services.chat_planner import generate_travel_plan, plan_to_markdown, PlannerOutageError
+from services.chat_planner import generate_travel_plan, plan_to_markdown, PlannerOutageError, TripDurationUnsupportedError
 from domain.compat import build_trip_request, trip_request_to_legacy
 from domain.trip import TripRequest
 
@@ -795,6 +795,21 @@ def itinerary_agent(state: TravelState):
             "llm_calls": state.get("llm_calls", 0) + 1,
             "approval_request": "Review this structured plan. Approve it, or tell Trust Trip exactly what you want changed.",
             "messages": [AIMessage(content=itinerary)],
+        }
+    except TripDurationUnsupportedError as exc:
+        msg = str(exc)
+        print(f"ITINERARY PLANNER DURATION GUARD: {msg}", flush=True)
+        return {
+            "itinerary": msg,
+            "plan_json": {"status": "unsupported", "planning_unavailable": True, "error": msg},
+            "llm_provider": "unsupported",
+            "llm_calls": state.get("llm_calls", 0),
+            "planning_blocked": True,
+            "planning_feedback": [msg],
+            "outage_status_code": 400,
+            "retryable": False,
+            "approval_request": msg,
+            "messages": [AIMessage(content=msg)],
         }
     except PlannerOutageError as exc:
         print(f"ITINERARY PLANNER OUTAGE: {exc}", flush=True)
