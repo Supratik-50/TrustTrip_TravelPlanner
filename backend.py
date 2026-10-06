@@ -99,6 +99,9 @@ class TravelState(TypedDict, total=False):
     planning_blocked: bool
     planning_feedback: list[str]
     provider_replan_required: bool
+    outage_status_code: int | None
+    retryable: bool
+    error: str
 
     # Phase 8 Research state
     research_session_id: str | None
@@ -775,6 +778,10 @@ def itinerary_agent(state: TravelState):
         if getattr(plan, "planning_unavailable", False) or provider == "unavailable":
             outage_code = getattr(plan, "outage_status_code", 503 if any("503" in str(w) for w in (getattr(plan, "warnings", []) or [])) else 500)
             is_retryable = bool(getattr(plan, "retryable", outage_code == 503))
+            err_msg = (
+                (plan.warnings[0] if getattr(plan, "warnings", None) else None)
+                or ("AI planning rate limit exceeded. Please wait before retrying." if outage_code == 429 else "Upstream AI travel planning service is temporarily overloaded. Please try again shortly.")
+            )
             return {
                 "itinerary": itinerary,
                 "plan_json": plan_json,
@@ -784,6 +791,7 @@ def itinerary_agent(state: TravelState):
                 "planning_feedback": plan.warnings,
                 "outage_status_code": outage_code,
                 "retryable": is_retryable,
+                "error": err_msg,
                 "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
                 "messages": [AIMessage(content=itinerary)],
             }
@@ -808,6 +816,7 @@ def itinerary_agent(state: TravelState):
             "planning_feedback": [msg],
             "outage_status_code": 400,
             "retryable": False,
+            "error": msg,
             "approval_request": msg,
             "messages": [AIMessage(content=msg)],
         }
@@ -822,6 +831,11 @@ def itinerary_agent(state: TravelState):
             itinerary = "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified evidence has been preserved."
         outage_code = getattr(exc, "status_code", 503)
         is_retryable = getattr(exc, "retryable", outage_code == 503)
+        err_msg = (
+            (exc.errors[0] if getattr(exc, "errors", None) else None)
+            or str(exc)
+            or ("AI planning rate limit exceeded. Please wait before retrying." if outage_code == 429 else "Upstream AI travel planning service is temporarily overloaded. Please try again shortly.")
+        )
         return {
             "itinerary": itinerary,
             "plan_json": plan_json,
@@ -831,6 +845,7 @@ def itinerary_agent(state: TravelState):
             "planning_feedback": exc.errors,
             "outage_status_code": outage_code,
             "retryable": is_retryable,
+            "error": err_msg,
             "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
             "messages": [AIMessage(content=itinerary)],
         }
@@ -1051,13 +1066,54 @@ def _serialize_result(
             "itinerary", ""
         )
 
+    plan_json = result.get("plan_json") or {}
+
+    outage_code = (
+        result.get("outage_status_code")
+        or plan_json.get("outage_status_code")
+        or (
+            400
+            if result.get("llm_provider") == "unsupported"
+            else None
+        )
+    )
+
+    is_retryable = (
+        result.get("retryable")
+        if result.get("retryable") is not None
+        else (
+            plan_json.get("retryable")
+            if plan_json.get("retryable") is not None
+            else False
+        )
+    )
+
+    error = (
+        result.get("error")
+        or (
+            result.get("planning_feedback", [None])[0]
+            if result.get("planning_blocked") and result.get("planning_feedback")
+            else None
+        )
+        or (
+            plan_json.get("error")
+            if isinstance(plan_json, dict)
+            else None
+        )
+        or (
+            result.get("guardrail_reason")
+            if not result.get("guardrail_allowed", True)
+            else ""
+        )
+    )
+
     return {
         "success": (
             result.get("success", True)
-            if (result.get("guardrail_allowed", True) and not result.get("planning_blocked", False) and not result.get("error"))
+            if (result.get("guardrail_allowed", True) and not result.get("planning_blocked", False) and not error)
             else False
         ),
-        "error": result.get("error", "" if result.get("guardrail_allowed", True) else result.get("guardrail_reason", "Blocked by guardrails")),
+        "error": error,
         "thread_id": thread_id,
         "answer": answer,
         "requires_approval": interrupt_payload is not None,
@@ -1089,18 +1145,18 @@ def _serialize_result(
         "live_plan": result.get("live_plan", {}),
         "replanning_mode": result.get("replanning_mode", "initial"),
         "llm_calls": result.get("llm_calls", 0),
-        "plan_json": result.get("plan_json", {}),
+        "plan_json": plan_json,
         "llm_provider": result.get("llm_provider", ""),
         "revision_count": result.get("revision_count", 0),
         "planning_blocked": result.get("planning_blocked", False),
         "planning_feedback": result.get("planning_feedback", []),
-        "outage_status_code": result.get("outage_status_code"),
+        "outage_status_code": outage_code,
         "status_code": (
-            result.get("outage_status_code")
+            outage_code
             if result.get("planning_blocked")
             else (422 if result.get("guardrail_allowed") is False else 200)
         ),
-        "retryable": result.get("retryable", False),
+        "retryable": is_retryable,
         "flight_search_status": result.get("flight_search_status", "ok"),
         "flight_search_errors": result.get("flight_search_errors", []),
         "flight_provider": os.getenv("FLIGHT_PROVIDER", "duffel").strip().lower(),

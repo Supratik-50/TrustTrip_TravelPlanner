@@ -419,22 +419,12 @@ def test_w3d07_chat_planner_classifies_429_as_non_retryable():
 
 
 def test_w3d07_api_travel_returns_structured_http_503_on_outage_state():
-    """W3D-07: POST /api/travel returns HTTP 503 with Retry-After: 5 and retryable=True on 503 outage."""
+    """W3D-07: POST /api/travel returns HTTP 503 with Retry-After: 5 and retryable=True through full LangGraph pipeline."""
     client, user = _auth_user("gemini503_test@trusttrip.com")
     trip_store = TripStore()
     trip = trip_store.create_trip(user_id=user["id"], title="Paris Trip", destination="Paris", origin="JFK")
 
-    outage_result = {
-        "success": False,
-        "planning_blocked": True,
-        "outage_status_code": 503,
-        "status_code": 503,
-        "retryable": True,
-        "error": "Upstream AI travel planning service is temporarily overloaded. Please try again shortly.",
-        "llm_provider": "unavailable",
-    }
-
-    with patch("app.run_travel_agent", return_value=outage_result):
+    with patch("backend.generate_travel_plan", side_effect=PlannerOutageError("Upstream AI travel planning service is temporarily overloaded.", status_code=503, retryable=True)):
         resp = client.post(
             "/api/travel",
             json={
@@ -446,6 +436,7 @@ def test_w3d07_api_travel_returns_structured_http_503_on_outage_state():
     assert resp.status_code == 503
     data = resp.json()
     assert data["success"] is False
+    assert data["status_code"] == 503
     assert data["retryable"] is True
     assert "Retry-After" in resp.headers
     assert resp.headers["Retry-After"] == "5"
@@ -476,22 +467,12 @@ def test_w3d07_api_travel_returns_structured_http_503_on_unhandled_exception():
 
 
 def test_w3d07_api_travel_returns_429_not_503():
-    """W3D-07: POST /api/travel returns HTTP 429 with retryable=False when quota/rate limit is hit, not 503."""
+    """W3D-07: POST /api/travel returns HTTP 429 with retryable=False through full LangGraph pipeline."""
     client, user = _auth_user("gemini429_test@trusttrip.com")
     trip_store = TripStore()
     trip = trip_store.create_trip(user_id=user["id"], title="Rome Trip", destination="Rome", origin="JFK")
 
-    outage_result = {
-        "success": False,
-        "planning_blocked": True,
-        "outage_status_code": 429,
-        "status_code": 429,
-        "retryable": False,
-        "error": "AI planning rate limit exceeded. Please wait before retrying.",
-        "llm_provider": "unavailable",
-    }
-
-    with patch("app.run_travel_agent", return_value=outage_result):
+    with patch("backend.generate_travel_plan", side_effect=PlannerOutageError("AI planning rate limit exceeded. Please wait before retrying.", status_code=429, retryable=False)):
         resp = client.post(
             "/api/travel",
             json={
@@ -503,8 +484,105 @@ def test_w3d07_api_travel_returns_429_not_503():
     assert resp.status_code == 429
     data = resp.json()
     assert data["success"] is False
+    assert data["status_code"] == 429
     assert data["retryable"] is False
     assert "rate limit" in data["error"].lower() or "quota" in data["error"].lower()
+
+
+def test_w3d07_duration_guard_returns_http_400():
+    """W3D-07: Trips longer than 7 days deterministically return HTTP 400 without invoking LLM providers."""
+    client, user = _auth_user("duration_guard_test@trusttrip.com")
+    trip_store = TripStore()
+    trip = trip_store.create_trip(
+        user_id=user["id"],
+        title="10-day Tokyo Trip",
+        destination="Tokyo",
+        origin="JFK",
+        metadata={"departure_date": "2026-06-01", "return_date": "2026-06-10"}
+    )
+
+    with patch("services.chat_planner._groq_plan") as mock_groq, \
+         patch("services.chat_planner._gemini_plan") as mock_gemini:
+        resp = client.post(
+            "/api/travel",
+            json={
+                "message": "Plan a 10-day trip to Tokyo from JFK from 2026-06-01 to 2026-06-10",
+                "trip_id": str(trip["id"]),
+            },
+        )
+
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["success"] is False
+    assert data["status_code"] == 400
+    assert data["retryable"] is False
+    assert "7 days" in data["error"]
+    assert mock_groq.call_count == 0
+    assert mock_gemini.call_count == 0
+
+
+def test_w3d07_unexpected_exception_returns_http_500():
+    """W3D-07: Unrelated unexpected exception in itinerary agent bubbles as HTTP 500 without inheriting 503/429/400."""
+    client, user = _auth_user("unexpected_exc_test@trusttrip.com")
+    trip_store = TripStore()
+    trip = trip_store.create_trip(user_id=user["id"], title="Paris Trip", destination="Paris", origin="JFK")
+
+    with patch("backend.generate_travel_plan", side_effect=ZeroDivisionError("unexpected division by zero in pricing")):
+        resp = client.post(
+            "/api/travel",
+            json={
+                "message": "Plan a 5-day trip to Paris",
+                "trip_id": str(trip["id"]),
+            },
+        )
+
+    assert resp.status_code == 500
+    data = resp.json()
+    assert data["success"] is False
+    assert data.get("status_code") not in (400, 429, 503)
+    assert data.get("retryable") is not True
+
+
+def test_w3d07_same_thread_stale_state_safety():
+    """W3D-07: Subsequent request on the same thread does NOT inherit previous turn's 503 outage state."""
+    client, user = _auth_user("stale_state_test@trusttrip.com")
+    trip_store = TripStore()
+    trip = trip_store.create_trip(
+        user_id=user["id"],
+        title="Paris Multi-turn Trip",
+        destination="Paris",
+        origin="JFK",
+        metadata={"departure_date": "2026-06-01", "return_date": "2026-06-10"}
+    )
+
+    # 1. First turn: 503 outage
+    with patch("backend.generate_travel_plan", side_effect=PlannerOutageError("Upstream AI travel planning service is temporarily overloaded.", status_code=503, retryable=True)):
+        resp1 = client.post(
+            "/api/travel",
+            json={
+                "message": "Plan a 5-day trip to Paris",
+                "trip_id": str(trip["id"]),
+            },
+        )
+    assert resp1.status_code == 503
+    thread_id = resp1.json().get("thread_id")
+    assert thread_id is not None
+
+    # 2. Second turn on same thread: 10-day duration guard triggers 400
+    resp2 = client.post(
+        "/api/travel",
+        json={
+            "message": "Plan a 10-day trip to Paris from JFK from 2026-06-01 to 2026-06-10",
+            "trip_id": str(trip["id"]),
+            "thread_id": thread_id,
+        },
+    )
+    assert resp2.status_code == 400
+    data2 = resp2.json()
+    assert data2["success"] is False
+    assert data2["status_code"] == 400
+    assert data2["retryable"] is False
+    assert "7 days" in data2["error"]
 
 
 def test_w3d07_empty_message_validation_returns_400():
@@ -515,3 +593,4 @@ def test_w3d07_empty_message_validation_returns_400():
     data = resp.json()
     assert data["success"] is False
     assert "empty" in data["error"].lower()
+

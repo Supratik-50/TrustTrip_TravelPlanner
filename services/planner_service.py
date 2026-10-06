@@ -449,6 +449,9 @@ class PlannerService:
             "planning_blocked": False,
             "planning_feedback": [],
             "provider_replan_required": False,
+            "outage_status_code": None,
+            "retryable": False,
+            "error": "",
         }
 
         result = travel_graph.invoke(initial_state, config=config)
