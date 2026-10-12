@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   CreditCard,
@@ -30,11 +30,14 @@ interface PaymentReviewModalProps {
   priceInr?: number;
   exchangeRate?: number;
   contact: TravelerContactInfo;
+  initialTransactionId?: string;
+  initialReconciliationPending?: boolean;
   onProcessPayment: (
     method: 'card' | 'upi' | 'netbanking' | 'pay_at_property',
     contact: TravelerContactInfo,
     paymentDetails?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string }
-  ) => Promise<void>;
+  ) => Promise<any>;
+  onReconcilePayment?: (transactionId: string) => Promise<any>;
   onInitiateOrder?: () => Promise<{
     transaction_id: string;
     razorpay_order_id: string;
@@ -59,13 +62,29 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
   priceInr,
   exchangeRate,
   contact,
+  initialTransactionId,
+  initialReconciliationPending = false,
   onProcessPayment,
+  onReconcilePayment,
   onInitiateOrder,
 }) => {
   const [paymentMethod, setPaymentMethod] = useState<'card' | 'upi' | 'netbanking' | 'pay_at_property'>('card');
-  const [processingState, setProcessingState] = useState<'idle' | 'processing' | 'success' | 'failed'>('idle');
+  const [processingState, setProcessingState] = useState<'idle' | 'processing' | 'success' | 'failed' | 'reconciliation_pending'>(
+    initialReconciliationPending ? 'reconciliation_pending' : 'idle'
+  );
+  const [activeTransactionId, setActiveTransactionId] = useState<string | null>(initialTransactionId || null);
+  const [reconciling, setReconciling] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [simulateFailure, setSimulateFailure] = useState(false);
+
+  useEffect(() => {
+    if (initialReconciliationPending) {
+      setProcessingState('reconciliation_pending');
+    }
+    if (initialTransactionId) {
+      setActiveTransactionId(initialTransactionId);
+    }
+  }, [initialReconciliationPending, initialTransactionId]);
 
   if (!isOpen) return null;
 
@@ -116,19 +135,34 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
           }) => {
             try {
               setProcessingState('processing');
-              await onProcessPayment(paymentMethod, contact, {
+              setActiveTransactionId(orderData.transaction_id);
+              const result: any = await onProcessPayment(paymentMethod, contact, {
                 transaction_id: orderData.transaction_id,
                 razorpay_order_id: response.razorpay_order_id || orderData.razorpay_order_id,
                 razorpay_payment_id: response.razorpay_payment_id,
                 razorpay_signature: response.razorpay_signature,
               });
+              if (result?.status === 'reconciliation_pending' || result?.reconciliation_pending) {
+                setProcessingState('reconciliation_pending');
+                setErrorMessage(result.message || 'Payment received — reservation verification in progress with supplier.');
+                return;
+              }
               setProcessingState('success');
               setTimeout(() => {
                 onClose();
               }, 1000);
             } catch (err: any) {
-              setProcessingState('failed');
-              setErrorMessage(err.message || 'Payment verification or hotel booking failed.');
+              if (
+                err?.reconciliation_pending ||
+                err?.message?.toLowerCase().includes('reconciliation') ||
+                err?.message?.toLowerCase().includes('uncertain')
+              ) {
+                setProcessingState('reconciliation_pending');
+                setErrorMessage(err.message || 'Payment received — reservation verification in progress with supplier.');
+              } else {
+                setProcessingState('failed');
+                setErrorMessage(err.message || 'Payment verification or hotel booking failed.');
+              }
             }
           },
           modal: {
@@ -156,14 +190,28 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
       }
 
       // Fallback for direct test calls without order initiation
-      await onProcessPayment(paymentMethod, contact);
+      const directResult: any = await onProcessPayment(paymentMethod, contact);
+      if (directResult?.status === 'reconciliation_pending' || directResult?.reconciliation_pending) {
+        setProcessingState('reconciliation_pending');
+        setErrorMessage(directResult.message || 'Payment received — reservation verification in progress with supplier.');
+        return;
+      }
       setProcessingState('success');
       setTimeout(() => {
         onClose();
       }, 1000);
     } catch (err: any) {
-      setProcessingState('failed');
-      setErrorMessage(err.message || 'Payment processing failed.');
+      if (
+        err?.reconciliation_pending ||
+        err?.message?.toLowerCase().includes('reconciliation') ||
+        err?.message?.toLowerCase().includes('uncertain')
+      ) {
+        setProcessingState('reconciliation_pending');
+        setErrorMessage(err.message || 'Payment received — reservation verification in progress with supplier.');
+      } else {
+        setProcessingState('failed');
+        setErrorMessage(err.message || 'Payment processing failed.');
+      }
     }
   };
 
@@ -220,6 +268,65 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
             <p className="text-xs text-[var(--text-secondary)] font-light">
               Stay reservation confirmed with property. Handing over confirmed voucher.
             </p>
+          </div>
+        )}
+
+        {/* RECONCILIATION PENDING STATE */}
+        {processingState === 'reconciliation_pending' && (
+          <div className="space-y-4 py-4" data-testid="reconciliation-pending-banner">
+            <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-xs space-y-2">
+              <div className="flex items-center gap-1.5 font-bold font-mono text-amber-600">
+                <RefreshCw className={`w-4 h-4 ${reconciling ? 'animate-spin' : ''}`} />
+                Payment received — reservation verification in progress
+              </div>
+              <p className="text-[var(--text-primary)] leading-relaxed">
+                {errorMessage || 'Your payment was successfully received. Supplier reservation confirmation is currently being verified. Do not make another payment.'}
+              </p>
+              {activeTransactionId && (
+                <div className="text-[11px] font-mono text-[var(--text-secondary)] pt-1">
+                  Transaction Reference: <span className="font-semibold text-[var(--text-primary)]">{activeTransactionId}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <Button
+                variant="primary"
+                size="md"
+                disabled={reconciling}
+                onClick={async () => {
+                  if (!activeTransactionId) return;
+                  setReconciling(true);
+                  try {
+                    if (onReconcilePayment) {
+                      const recRes = await onReconcilePayment(activeTransactionId);
+                      if (recRes?.status === 'confirmed' || recRes?.success || recRes?.confirmation_code) {
+                        setProcessingState('success');
+                        setTimeout(() => {
+                          onClose();
+                        }, 1200);
+                        return;
+                      }
+                      if (recRes?.status === 'reconciliation_pending' || recRes?.reconciliation_pending) {
+                        setErrorMessage(recRes.message || 'Verification is still in progress with supplier. Please check again in a few moments.');
+                        return;
+                      }
+                      if (recRes?.status === 'refunded' || recRes?.refunded) {
+                        setProcessingState('failed');
+                        setErrorMessage('Supplier confirmed no reservation could be made. Your payment has been refunded.');
+                        return;
+                      }
+                    }
+                  } catch (recErr: any) {
+                    setErrorMessage(recErr.message || 'Status check failed. Please try again.');
+                  } finally {
+                    setReconciling(false);
+                  }
+                }}
+              >
+                {reconciling ? 'Checking...' : 'Check Confirmation Status'}
+              </Button>
+            </div>
           </div>
         )}
 

@@ -107,11 +107,11 @@ def build_booking_pdf(order: dict[str, Any], transaction: dict[str, Any]) -> byt
     story += [Paragraph("Itinerary", styles["Section"])]
     seg_rows = [["Flight", "From → To", "Departure", "Arrival", "Operating carrier"]]
     for seg in _extract_segments(order):
-        origin = (seg.get("origin") or {}).get("iata_code") or (seg.get("origin") or {}).get("name") or "—"
-        destination = (seg.get("destination") or {}).get("iata_code") or (seg.get("destination") or {}).get("name") or "—"
-        carrier = (seg.get("operating_carrier") or {}).get("name") or (seg.get("marketing_carrier") or {}).get("name") or "—"
-        flight_no = seg.get("marketing_carrier_flight_number") or seg.get("operating_carrier_flight_number") or "—"
-        seg_rows.append([str(flight_no), f"{origin} → {destination}", _first(seg.get("departing_at")), _first(seg.get("arriving_at")), carrier])
+        origin = (seg.get("origin") or {}).get("iata_code") or (seg.get("origin") or {}).get("name") or seg.get("origin_iata") or "—"
+        destination = (seg.get("destination") or {}).get("iata_code") or (seg.get("destination") or {}).get("name") or seg.get("destination_iata") or "—"
+        carrier = (seg.get("operating_carrier") or {}).get("name") or (seg.get("marketing_carrier") or {}).get("name") or seg.get("marketing_carrier_name") or seg.get("carrier") or "—"
+        flight_no = seg.get("marketing_carrier_flight_number") or seg.get("operating_carrier_flight_number") or seg.get("flight_number") or "—"
+        seg_rows.append([str(flight_no), f"{origin} → {destination}", _first(seg.get("departing_at") or seg.get("departure_time")), _first(seg.get("arriving_at") or seg.get("arrival_time")), carrier])
     story.append(Table(seg_rows, colWidths=[25*mm, 39*mm, 43*mm, 43*mm, 32*mm], repeatRows=1, style=TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EEF2F6")), ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#C9D0D8")),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 7.5),

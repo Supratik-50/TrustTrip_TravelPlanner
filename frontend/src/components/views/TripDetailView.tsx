@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Compass,
   RefreshCw,
@@ -92,6 +92,7 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
   const [editBudget, setEditBudget] = useState<string>('');
   const [editStartDate, setEditStartDate] = useState('');
   const [editEndDate, setEditEndDate] = useState('');
+  const [isSavingConstraints, setIsSavingConstraints] = useState(false);
 
   const fetchTrip = useCallback(async () => {
     setIsLoading(true);
@@ -218,6 +219,15 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
     }
   }, [activeTab, hotelOffers.length, trip, handleSearchHotels]);
 
+  // Canonical trip night count
+  const canonicalNights = useMemo(() => {
+    if (!trip?.start_date || !trip?.end_date) return undefined;
+    const start = new Date(trip.start_date.split('T')[0]);
+    const end = new Date(trip.end_date.split('T')[0]);
+    const diff = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+    return diff > 0 ? diff : undefined;
+  }, [trip?.start_date, trip?.end_date]);
+
   // Select canonical flight offer
   const handleSelectFlightOffer = async (offer: FlightOffer) => {
     if (!trip) return;
@@ -230,23 +240,10 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
         snapshot_id: offer.snapshot_id || offerId,
         metadata: offer,
       });
-      setTrip(updated);
-
-      // Pre-initialize Section 5B booking intent on the backend
-      try {
-        await bookingService.selectFlightOffer(trip.trip_id, offerId, [
-          {
-            given_name: 'Traveler',
-            family_name: 'User',
-            born_on: '1990-01-01',
-            title: 'mr',
-            gender: 'm',
-            email: 'traveler@trusttrip.com',
-          },
-        ]);
-      } catch {
-        // Soft catch if already initialized
-      }
+      setTrip({
+        ...updated,
+        selected_flight_offer: offer,
+      });
 
       notify(
         `Selected ${offer.carrier_name} (${offer.slices[0]?.origin} ➔ ${offer.slices[0]?.destination}). Canonical snapshot locked.`,
@@ -298,26 +295,52 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
     }
   };
 
-  const handleSaveConstraints = (e: React.FormEvent) => {
+  const handleSaveConstraints = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!trip) return;
 
-    const updated: TripDetail = {
-      ...trip,
-      travelers_count: Number(editTravelers) || 1,
-      budget: editBudget ? Number(editBudget) : undefined,
-      start_date: editStartDate,
-      end_date: editEndDate,
-      active_revision_number: (trip.active_revision_number || 1) + 1,
-    };
+    setIsSavingConstraints(true);
+    try {
+      const budgetNum = editBudget ? Number(editBudget) : undefined;
+      const travelersNum = Number(editTravelers) || 1;
+      const updatedConstraints: Record<string, any> = {
+        budget: budgetNum,
+        budget_amount: budgetNum,
+        travelers_count: travelersNum,
+        adults: travelersNum,
+        children: 0,
+        rooms: 1,
+        start_date: editStartDate,
+        end_date: editEndDate,
+        departure_date: editStartDate,
+        return_date: editEndDate,
+      };
 
-    setTrip(updated);
-    setIsEditModalOpen(false);
-    notify(
-      'Updated trip parameters. Revision incremented for next planning iteration.',
-      'info',
-      'Constraints Saved'
-    );
+      const res = await api.createTripRevision(trip.trip_id, {
+        updated_constraints: updatedConstraints,
+        feedback: 'Updated trip constraints and parameters',
+        expected_base_revision: trip.active_revision_number ?? trip.current_revision?.revision_number,
+        expected_base_revision_id: trip.active_revision_id ?? trip.current_revision?.revision_id,
+      });
+
+      // Refetch the authoritative trip from backend
+      const refreshedTrip = await api.getTrip(trip.trip_id);
+      setTrip(refreshedTrip);
+      setIsEditModalOpen(false);
+      notify(
+        `Trip parameters saved as Revision ${res.revision_number || refreshedTrip.active_revision_number || 1} (awaiting review).`,
+        'success',
+        'Constraints Saved'
+      );
+    } catch (err: any) {
+      notify(
+        err.message || 'Failed to save trip constraints.',
+        'error',
+        'Save Error'
+      );
+    } finally {
+      setIsSavingConstraints(false);
+    }
   };
 
   if (isLoading) {
@@ -399,19 +422,45 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
       return 0;
     });
 
-  // Total committed expenses
-  const committedFlight = selectedFlight ? Number(selectedFlight.total_amount) : 0;
-  const committedHotel = selectedHotel ? Number(selectedHotel.total_amount) : 0;
-  const totalCommitted = committedFlight + committedHotel;
+  // Multicurrency budget commitment calculation
+  const tripCurrency = (trip?.currency || 'INR').toUpperCase();
 
-  // Canonical trip night count
-  const canonicalNights = React.useMemo(() => {
-    if (!trip?.start_date || !trip?.end_date) return undefined;
-    const start = new Date(trip.start_date.split('T')[0]);
-    const end = new Date(trip.end_date.split('T')[0]);
-    const diff = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-    return diff > 0 ? diff : undefined;
-  }, [trip?.start_date, trip?.end_date]);
+  const getOfferCommittedAmount = (
+    offer: { total_amount?: string | number; currency?: string; price_inr?: number | null } | undefined
+  ): { amount: number; isAvailable: boolean; isConverted: boolean } => {
+    if (!offer) {
+      return { amount: 0, isAvailable: true, isConverted: false };
+    }
+    const offerCurrency = (offer.currency || tripCurrency).toUpperCase();
+    const rawAmount = Number(offer.total_amount);
+
+    if (offerCurrency === tripCurrency) {
+      if (isNaN(rawAmount) || rawAmount < 0) {
+        return { amount: 0, isAvailable: false, isConverted: false };
+      }
+      return { amount: rawAmount, isAvailable: true, isConverted: false };
+    }
+
+    // Offer currency differs from trip currency
+    if (tripCurrency === 'INR') {
+      const priceInr = offer.price_inr != null ? Number(offer.price_inr) : NaN;
+      if (!isNaN(priceInr) && priceInr > 0) {
+        return { amount: priceInr, isAvailable: true, isConverted: true };
+      }
+      // Fails closed if foreign currency offer lacks authoritative INR conversion
+      return { amount: 0, isAvailable: false, isConverted: false };
+    }
+
+    // If trip currency is not INR and differs from offer currency, without a known conversion rate, fail closed
+    return { amount: 0, isAvailable: false, isConverted: false };
+  };
+
+  const flightCommitment = getOfferCommittedAmount(selectedFlight);
+  const hotelCommitment = getOfferCommittedAmount(selectedHotel);
+
+  const committedBudgetAvailable = flightCommitment.isAvailable && hotelCommitment.isAvailable;
+  const totalCommitted = committedBudgetAvailable ? flightCommitment.amount + hotelCommitment.amount : 0;
+  const hasMulticurrencyCommitment = flightCommitment.isConverted || hotelCommitment.isConverted;
 
   return (
     <div className="space-y-8 pb-16">
@@ -452,13 +501,26 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
           {selectedFlight ? (
             <div>
               <div className="font-semibold text-sm text-[var(--text-primary)] truncate">
-                {selectedFlight.carrier_name}
+                {selectedFlight.carrier_name || 'Selected Flight'}
               </div>
               <div className="text-xs text-[var(--text-secondary)] font-mono flex items-center justify-between mt-1">
-                <span>{selectedFlight.slices[0]?.origin} ➔ {selectedFlight.slices[0]?.destination}</span>
-                <span className="font-bold text-[var(--text-primary)]">
-                  {formatCurrency(selectedFlight.total_amount, selectedFlight.currency)}
+                <span>
+                  {selectedFlight.slices && selectedFlight.slices.length > 1
+                    ? `${selectedFlight.slices[0].origin} ⇄ ${selectedFlight.slices[0].destination}`
+                    : selectedFlight.slices?.[0]?.origin
+                    ? `${selectedFlight.slices[0].origin} ➔ ${selectedFlight.slices[0].destination}`
+                    : 'Active Flight Snapshot'}
                 </span>
+                <div className="text-right">
+                  <span className="font-bold text-[var(--text-primary)]">
+                    {selectedFlight.total_amount ? formatCurrency(selectedFlight.total_amount, selectedFlight.currency) : ''}
+                  </span>
+                  {selectedFlight.currency?.toUpperCase() !== 'INR' && selectedFlight.price_inr != null && (
+                    <div className="text-[10px] text-[var(--text-muted)] font-mono">
+                      ≈ {formatCurrency(selectedFlight.price_inr, 'INR')}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           ) : (
@@ -502,9 +564,16 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
                 {selectedHotel.stars != null && selectedHotel.stars > 0 ? (
                   <span data-testid="stay-stars-label">{selectedHotel.stars}-Star Stay</span>
                 ) : null}
-                <span className="font-bold text-[var(--text-primary)]">
-                  {formatCurrency(selectedHotel.total_amount, selectedHotel.currency)}
-                </span>
+                <div className="text-right">
+                  <span className="font-bold text-[var(--text-primary)]">
+                    {formatCurrency(selectedHotel.total_amount, selectedHotel.currency)}
+                  </span>
+                  {selectedHotel.currency?.toUpperCase() !== 'INR' && selectedHotel.price_inr != null && (
+                    <div className="text-[10px] text-[var(--text-muted)] font-mono">
+                      ≈ {formatCurrency(selectedHotel.price_inr, 'INR')}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           ) : (
@@ -529,10 +598,19 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
             </span>
           </div>
           <div className="flex items-baseline justify-between">
-            <div className="text-base font-bold font-editorial text-[var(--text-primary)]">
-              {formatCurrency(totalCommitted, trip.currency)}{' '}
-              <span className="text-xs font-normal text-[var(--text-muted)] font-mono">committed</span>
-            </div>
+            {committedBudgetAvailable ? (
+              <div className="text-base font-bold font-editorial text-[var(--text-primary)]">
+                {formatCurrency(totalCommitted, trip.currency)}{' '}
+                <span className="text-xs font-normal text-[var(--text-muted)] font-mono">
+                  committed{hasMulticurrencyCommitment ? ' (conv.)' : ''}
+                </span>
+              </div>
+            ) : (
+              <div className="text-xs font-semibold font-mono text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Conversion Pending</span>
+              </div>
+            )}
             <span className="text-xs font-medium text-[var(--primary)] flex items-center gap-1">
               Handoff <ArrowRight className="w-3 h-3" />
             </span>
@@ -541,7 +619,7 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
             <div
               className="h-full bg-[var(--primary)] transition-all duration-500 rounded-full"
               style={{
-                width: trip.budget ? `${Math.min(100, Math.round((totalCommitted / trip.budget) * 100))}%` : '40%',
+                width: committedBudgetAvailable && trip.budget ? `${Math.min(100, Math.round((totalCommitted / trip.budget) * 100))}%` : '0%',
               }}
             />
           </div>
@@ -776,7 +854,12 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
                 <FlightCard
                   key={offer.id}
                   offer={offer}
-                  isSelected={selectedFlight?.id === offer.id}
+                  isSelected={
+                    selectedFlight?.id === offer.id ||
+                    selectedFlight?.snapshot_id === offer.id ||
+                    (Boolean(offer.snapshot_id) && selectedFlight?.id === offer.snapshot_id) ||
+                    (Boolean(offer.snapshot_id) && selectedFlight?.snapshot_id === offer.snapshot_id)
+                  }
                   onSelect={handleSelectFlightOffer}
                   isSelecting={isSelectingFlight}
                   tripContext={{ tripId: trip.trip_id, destinationName: trip.destination }}
@@ -1035,8 +1118,14 @@ export const TripDetailView: React.FC<TripDetailViewProps> = ({
             >
               Cancel
             </Button>
-            <Button type="submit" variant="primary" size="sm">
-              Apply Changes
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              isLoading={isSavingConstraints}
+              disabled={isSavingConstraints}
+            >
+              Save Constraints
             </Button>
           </div>
         </form>

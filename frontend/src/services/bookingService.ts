@@ -23,6 +23,8 @@ import {
   ExternalCheckoutHandoff,
   FlightConfirmationRecord,
   HotelConfirmationRecord,
+  HotelPaymentResult,
+  HotelReconciliationPendingResult,
   TravelerContactInfo,
   CancellationRequest,
 } from '../types/bookingFrontend';
@@ -483,32 +485,56 @@ export class TrustTripBookingService implements IBookingService {
       trip_id: tripId,
       snapshot_id: snapshotId,
       hotel_id: hotelId,
-      room_id: offerData?.room_id || `rm_${hotelId}_01`,
-      check_in_date: offerData?.check_in_date || offerData?.checkin || '',
-      check_out_date: offerData?.check_out_date || offerData?.checkout || '',
+      room_id: offerData?.room_id || offerData?.selected_room?.room_id || offerData?.selected_room?.id || (hotelId ? `rm_${hotelId}_01` : 'rm_01'),
+      check_in_date: offerData?.check_in_date || offerData?.checkin || offerData?.start_date || '',
+      check_out_date: offerData?.check_out_date || offerData?.checkout || offerData?.end_date || '',
       guests: offerData?.adults_count || 2,
       guest_name: guestName,
       guest_email: guestEmail,
     });
 
-    this.activePrebookIds.set(tripId, res.prebook_id);
-    this.activePrebookData.set(tripId, {
+    const prebookRecord = {
       prebook_id: res.prebook_id,
       hotel_id: hotelId,
       amount: res.amount,
       currency: res.currency,
       hotel_name: res.hotel_name || offerData?.hotel_name || offerData?.name,
       status: 'confirmed',
-    });
+      snapshot_id: snapshotId,
+    };
+    this.activePrebookIds.set(tripId, res.prebook_id);
+    this.activePrebookData.set(tripId, prebookRecord);
     if (offerData) {
       this.activeHotelOffers.set(tripId, offerData);
     }
+
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.setItem(`tt_prebook_${tripId}`, JSON.stringify(prebookRecord));
+        if (offerData) {
+          sessionStorage.setItem(`tt_hotel_offer_${tripId}`, JSON.stringify(offerData));
+        }
+      }
+    } catch {}
 
     return {
       required_amount: res.amount,
       currency: res.currency,
       prebook_id: res.prebook_id,
     };
+  }
+
+  /**
+   * Returns whether an authoritative hotel prebook is active for this trip.
+   */
+  hasActiveHotelPrebook(tripId: string): boolean {
+    if (this.activePrebookIds.has(tripId)) return true;
+    try {
+      if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(`tt_prebook_${tripId}`)) {
+        return true;
+      }
+    } catch {}
+    return false;
   }
 
   /**
@@ -529,15 +555,42 @@ export class TrustTripBookingService implements IBookingService {
     key_id: string;
     hotel_name?: string;
   }> {
-    const prebookId = this.activePrebookIds.get(tripId);
+    let prebookId = this.activePrebookIds.get(tripId);
+    let prebook = this.activePrebookData.get(tripId);
+    let cachedOffer = this.activeHotelOffers.get(tripId);
+
+    // Rehydrate authoritative prebook from sessionStorage if in-memory Map was cleared
+    if (!prebookId) {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          const storedPre = sessionStorage.getItem(`tt_prebook_${tripId}`);
+          if (storedPre) {
+            const parsed = JSON.parse(storedPre);
+            if (parsed && parsed.prebook_id) {
+              const pid = String(parsed.prebook_id);
+              prebookId = pid;
+              prebook = parsed;
+              this.activePrebookIds.set(tripId, pid);
+              this.activePrebookData.set(tripId, prebook);
+            }
+          }
+          const storedOffer = sessionStorage.getItem(`tt_hotel_offer_${tripId}`);
+          if (storedOffer) {
+            cachedOffer = JSON.parse(storedOffer);
+            this.activeHotelOffers.set(tripId, cachedOffer);
+          }
+        }
+      } catch {}
+    }
+
     if (!prebookId) {
       throw new Error('No authoritative hotel prebook exists for this trip.');
     }
-    const prebook = this.activePrebookData.get(tripId) || {
+    prebook = prebook || {
       prebook_id: prebookId,
       status: 'confirmed',
     };
-    const cachedOffer = this.activeHotelOffers.get(tripId);
+    cachedOffer = cachedOffer || this.activeHotelOffers.get(tripId);
     const offerCurrency = (cachedOffer?.currency || prebook.currency || 'INR').toUpperCase();
     let authoritativePriceInr: number | undefined = cachedOffer?.price_inr;
     if (authoritativePriceInr == null && offerCurrency === 'INR') {
@@ -640,7 +693,7 @@ export class TrustTripBookingService implements IBookingService {
     expectedRevisionNumber?: number,
     paymentDetailsOrTravelers?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
     allTravelersParam?: FlightPassenger[]
-  ): Promise<HotelConfirmationRecord> {
+  ): Promise<HotelPaymentResult> {
     let paymentDetails: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | undefined;
     let allTravelers: FlightPassenger[] | undefined;
 
@@ -651,7 +704,34 @@ export class TrustTripBookingService implements IBookingService {
       allTravelers = allTravelersParam;
     }
 
-    const prebookId = this.activePrebookIds.get(tripId);
+    let prebookId = this.activePrebookIds.get(tripId);
+    let prebook = this.activePrebookData.get(tripId);
+    let cachedOffer = this.activeHotelOffers.get(tripId);
+
+    // Rehydrate authoritative prebook from sessionStorage if in-memory Map was cleared
+    if (!prebookId) {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          const storedPre = sessionStorage.getItem(`tt_prebook_${tripId}`);
+          if (storedPre) {
+            const parsed = JSON.parse(storedPre);
+            if (parsed && parsed.prebook_id) {
+              const pid = String(parsed.prebook_id);
+              prebookId = pid;
+              prebook = parsed;
+              this.activePrebookIds.set(tripId, pid);
+              this.activePrebookData.set(tripId, prebook);
+            }
+          }
+          const storedOffer = sessionStorage.getItem(`tt_hotel_offer_${tripId}`);
+          if (storedOffer) {
+            cachedOffer = JSON.parse(storedOffer);
+            this.activeHotelOffers.set(tripId, cachedOffer);
+          }
+        }
+      } catch {}
+    }
+
     if (!prebookId) {
       throw new Error('No authoritative hotel prebook exists for this trip.');
     }
@@ -670,11 +750,12 @@ export class TrustTripBookingService implements IBookingService {
     }
     const revId = revisionId;
     const revNum = expectedRevisionNumber;
-
-    const prebook = this.activePrebookData.get(tripId) || {
-      prebook_id: prebookId,
-      status: 'confirmed',
-    };
+    if (!prebook) {
+      prebook = this.activePrebookData.get(tripId) || {
+        prebook_id: prebookId,
+        status: 'confirmed',
+      };
+    }
     // HRP-01: Exactly one authoritative payment order/transaction per checkout attempt.
     // If an order was already created via initiateHotelPaymentOrder, reuse it directly
     // instead of creating a second transaction after customer has already paid.
@@ -682,7 +763,9 @@ export class TrustTripBookingService implements IBookingService {
     const existingTxId = paymentDetails?.transaction_id || (activeTx?.razorpay_order_id === paymentDetails?.razorpay_order_id ? activeTx?.transaction_id : undefined);
     const existingOrderId = paymentDetails?.razorpay_order_id || activeTx?.razorpay_order_id;
 
-    const cachedOffer = this.activeHotelOffers.get(tripId);
+    if (!cachedOffer) {
+      cachedOffer = this.activeHotelOffers.get(tripId);
+    }
     const offerCurrency = (cachedOffer?.currency || prebook.currency || 'INR').toUpperCase();
     let authoritativePriceInr: number | undefined = cachedOffer?.price_inr;
     if (authoritativePriceInr == null && offerCurrency === 'INR') {
@@ -786,12 +869,32 @@ export class TrustTripBookingService implements IBookingService {
       final_confirmation: true,
     });
 
+    if (verifyRes.reconciliation_pending || (verifyRes.payment_captured && !verifyRes.success && !verifyRes.refunded)) {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.setItem(`tt_pending_hotel_tx_${tripId}`, transactionId);
+        }
+      } catch (e) {}
+      return {
+        status: 'reconciliation_pending',
+        transaction_id: transactionId,
+        payment_captured: true,
+        reconciliation_pending: true,
+        message: verifyRes.error || 'Payment received — reservation verification in progress with supplier.',
+      };
+    }
+
     if (!verifyRes.success || !verifyRes.booking || !verifyRes.payment_captured) {
       throw new Error(verifyRes.error || 'Authoritative hotel booking confirmation data unavailable from server.');
     }
 
     // Clean up active transaction memory upon successful booking
     this.activeHotelTransactions.delete(tripId);
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.removeItem(`tt_pending_hotel_tx_${tripId}`);
+      }
+    } catch (e) {}
 
     const booking = verifyRes.booking;
     const confirmationCode = booking.confirmation_code || booking.booking_id || booking.id;
@@ -831,6 +934,73 @@ export class TrustTripBookingService implements IBookingService {
       confirmed_at: booking.confirmed_at || booking.created_at || new Date().toISOString(),
       status: 'voucher_issued',
     };
+  }
+
+  /**
+   * Reconciles an existing captured hotel transaction via POST /api/hotel-payments/{transaction_id}/reconcile
+   */
+  async reconcileHotelPayment(
+    tripId: string,
+    transactionId: string
+  ): Promise<HotelPaymentResult> {
+    const recRes = await api.reconcileHotelPayment(transactionId);
+    if (recRes.success && recRes.booking) {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.removeItem(`tt_pending_hotel_tx_${tripId}`);
+        }
+      } catch (e) {}
+      this.activeHotelTransactions.delete(tripId);
+      const booking = recRes.booking;
+      const confirmationCode = booking.confirmation_code || booking.booking_id || booking.id;
+      return {
+        confirmation_code: confirmationCode,
+        property_name: booking.hotel_name || booking.property_name || booking.name || undefined,
+        property_address: booking.address || booking.property_address || undefined,
+        room_name: booking.room_name || undefined,
+        check_in_date: booking.check_in || booking.checkin || booking.check_in_date || undefined,
+        check_out_date: booking.check_out || booking.checkout || booking.check_out_date || undefined,
+        nights_count: typeof booking.nights === 'number' ? booking.nights : undefined,
+        guests_count: typeof booking.guests === 'number' ? booking.guests : 1,
+        cancellation_policy: booking.cancellation_policy || undefined,
+        confirmed_at: booking.confirmed_at || booking.created_at || new Date().toISOString(),
+        status: 'voucher_issued',
+      };
+    }
+
+    if (recRes.reconciliation_pending || (recRes.payment_captured && !recRes.success && !recRes.refunded)) {
+      return {
+        status: 'reconciliation_pending',
+        transaction_id: transactionId,
+        payment_captured: true,
+        reconciliation_pending: true,
+        message: recRes.error || 'Payment received — reservation verification in progress with supplier.',
+      };
+    }
+
+    if (recRes.refunded) {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.removeItem(`tt_pending_hotel_tx_${tripId}`);
+        }
+      } catch (e) {}
+      this.activeHotelTransactions.delete(tripId);
+      throw new Error(recRes.error || 'Supplier confirmed no booking exists. Payment has been refunded.');
+    }
+
+    throw new Error(recRes.error || 'Unable to reconcile hotel payment status.');
+  }
+
+  /**
+   * Checks backend for pending hotel transaction for a trip.
+   */
+  async checkPendingHotelTransaction(tripId: string): Promise<any | null> {
+    try {
+      const res = await api.getHotelPaymentByTrip(tripId);
+      return res?.transaction || null;
+    } catch (e) {
+      return null;
+    }
   }
 
   /**

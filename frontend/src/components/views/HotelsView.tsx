@@ -58,7 +58,9 @@ export const HotelsView: React.FC = () => {
           destination: selectedTrip.destination,
           checkin: selectedTrip.start_date,
           checkout: selectedTrip.end_date,
-          adults: selectedTrip.travelers_count,
+          adults: request.guests ?? request.adults ?? selectedTrip.travelers_count ?? 1,
+          children: request.children ?? 0,
+          rooms: request.rooms ?? 1,
         });
         setHotels(results);
       } catch (err: any) {

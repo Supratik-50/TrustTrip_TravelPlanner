@@ -144,8 +144,9 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   ) ? trip.booking_authorization : undefined;
   const [flightState, setFlightState] = useState<FlightVerificationState>('idle');
   const [flightConfirmation, setFlightConfirmation] = useState<FlightConfirmationRecord | undefined>(undefined);
-  const [hotelState, setHotelState] = useState<HotelBookingState | 'idle' | 'preparing' | 'payment_required' | 'confirmed'>('idle');
+  const [hotelState, setHotelState] = useState<HotelBookingState | 'idle' | 'preparing' | 'payment_required' | 'reconciliation_pending' | 'confirmed'>('idle');
   const [hotelConfirmation, setHotelConfirmation] = useState<HotelConfirmationRecord | undefined>(undefined);
+  const [pendingHotelTransactionId, setPendingHotelTransactionId] = useState<string | undefined>(undefined);
 
   // Section 5B/5C Authoritative Booking State
   const [bookingId, setBookingId] = useState<string | undefined>(undefined);
@@ -300,9 +301,19 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
               status: 'voucher_issued',
             };
             setHotelConfirmation(hotelConf);
+          } else if (res.hotel.status === 'reconciliation_pending' || res.hotel.reconciliation_pending) {
+            setHotelState('reconciliation_pending');
+            setPendingHotelTransactionId(res.hotel.transaction_id);
           } else if (res.hotel.in_progress || res.hotel.status === 'booking_in_progress') {
             setHotelState('booking_in_progress');
           }
+        } else if (bookingService.checkPendingHotelTransaction) {
+          bookingService.checkPendingHotelTransaction(trip.trip_id).then((pTx: any) => {
+            if (pTx && (pTx.reconciliation_pending || pTx.booking_status === 'reconciliation_pending')) {
+              setHotelState('reconciliation_pending');
+              setPendingHotelTransactionId(pTx.transaction_id);
+            }
+          }).catch(() => {});
         }
 
         if (hasConfirmedFlight && hasConfirmedHotel) {
@@ -835,10 +846,16 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
         }
       : undefined;
 
+    const offerPayload = selectedHotel ? {
+      ...selectedHotel,
+      check_in_date: selectedHotel.check_in_date || trip.start_date,
+      check_out_date: selectedHotel.check_out_date || trip.end_date,
+    } : undefined;
+
     await bookingService.prepareHotelBooking(
       trip.trip_id,
       selectedHotel?.id || selectedHotel?.snapshot_id || '',
-      selectedHotel,
+      offerPayload,
       guestInfo
     );
     setHotelState('payment_required');
@@ -847,6 +864,12 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
   // Initiate Hotel Payment Order (Razorpay)
   const handleInitiateHotelOrder = async () => {
+    if (hotelState === 'reconciliation_pending' || pendingHotelTransactionId) {
+      const pendingErr = new Error('A payment for this hotel stay has already been captured and is pending verification. Please check confirmation status before initiating another order.');
+      notify(pendingErr.message, 'warning', 'Verification In Progress');
+      throw pendingErr;
+    }
+
     if (
       !activeAuthorization ||
       !activeAuthorization.revision_id ||
@@ -860,6 +883,12 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
     if (!bookingService.initiateHotelPaymentOrder) {
       throw new Error('Hotel payment initiation is not supported by booking service.');
+    }
+
+    // Continuity: If an authoritative hotel prebook is not active in this session,
+    // prepare it before creating the Razorpay order.
+    if (!bookingService.hasActiveHotelPrebook?.(trip.trip_id)) {
+      await handlePrepareHotel();
     }
 
     return await bookingService.initiateHotelPaymentOrder(
@@ -890,7 +919,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
     const revId = activeAuthorization.revision_id;
     const revNum = activeAuthorization.revision_number;
-    const confirmRec = await bookingService.processHotelPayment(
+    const outcome = await bookingService.processHotelPayment(
       trip.trip_id,
       method,
       travelerContact,
@@ -899,13 +928,44 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       paymentDetails,
       travelers.length > 0 ? travelers : undefined
     );
+
+    if ((outcome as any)?.status === 'reconciliation_pending' || (outcome as any)?.reconciliation_pending) {
+      setHotelState('reconciliation_pending');
+      setPendingHotelTransactionId((outcome as any).transaction_id);
+      notify('Payment received — reservation verification in progress with supplier.', 'warning', 'Verification Pending');
+      return outcome;
+    }
+
+    const confirmRec = outcome as HotelConfirmationRecord;
     setHotelConfirmation(confirmRec);
     setHotelState('confirmed');
+    setPendingHotelTransactionId(undefined);
     notify(`Stay reserved! Voucher code: ${confirmRec.confirmation_code}`, 'success', 'Stay Confirmed');
 
     // Both confirmed
     if (flightState === 'confirmed') {
       setCurrentStage('confirmed');
+    }
+    return confirmRec;
+  };
+
+  // Reconcile Hotel Payment
+  const handleReconcileHotelPayment = async (transactionId: string) => {
+    if (bookingService.reconcileHotelPayment) {
+      const outcome = await bookingService.reconcileHotelPayment(trip.trip_id, transactionId);
+      if ((outcome as any)?.status === 'reconciliation_pending' || (outcome as any)?.reconciliation_pending) {
+        setHotelState('reconciliation_pending');
+        return outcome;
+      }
+      const confirmRec = outcome as HotelConfirmationRecord;
+      setHotelConfirmation(confirmRec);
+      setHotelState('confirmed');
+      setPendingHotelTransactionId(undefined);
+      notify(`Stay confirmed! Voucher code: ${confirmRec.confirmation_code}`, 'success', 'Stay Confirmed');
+      if (flightState === 'confirmed') {
+        setCurrentStage('confirmed');
+      }
+      return confirmRec;
     }
   };
 
@@ -1220,7 +1280,16 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
                   <Button
                     variant="primary"
                     size="md"
-                    onClick={() => setIsPaymentModalOpen(true)}
+                    onClick={async () => {
+                      if (!bookingService.hasActiveHotelPrebook?.(trip.trip_id)) {
+                        try {
+                          await handlePrepareHotel();
+                        } catch {
+                          return;
+                        }
+                      }
+                      setIsPaymentModalOpen(true);
+                    }}
                     rightIcon={<CreditCard className="w-4 h-4" />}
                     className="shadow-xs shrink-0"
                   >
@@ -1274,8 +1343,11 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
         priceInr={selectedHotel?.price_inr}
         exchangeRate={selectedHotel?.exchange_rate}
         contact={derivedContact}
+        initialTransactionId={pendingHotelTransactionId}
+        initialReconciliationPending={hotelState === 'reconciliation_pending'}
         onInitiateOrder={handleInitiateHotelOrder}
         onProcessPayment={handleProcessHotelPayment}
+        onReconcilePayment={handleReconcileHotelPayment}
       />
 
       {/* Traveler / Passenger Details Modal */}

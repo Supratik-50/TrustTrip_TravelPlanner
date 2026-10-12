@@ -27,6 +27,8 @@ export interface FlightOffer {
   total_amount: string;
   price?: number;
   currency: string;
+  price_inr?: number | null;
+  exchange_rate?: number | null;
   carrier_name: string;
   carrier_code: string;
   carrier_logo_url?: string;
@@ -100,6 +102,7 @@ export interface NormalizedFlightOffer {
   price: number;
   currency: string;
   price_inr?: number | null;
+  exchange_rate?: number | null;
   price_per_traveler?: number | null;
   refundable?: boolean | null;
   changeable?: boolean | null;
@@ -298,24 +301,65 @@ export function toFlightOffer(normalized: NormalizedFlightOffer): FlightOffer {
         },
       ];
 
+  const slices: FlightOffer['slices'] = [];
+  if (normalized.return_departure_time) {
+    const outboundSegs: FlightSegment[] = [];
+    const returnSegs: FlightSegment[] = [];
+    for (const seg of segments) {
+      if (
+        returnSegs.length > 0 ||
+        seg.origin === normalized.destination ||
+        (normalized.return_departure_time && seg.departure_time >= normalized.return_departure_time)
+      ) {
+        returnSegs.push(seg);
+      } else {
+        outboundSegs.push(seg);
+      }
+    }
+    if (outboundSegs.length > 0 && returnSegs.length > 0) {
+      slices.push({
+        origin: normalized.origin,
+        destination: normalized.destination,
+        departure_time: normalized.departure_time,
+        arrival_time: outboundSegs[outboundSegs.length - 1]?.arrival_time || normalized.arrival_time,
+        segments: outboundSegs,
+        total_duration_minutes: durMins || 120,
+        stops: Math.max(0, outboundSegs.length - 1),
+      });
+      slices.push({
+        origin: normalized.destination,
+        destination: normalized.origin,
+        departure_time: normalized.return_departure_time,
+        arrival_time: normalized.return_arrival_time || returnSegs[returnSegs.length - 1]?.arrival_time || '',
+        segments: returnSegs,
+        total_duration_minutes: durMins || 120,
+        stops: Math.max(0, returnSegs.length - 1),
+      });
+    }
+  }
+
+  if (slices.length === 0) {
+    slices.push({
+      origin: normalized.origin,
+      destination: normalized.destination,
+      departure_time: normalized.departure_time,
+      arrival_time: normalized.arrival_time,
+      segments,
+      total_duration_minutes: durMins || 120,
+      stops: normalized.stops,
+    });
+  }
+
   return {
     id: normalized.offer_id,
     snapshot_id: normalized.offer_id,
     offer_id: normalized.offer_id,
-    slices: [
-      {
-        origin: normalized.origin,
-        destination: normalized.destination,
-        departure_time: normalized.departure_time,
-        arrival_time: normalized.arrival_time,
-        segments,
-        total_duration_minutes: durMins || 120,
-        stops: normalized.stops,
-      },
-    ],
+    slices,
     total_amount: String(normalized.price),
     price: normalized.price,
     currency: normalized.currency,
+    price_inr: normalized.price_inr,
+    exchange_rate: normalized.exchange_rate,
     carrier_name: normalized.carrier || 'Airline Partner',
     carrier_code: normalized.carrier_code || '',
     cabin_class: normalized.cabin_class,

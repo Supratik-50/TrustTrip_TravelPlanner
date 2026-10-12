@@ -172,6 +172,8 @@ export function normalizeBackendTrip(raw: any): TripSummary {
     active_revision_number: raw.current_revision_number ?? raw.active_revision_number ?? meta.revision ?? meta.trip_revision ?? 1,
     // FIX 3: Never fabricate revision IDs. If backend doesn't supply one, leave undefined.
     active_revision_id: raw.active_revision_id || raw.current_revision_id || meta.active_revision_id || undefined,
+    current_revision_id: raw.current_revision_id || raw.active_revision_id || meta.active_revision_id || undefined,
+    current_revision_number: raw.current_revision_number ?? raw.active_revision_number ?? meta.revision ?? meta.trip_revision ?? undefined,
     thread_id: raw.thread_id || meta.thread_id,
     travelers_count: raw.travelers_count ?? meta.travelers_count ?? constraints.travelers_count ?? constraints.adults ?? 1,
     budget: raw.budget ?? meta.budget ?? constraints.budget ?? constraints.budget_amount,
@@ -1562,6 +1564,29 @@ export class ApiClient {
     }
   }
 
+  async generateRevisionPlan(
+    tripId: string,
+    revisionId: string,
+    options?: { message?: string; query?: string }
+  ): Promise<TravelPlanResponse> {
+    try {
+      const response = await this.request<any>(`/api/trips/${tripId}/revisions/${revisionId}/plan`, {
+        method: 'POST',
+        body: JSON.stringify(options || {}),
+      });
+      return normalizeBackendPlanResponse(response, tripId, `user_${tripId}`);
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR') {
+        const mock = this.handleMockFallback<any>(`/api/trips/${tripId}/revisions/${revisionId}/plan`, {
+          method: 'POST',
+          body: JSON.stringify(options || {}),
+        });
+        if (mock) return normalizeBackendPlanResponse(mock, tripId, `user_${tripId}`);
+      }
+      throw err;
+    }
+  }
+
   // --- Part 5B & Section 8: Trip Approval & Rejection Canonical Endpoints ---
   async approveTrip(
     tripId: string,
@@ -1884,12 +1909,28 @@ export class ApiClient {
     already_booked?: boolean;
     pdf_available?: boolean;
     requires_refund?: boolean;
+    reconciliation_pending?: boolean;
+    refunded?: boolean;
     error?: string;
   }> {
     return await this.request<any>('/api/hotel-payments/verify-and-book', {
       method: 'POST',
       body: JSON.stringify(request),
     });
+  }
+
+  async getHotelPaymentStatus(transactionId: string): Promise<any> {
+    return await this.request<any>(`/api/hotel-payments/${transactionId}/status`);
+  }
+
+  async reconcileHotelPayment(transactionId: string): Promise<any> {
+    return await this.request<any>(`/api/hotel-payments/${transactionId}/reconcile`, {
+      method: 'POST',
+    });
+  }
+
+  async getHotelPaymentByTrip(tripId: string): Promise<any> {
+    return await this.request<any>(`/api/hotel-payments/by-trip/${tripId}`);
   }
 
   // --- Part 5B: Booking Cancellation Intent (Uncompleted drafts) ---

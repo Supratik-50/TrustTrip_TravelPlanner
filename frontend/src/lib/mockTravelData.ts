@@ -1075,7 +1075,7 @@ export const createMockTripRevision = (
   }
 
   const nextRevNumber = current.revision_number + 1;
-  const changes = req.changes || {};
+  const changes = req.changes || (req.updated_constraints as TripChangeSet) || {};
 
   // Check for stale travel selections
   const staleWarnings: string[] = [];

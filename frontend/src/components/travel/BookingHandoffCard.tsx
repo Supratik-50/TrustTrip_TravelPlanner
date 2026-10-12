@@ -189,7 +189,9 @@ export const BookingHandoffCard: React.FC<BookingHandoffCardProps> = ({
                   {flight.carrier_name}
                 </div>
                 <div className="text-xs text-[var(--text-secondary)] font-mono">
-                  {flight.slices[0]?.origin} ➔ {flight.slices[0]?.destination} • {flight.cabin_class.toUpperCase()}
+                  {flight.slices && flight.slices.length > 1
+                    ? `${flight.slices[0]?.origin} ⇄ ${flight.slices[0]?.destination}`
+                    : `${flight.slices[0]?.origin} ➔ ${flight.slices[0]?.destination}`} • {flight.cabin_class?.toUpperCase()}
                 </div>
                 <div className="flex items-center justify-between pt-2 border-t border-[var(--border)] text-xs">
                   <span className="font-mono text-[11px] text-[var(--text-muted)]">

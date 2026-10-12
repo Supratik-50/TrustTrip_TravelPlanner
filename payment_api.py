@@ -203,6 +203,188 @@ async def payment_config():
     }
 
 
+
+def resolve_flight_offer_id(
+    offer_id_input: str,
+    user_id: uuid.UUID | str,
+    trip_id: uuid.UUID | str,
+    revision_id: uuid.UUID | str,
+    expected_revision_number: int,
+    store: SearchSessionStore | None = None,
+) -> tuple[str, uuid.UUID | None]:
+    """Resolve an incoming offer_id (either snapshot UUID or Duffel provider offer ID)
+    into an authoritative Duffel provider_offer_id ('off_...'), enforcing strict tenant,
+    trip, revision, and offer-type isolation.
+
+    Returns:
+        tuple[provider_offer_id, snapshot_uuid_if_applicable]
+    """
+    raw_input = (offer_id_input or "").strip()
+    if not raw_input:
+        raise HTTPException(status_code=422, detail="offer_id is required.")
+
+    uid_str = str(user_id)
+    tid_str = str(trip_id)
+    rid_str = str(revision_id)
+    from services.search_session_store import SearchSessionStore
+    snapshot_store = store or SearchSessionStore()
+
+    parsed_uuid: uuid.UUID | None = None
+    try:
+        candidate = uuid.UUID(raw_input)
+        if str(candidate) == raw_input.lower() or candidate.hex == raw_input.lower():
+            parsed_uuid = candidate
+    except (ValueError, AttributeError, TypeError):
+        parsed_uuid = None
+
+    if parsed_uuid is not None:
+        # Case A: Snapshot UUID provided. Resolve through SearchSessionStore.
+        try:
+            snapshot = snapshot_store.get_snapshot(parsed_uuid, uid_str)
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail="Offer snapshot is invalid or missing required provider fields.",
+            )
+        if not snapshot:
+            # Distinguish cross-user unauthorized access (403) from not found (404)
+            is_other_user = False
+            if snapshot_store.use_in_memory:
+                other_rec = snapshot_store._IN_MEMORY_SNAPSHOTS.get(str(parsed_uuid))
+                if other_rec:
+                    is_other_user = True
+            else:
+                try:
+                    with snapshot_store._connect() as conn:
+                        row = conn.execute(
+                            "SELECT 1 FROM offer_snapshots WHERE id = %s",
+                            (str(parsed_uuid),),
+                        ).fetchone()
+                        if row:
+                            is_other_user = True
+                except Exception:
+                    pass
+            if is_other_user:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Forbidden: Offer snapshot belongs to another user.",
+                )
+            raise HTTPException(
+                status_code=404,
+                detail="Offer snapshot not found.",
+            )
+
+        if snapshot.offer_type != "flight":
+            raise HTTPException(
+                status_code=422,
+                detail=f"Offer snapshot '{parsed_uuid}' is of type '{snapshot.offer_type}', expected 'flight'.",
+            )
+
+        session = snapshot_store.get_session(snapshot.session_id, uid_str)
+        if not session or str(session.trip_id) != tid_str:
+            raise HTTPException(
+                status_code=400,
+                detail="Offer snapshot does not belong to the specified trip.",
+            )
+
+        # Enforce consistency with authorized revision if revision specified a flight snapshot
+        try:
+            from services.evidence_store import EvidenceRevisionStore
+            from services.authorization_store import extract_canonical_booking_fields
+            ev_store = EvidenceRevisionStore()
+            rev = ev_store.get_revision(rid_str, uid_str)
+            if rev and rev.plan_snapshot:
+                rev_fields = extract_canonical_booking_fields(rev.plan_snapshot)
+                auth_flight_snap = rev_fields.get("selected_flight_snapshot_id")
+                if auth_flight_snap and str(auth_flight_snap).lower() != str(parsed_uuid).lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "BOOKING_NOT_ELIGIBLE",
+                            "message": f"Snapshot '{parsed_uuid}' does not match authorized revision flight snapshot '{auth_flight_snap}'.",
+                        },
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        if snapshot.expires_at and snapshot.expires_at < now:
+            raise HTTPException(
+                status_code=410,
+                detail="Offer snapshot has expired.",
+            )
+
+        provider_offer_id = (snapshot.provider_offer_id or "").strip()
+        if not provider_offer_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Offer snapshot does not contain an authoritative provider offer ID.",
+            )
+        if not provider_offer_id.startswith("off_"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Authoritative provider offer ID '{provider_offer_id}' has an invalid format.",
+            )
+        return provider_offer_id, parsed_uuid
+
+    # Case B: Direct Duffel provider offer ID provided ('off_...')
+    if not raw_input.startswith("off_") or len(raw_input) < 8:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid offer ID format: expected a valid snapshot UUID or Duffel offer ID ('off_...').",
+        )
+
+    # Cross-tenant / cross-trip guard on provider offer ID
+    if snapshot_store.use_in_memory:
+        for rec in snapshot_store._IN_MEMORY_SNAPSHOTS.values():
+            if rec.get("provider_offer_id") == raw_input:
+                s_sess = snapshot_store._IN_MEMORY_SESSIONS.get(str(rec.get("session_id")))
+                if s_sess:
+                    if str(s_sess.get("user_id")) != uid_str:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Forbidden: Provider offer ID belongs to another user's snapshot.",
+                        )
+                    if str(s_sess.get("trip_id")) != tid_str:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Provider offer ID belongs to a different trip.",
+                        )
+    else:
+        try:
+            with snapshot_store._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT ss.user_id, ss.trip_id
+                    FROM offer_snapshots os
+                    JOIN search_sessions ss ON os.session_id = ss.id
+                    WHERE os.provider_offer_id = %s
+                    LIMIT 1
+                    """,
+                    (raw_input,),
+                ).fetchone()
+                if row:
+                    if str(row["user_id"]) != uid_str:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Forbidden: Provider offer ID belongs to another user's snapshot.",
+                        )
+                    if str(row["trip_id"]) != tid_str:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Provider offer ID belongs to a different trip.",
+                        )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    return raw_input, None
+
+
 @router.post("/create-order")
 async def create_payment_order(
     request: PaymentOrderRequest,
@@ -227,6 +409,15 @@ async def create_payment_order(
             raise
         raise HTTPException(status_code=409, detail={"code": "BOOKING_NOT_ELIGIBLE", "message": str(elig_err)}) from elig_err
 
+    # Resolve snapshot UUID -> authoritative Duffel provider_offer_id ('off_...')
+    provider_offer_id, snapshot_uuid = resolve_flight_offer_id(
+        offer_id_input=request.offer_id,
+        user_id=current_user.id,
+        trip_id=request.trip_id,
+        revision_id=request.revision_id,
+        expected_revision_number=request.expected_revision_number,
+    )
+
     rp = _razorpay()
     _integration_mode()
     if not rp.configured:
@@ -234,7 +425,7 @@ async def create_payment_order(
 
     try:
         # Never trust the amount supplied by the browser. Recheck the provider first.
-        offer = await asyncio.to_thread(FlightService().recheck, request.offer_id)
+        offer = await asyncio.to_thread(FlightService().recheck, provider_offer_id)
         conversion = await asyncio.to_thread(
             _validate_and_convert_offer, offer, request.expected_amount, request.currency
         )
@@ -264,12 +455,18 @@ async def create_payment_order(
         store = _store()
         try:
             reserved, is_new = store.reserve_payment_order(
-                customer_ref=effective_customer_ref, offer_id=request.offer_id, amount=amount,
+                customer_ref=effective_customer_ref, offer_id=provider_offer_id, amount=amount,
                 currency="INR", provider_amount=conversion["provider_amount"],
                 provider_currency=conversion["provider_currency"], fx_rate=conversion["fx_rate"],
                 fx_rate_date=conversion["fx_rate_date"], fx_source=conversion["fx_source"],
                 passengers=request.passengers,
-                metadata={"receipt": receipt, "fare_rechecked_at_creation": True, "customer_final_confirmation": True},
+                metadata={
+                    "receipt": receipt,
+                    "fare_rechecked_at_creation": True,
+                    "customer_final_confirmation": True,
+                    "snapshot_id": str(snapshot_uuid) if snapshot_uuid else None,
+                    "client_submitted_offer_id": request.offer_id,
+                },
                 trip_id=request.trip_id, revision_id=request.revision_id,
                 revision_number=request.expected_revision_number,
                 payment_idempotency_key=request.payment_idempotency_key,
@@ -307,7 +504,12 @@ async def create_payment_order(
                 rp.create_order,
                 amount,
                 receipt,
-                {"offer_id": request.offer_id, "app": "Trust Trip MAS", "provider_currency": conversion["provider_currency"]},
+                {
+                    "offer_id": provider_offer_id,
+                    "snapshot_id": str(snapshot_uuid) if snapshot_uuid else "",
+                    "app": "Trust Trip MAS",
+                    "provider_currency": conversion["provider_currency"],
+                },
             )
         except Exception as exc:
             store.update(tx_id, payment_status="order_failed", booking_status="payment_order_failed")

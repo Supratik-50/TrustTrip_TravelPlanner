@@ -51,6 +51,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDeciding, setIsDeciding] = useState(false);
+  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   const [showRejectModal, setShowRejectModal] = useState(false);
   const [rejectionReason, setRejectionReason] = useState('');
 
@@ -63,6 +64,52 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
   const revisions = trip.revisions || [];
   const currentRevisionNumber = trip.active_revision_number || revisions.length || 1;
   const currentRevision = revisions.find((r) => r.revision_number === currentRevisionNumber) || trip.current_revision;
+
+  const activeRevisionId =
+    currentRevision?.revision_id ||
+    trip.active_revision_id ||
+    (trip as any).current_revision_id;
+
+  // Canonical dates on the active trip
+  const tripStartDate = (trip.start_date || '').slice(0, 10);
+  const tripEndDate = (trip.end_date || '').slice(0, 10);
+
+  // Dates present on the existing plan
+  const planStartDate = (
+    (trip.plan as any)?.departure_date ||
+    trip.plan?.plan_json?.departure_date ||
+    ''
+  ).slice(0, 10);
+  const planEndDate = (
+    (trip.plan as any)?.return_date ||
+    trip.plan?.plan_json?.return_date ||
+    ''
+  ).slice(0, 10);
+
+  // Calculate authoritative duration days
+  const expectedDays = React.useMemo(() => {
+    if (!tripStartDate || !tripEndDate) return 0;
+    try {
+      const d1 = new Date(tripStartDate);
+      const d2 = new Date(tripEndDate);
+      const diff = Math.round((d2.getTime() - d1.getTime()) / (1000 * 60 * 60 * 24));
+      return diff > 0 ? diff : 0;
+    } catch {
+      return 0;
+    }
+  }, [tripStartDate, tripEndDate]);
+
+  // A plan is missing or stale if no plan exists or its dates do not match the trip's active constraints
+  const hasValidPlan = Boolean(
+    trip.plan &&
+    (!tripStartDate || !planStartDate || tripStartDate === planStartDate) &&
+    (!tripEndDate || !planEndDate || tripEndDate === planEndDate)
+  );
+
+  const isPlanMissingOrStale = Boolean(
+    (currentRevision?.status === 'PROPOSED' || (!trip.is_approved && trip.status === 'awaiting_approval')) &&
+    !hasValidPlan
+  );
 
   const [selectedHistoricalRev, setSelectedHistoricalRev] = useState<TripRevision | null>(
     revisions.length > 1 ? revisions[revisions.length - 2] : null
@@ -141,8 +188,37 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
     }
   };
 
+  const handleGenerateRevisionPlan = async () => {
+    if (!activeRevisionId) {
+      notify('No active revision found to plan for.', 'error');
+      return;
+    }
+
+    setIsGeneratingPlan(true);
+    setConflictError(null);
+
+    try {
+      await api.generateRevisionPlan(trip.trip_id, activeRevisionId, {
+        message: feedback.trim() || undefined,
+      });
+
+      notify(
+        `Revised ${expectedDays > 0 ? `${expectedDays}-day ` : ''}itinerary generated for Revision #${currentRevisionNumber}.`,
+        'success',
+        'Itinerary Generated'
+      );
+
+      const freshTrip = await api.getTrip(trip.trip_id);
+      onTripUpdated(freshTrip);
+    } catch (err: any) {
+      notify(err.message || 'Failed to generate revised itinerary.', 'error', 'Planning Notice');
+    } finally {
+      setIsGeneratingPlan(false);
+    }
+  };
+
   const handleApprove = async () => {
-    if (!currentRevision?.revision_id) {
+    if (!activeRevisionId) {
       notify('No active revision found to approve.', 'error');
       return;
     }
@@ -152,7 +228,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
 
     try {
       await api.approveTrip(trip.trip_id, {
-        revision_id: currentRevision.revision_id,
+        revision_id: activeRevisionId,
         expected_revision_number: currentRevisionNumber,
       });
 
@@ -221,13 +297,21 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
   };
 
   const handleAuthorizeBooking = async () => {
-    const targetRevId = trip.active_revision_id;
-    const targetRevNum = trip.active_revision_number;
-    const activeRevision = revisions.find(
-      (revision) =>
-        revision.revision_id === targetRevId &&
-        revision.revision_number === targetRevNum
-    );
+    const targetRevId =
+      trip.active_revision_id ||
+      (trip as any).current_revision_id ||
+      currentRevision?.revision_id;
+    const targetRevNum =
+      trip.active_revision_number ||
+      (trip as any).current_revision_number ||
+      currentRevision?.revision_number;
+    const activeRevision = revisions.length > 0
+      ? revisions.find(
+          (revision) =>
+            revision.revision_id === targetRevId &&
+            revision.revision_number === targetRevNum
+        )
+      : true;
 
     if (
       typeof targetRevId !== 'string' ||
@@ -388,6 +472,69 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
           </div>
         )}
 
+        {/* Itinerary Generation Status & Action */}
+        {currentStatus === 'PROPOSED' && (
+          <div className="pt-2">
+            {isPlanMissingOrStale ? (
+              <div className="p-4 rounded-2xl bg-[var(--primary-soft)]/30 border border-[var(--primary)]/30 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-[var(--primary)] font-mono uppercase tracking-wider flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4" />
+                    Itinerary Generation Required
+                  </span>
+                  <span className="text-[11px] font-mono text-[var(--text-muted)]">
+                    Target: {expectedDays > 0 ? `${expectedDays} Days` : 'Updated Dates'}
+                  </span>
+                </div>
+                <p className="text-xs text-[var(--text-primary)] font-light leading-relaxed">
+                  Your trip constraints for Revision #{currentRevisionNumber} specify {expectedDays > 0 ? `${expectedDays} days` : 'updated dates'} ({trip.start_date} to {trip.end_date}), but the daily itinerary has not yet been synthesized for this revision proposal.
+                </p>
+                <div className="flex flex-wrap items-center gap-3 pt-1">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleGenerateRevisionPlan}
+                    isLoading={isGeneratingPlan}
+                    leftIcon={<Sparkles className="w-4 h-4" />}
+                  >
+                    {expectedDays > 0 ? `Generate Revised ${expectedDays}-Day Plan` : 'Generate Revised Plan'}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-2xl bg-[var(--surface-muted)]/60 border border-[var(--border)] flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div className="flex items-center gap-2 text-[var(--status-success)] font-mono font-bold">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>
+                    Revised {expectedDays > 0 ? `${expectedDays}-day ` : ''}itinerary is generated for Revision #{currentRevisionNumber}.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => onNavigateTab('itinerary')}
+                    rightIcon={<ArrowRight className="w-3.5 h-3.5" />}
+                    className="text-xs h-8"
+                  >
+                    View Full Itinerary
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleGenerateRevisionPlan}
+                    isLoading={isGeneratingPlan}
+                    leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
+                    className="text-xs h-8"
+                  >
+                    Regenerate Plan
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* HITL Decision Controls */}
         <div className="pt-2 flex flex-wrap items-center justify-between gap-4 border-t border-[var(--border)]">
           <div className="text-xs text-[var(--text-secondary)] font-light max-w-md">
@@ -397,11 +544,16 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
           <div className="flex flex-wrap items-center gap-3">
             {currentStatus === 'PROPOSED' && (
               <>
+                {isPlanMissingOrStale && (
+                  <span className="text-[11px] text-[var(--terracotta)] font-mono">
+                    Generate revised itinerary before accepting.
+                  </span>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => setShowRejectModal(true)}
-                  disabled={isDeciding}
+                  disabled={isDeciding || isGeneratingPlan}
                   className="border-[var(--status-danger)]/40 text-[var(--status-danger)] hover:bg-[var(--status-danger)]/10"
                 >
                   Reject Proposal
@@ -410,8 +562,10 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
                   variant="primary"
                   size="sm"
                   onClick={handleApprove}
+                  disabled={isPlanMissingOrStale || isDeciding || isGeneratingPlan}
                   isLoading={isDeciding}
                   leftIcon={<ShieldCheck className="w-4 h-4" />}
+                  title={isPlanMissingOrStale ? "Generate revised plan before accepting" : undefined}
                 >
                   Accept this trip revision
                 </Button>

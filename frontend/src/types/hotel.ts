@@ -67,20 +67,26 @@ export interface HotelSearchRequest {
 }
 
 export interface HotelPrebookRequest {
-  hotel_id: string;
-  room_id: string;
-  check_in_date: string;
-  check_out_date: string;
-  guests: number;
-  guest_name: string;
-  guest_email: string;
+  trip_id: string;
+  snapshot_id?: string;
+  hotel_id?: string;
+  room_id?: string;
+  check_in_date?: string;
+  check_out_date?: string;
+  guests?: number | any[];
+  guest_name?: string;
+  guest_email?: string;
+  offer?: any;
 }
 
 export interface HotelPrebookResponse {
+  success?: boolean;
   prebook_id: string;
   amount: number;
   currency: string;
+  status?: string;
   razorpay_order_id?: string;
   hotel_name: string;
-  expires_at: string;
+  expires_at?: string;
+  prebook?: any;
 }

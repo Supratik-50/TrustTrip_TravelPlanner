@@ -267,6 +267,12 @@ export const FlightCard: React.FC<FlightCardProps> = ({
                 total
               </span>
             </div>
+            {offer.currency?.toUpperCase() !== 'INR' && offer.price_inr !== undefined && offer.price_inr !== null && !isNaN(Number(offer.price_inr)) && (
+              <div className="text-xs sm:text-sm font-semibold text-[var(--text-secondary)] font-mono flex items-center gap-1">
+                <span>{formatCurrency(offer.price_inr, 'INR')}</span>
+                <span className="text-[var(--text-muted)] font-normal text-xs">(est.)</span>
+              </div>
+            )}
             <p className="text-[11px] text-[var(--text-muted)]">
               All taxes, passenger fees & carry-on included
             </p>

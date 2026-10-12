@@ -44,9 +44,11 @@ export interface TripSummary {
   destination: string;
   start_date: string;
   end_date: string;
-  status: 'draft' | 'planning' | 'approved' | 'booked' | 'cancelled';
+  status: 'draft' | 'planning' | 'awaiting_approval' | 'approved' | 'booked' | 'cancelled';
   active_revision_number?: number;
   active_revision_id?: string;
+  current_revision_number?: number;
+  current_revision_id?: string;
   is_booking_authorized?: boolean;
   booking_authorization?: BookingAuthorizationInfo | null;
   thread_id?: string;
@@ -55,6 +57,10 @@ export interface TripSummary {
   currency?: string;
   preferences?: string[];
   metadata?: Record<string, any>;
+  flight_count?: number;
+  hotel_count?: number;
+  flights?: any[];
+  hotels?: any[];
   created_at: string;
   updated_at: string;
 }
@@ -147,10 +153,12 @@ export interface TripChangeSet {
 }
 
 export interface CreateRevisionRequest {
-  expected_base_revision: number;
+  expected_base_revision?: number;
   expected_base_revision_id?: string;
-  changes: TripChangeSet;
+  changes?: TripChangeSet;
   change_summary?: string;
+  updated_constraints?: Record<string, any>;
+  feedback?: string;
 }
 
 export interface TripOfferSelection {

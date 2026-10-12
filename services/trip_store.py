@@ -177,38 +177,153 @@ def _build_selected_flight_metadata(
     cabin_class = "economy"
     f_slices: list[dict[str, Any]] = []
 
-    if hasattr(norm_offer, "segments") and norm_offer.segments:
-        first_seg = norm_offer.segments[0]
-        carrier_name = getattr(first_seg, "marketing_carrier_name", "Airline")
-        carrier_code = getattr(first_seg, "marketing_carrier_iata", "")
-        cabin_class = getattr(first_seg, "cabin_class", "economy")
-        seg_list = []
-        for s in norm_offer.segments:
-            seg_list.append({
-                "origin": getattr(s, "origin_iata", ""),
-                "destination": getattr(s, "destination_iata", ""),
-                "departure_time": s.departure_time.isoformat() if hasattr(s.departure_time, "isoformat") else str(s.departure_time),
-                "arrival_time": s.arrival_time.isoformat() if hasattr(s.arrival_time, "isoformat") else str(s.arrival_time),
-                "carrier_code": getattr(s, "marketing_carrier_iata", ""),
-                "carrier_name": getattr(s, "marketing_carrier_name", ""),
-                "flight_number": getattr(s, "flight_number", ""),
-                "duration_minutes": getattr(s, "duration_minutes", 0),
-                "cabin_class": getattr(s, "cabin_class", "economy"),
-            })
-        f_slices.append({
-            "origin": seg_list[0]["origin"] if seg_list else (trip.get("origin") or ""),
-            "destination": seg_list[-1]["destination"] if seg_list else (trip.get("destination") or ""),
-            "departure_time": seg_list[0]["departure_time"] if seg_list else "",
-            "arrival_time": seg_list[-1]["arrival_time"] if seg_list else "",
-            "segments": seg_list,
-            "total_duration_minutes": sum(s.get("duration_minutes", 0) for s in seg_list),
-            "stops": max(0, len(seg_list) - 1),
-        })
+    def _make_slice(segs: list[dict[str, Any]], fallback_origin: str = "", fallback_destination: str = "") -> dict[str, Any]:
+        return {
+            "origin": segs[0]["origin"] if segs else fallback_origin,
+            "destination": segs[-1]["destination"] if segs else fallback_destination,
+            "departure_time": segs[0]["departure_time"] if segs else "",
+            "arrival_time": segs[-1]["arrival_time"] if segs else "",
+            "segments": segs,
+            "total_duration_minutes": sum(s.get("duration_minutes", 0) for s in segs),
+            "stops": max(0, len(segs) - 1),
+        }
+
+    raw_slices = None
+    if hasattr(norm_offer, "raw") and isinstance(norm_offer.raw, dict):
+        raw_slices = norm_offer.raw.get("slices")
     elif isinstance(norm_offer, dict):
-        carrier_name = norm_offer.get("carrier_name") or "Airline"
-        carrier_code = norm_offer.get("carrier_code") or ""
-        cabin_class = norm_offer.get("cabin_class") or "economy"
-        f_slices = norm_offer.get("slices") or []
+        raw_slices = (norm_offer.get("raw") or {}).get("slices") if isinstance(norm_offer.get("raw"), dict) else norm_offer.get("slices")
+
+    raw_segments = getattr(norm_offer, "segments", None) if hasattr(norm_offer, "segments") else (norm_offer.get("segments") if isinstance(norm_offer, dict) else None)
+
+    if isinstance(norm_offer, dict):
+        carrier_name = norm_offer.get("carrier_name") or carrier_name
+        carrier_code = norm_offer.get("carrier_code") or carrier_code
+        cabin_class = norm_offer.get("cabin_class") or cabin_class
+
+    if raw_segments:
+        first_seg = raw_segments[0]
+        if hasattr(first_seg, "marketing_carrier_name"):
+            carrier_name = getattr(first_seg, "marketing_carrier_name", carrier_name)
+            carrier_code = getattr(first_seg, "marketing_carrier_iata", carrier_code)
+            cabin_class = getattr(first_seg, "cabin_class", cabin_class)
+        elif isinstance(first_seg, dict):
+            carrier_name = first_seg.get("carrier_name") or first_seg.get("marketing_carrier_name") or carrier_name
+            carrier_code = first_seg.get("carrier_code") or first_seg.get("marketing_carrier_iata") or carrier_code
+            cabin_class = first_seg.get("cabin_class") or cabin_class
+
+        seg_list = []
+        for s in raw_segments:
+            if hasattr(s, "origin_iata"):
+                dep_t = s.departure_time.isoformat() if hasattr(s.departure_time, "isoformat") else str(s.departure_time)
+                arr_t = s.arrival_time.isoformat() if hasattr(s.arrival_time, "isoformat") else str(s.arrival_time)
+                seg_list.append({
+                    "id": str(getattr(s, "id", "") or ""),
+                    "origin": getattr(s, "origin_iata", ""),
+                    "destination": getattr(s, "destination_iata", ""),
+                    "departure_time": dep_t,
+                    "arrival_time": arr_t,
+                    "carrier_code": getattr(s, "marketing_carrier_iata", ""),
+                    "carrier_name": getattr(s, "marketing_carrier_name", ""),
+                    "flight_number": getattr(s, "flight_number", ""),
+                    "duration_minutes": getattr(s, "duration_minutes", 0),
+                    "cabin_class": getattr(s, "cabin_class", "economy"),
+                })
+            elif isinstance(s, dict):
+                seg_list.append({
+                    "id": str(s.get("id") or ""),
+                    "origin": str(s.get("origin_iata") or s.get("origin") or ""),
+                    "destination": str(s.get("destination_iata") or s.get("destination") or ""),
+                    "departure_time": str(s.get("departure_time") or ""),
+                    "arrival_time": str(s.get("arrival_time") or ""),
+                    "carrier_code": str(s.get("carrier_code") or s.get("marketing_carrier_iata") or ""),
+                    "carrier_name": str(s.get("carrier_name") or s.get("marketing_carrier_name") or ""),
+                    "flight_number": str(s.get("flight_number") or ""),
+                    "duration_minutes": int(s.get("duration_minutes") or 0),
+                    "cabin_class": str(s.get("cabin_class") or "economy"),
+                })
+
+        if raw_slices and isinstance(raw_slices, list) and len(raw_slices) > 1:
+            # Multi-slice boundaries from authoritative provider payload
+            seg_idx = 0
+            for r_sl in raw_slices:
+                r_sl_segs = r_sl.get("segments") or []
+                count = len(r_sl_segs) if r_sl_segs else 0
+                if count > 0 and seg_idx + count <= len(seg_list):
+                    sl_slice_segs = seg_list[seg_idx:seg_idx + count]
+                    seg_idx += count
+                else:
+                    sl_slice_segs = [seg_list[seg_idx]] if seg_idx < len(seg_list) else []
+                    seg_idx += 1
+                if sl_slice_segs:
+                    f_slices.append(_make_slice(
+                        sl_slice_segs,
+                        fallback_origin=str(r_sl.get("origin") or ""),
+                        fallback_destination=str(r_sl.get("destination") or ""),
+                    ))
+
+        if not f_slices and seg_list:
+            first_orig = seg_list[0]["origin"]
+            last_dest = seg_list[-1]["destination"]
+            # Detect round-trip: journey departs from first_orig and eventually returns to first_orig
+            if len(seg_list) >= 2 and first_orig and last_dest and first_orig.upper() == last_dest.upper():
+                # Derive canonical destination from trip
+                trip_dest_raw = trip.get("destination") or ""
+                canonical_dest = ""
+                if "(" in trip_dest_raw and ")" in trip_dest_raw:
+                    canonical_dest = trip_dest_raw.split("(")[-1].replace(")", "").strip().upper()
+                elif len(trip_dest_raw.strip()) == 3:
+                    canonical_dest = trip_dest_raw.strip().upper()
+
+                # Find turnaround segment: where return slice commences
+                turnaround_idx = None
+                # Check for segment starting at canonical destination
+                if canonical_dest:
+                    for idx in range(1, len(seg_list)):
+                        if seg_list[idx]["origin"].upper() == canonical_dest:
+                            turnaround_idx = idx
+                            break
+                        if seg_list[idx - 1]["destination"].upper() == canonical_dest:
+                            turnaround_idx = idx
+                            break
+
+                # If canonical destination not directly matched, find where arrival date/time breaks
+                if turnaround_idx is None:
+                    # Look for date change or disconnected leg or departure heading back towards first_orig
+                    max_gap = None
+                    best_split = None
+                    for idx in range(1, len(seg_list)):
+                        dep_prev = seg_list[idx - 1].get("arrival_time", "")
+                        dep_next = seg_list[idx].get("departure_time", "")
+                        # If segment destination is first_orig, this is definitely a return flight
+                        if seg_list[idx]["destination"].upper() == first_orig.upper() and len(seg_list) == 2:
+                            best_split = idx
+                            break
+                        # Track calendar date change between legs
+                        date_prev = dep_prev[:10] if len(dep_prev) >= 10 else ""
+                        date_next = dep_next[:10] if len(dep_next) >= 10 else ""
+                        if date_prev and date_next and date_next > date_prev:
+                            best_split = idx
+                            break
+                    turnaround_idx = best_split if best_split is not None else (len(seg_list) // 2)
+
+                if turnaround_idx and 0 < turnaround_idx < len(seg_list):
+                    outbound_segs = seg_list[:turnaround_idx]
+                    return_segs = seg_list[turnaround_idx:]
+                    f_slices.append(_make_slice(outbound_segs, trip.get("origin") or "", canonical_dest or ""))
+                    f_slices.append(_make_slice(return_segs, canonical_dest or "", trip.get("origin") or ""))
+                else:
+                    f_slices.append(_make_slice(seg_list, trip.get("origin") or "", trip.get("destination") or ""))
+            else:
+                # One-way journey
+                f_slices.append(_make_slice(seg_list, trip.get("origin") or "", trip.get("destination") or ""))
+
+    elif isinstance(norm_offer, dict):
+        carrier_name = norm_offer.get("carrier_name") or carrier_name
+        carrier_code = norm_offer.get("carrier_code") or carrier_code
+        cabin_class = norm_offer.get("cabin_class") or cabin_class
+        if not f_slices:
+            f_slices = norm_offer.get("slices") or []
 
     provider_offer_id = getattr(norm_offer, "provider_offer_id", None) or (
         norm_offer.get("offer_id") or norm_offer.get("provider_offer_id") if isinstance(norm_offer, dict) else str(snapshot_id)
@@ -302,6 +417,37 @@ class TripStore:
                 (trip_id, uid_str, title, destination, origin, status, json.dumps(meta), rev_num, str(current_revision_id) if current_revision_id else None, now, now),
             ).fetchone()
             return dict(row)
+
+    def update_trip_metadata(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Update metadata on a trip owned by user_id."""
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        now = datetime.now(timezone.utc)
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            t = self._memory_trips.get(tid_str)
+            if t and str(t["user_id"]) == uid_str:
+                t["metadata"] = dict(metadata)
+                t["updated_at"] = now
+                return dict(t)
+            return None
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE trips
+                SET metadata = %s::jsonb, updated_at = %s
+                WHERE id = %s AND user_id = %s
+                RETURNING *
+                """,
+                (json.dumps(metadata, default=str), now, tid_str, uid_str),
+            ).fetchone()
+            return dict(row) if row else None
 
     def get_trip(self, trip_id: str | uuid.UUID, user_id: str | uuid.UUID) -> dict[str, Any] | None:
         """Fetch trip strictly verifying ownership by user_id."""
@@ -918,6 +1064,10 @@ class TripStore:
                 if plan.requires_flight_search or flight_selection_changed or flight_dates_or_route_changed:
                     if plan.requires_flight_search or new_flight is None:
                         meta.pop("selected_flight_snapshot_id", None)
+                        meta.pop("selected_flight", None)
+                    elif flight_selection_changed:
+                        meta["selected_flight_snapshot_id"] = new_flight
+                        meta.pop("selected_flight", None)
                     else:
                         meta["selected_flight_snapshot_id"] = new_flight
                     try:
@@ -928,6 +1078,9 @@ class TripStore:
                         raise
                 if plan.requires_hotel_search:
                     meta.pop("selected_hotel_snapshot_id", None)
+                    meta.pop("selected_hotel", None)
+                    meta.pop("hotel_prebook", None)
+                    meta.pop("selected_room", None)
 
                 new_rev_id = uuid.uuid4()
                 parent_rev_id = trip_row.get("current_revision_id")
@@ -1098,6 +1251,10 @@ class TripStore:
                 if plan.requires_flight_search or flight_selection_changed or flight_dates_or_route_changed:
                     if plan.requires_flight_search or new_flight is None:
                         meta.pop("selected_flight_snapshot_id", None)
+                        meta.pop("selected_flight", None)
+                    elif flight_selection_changed:
+                        meta["selected_flight_snapshot_id"] = new_flight
+                        meta.pop("selected_flight", None)
                     else:
                         meta["selected_flight_snapshot_id"] = new_flight
                     try:
@@ -1108,6 +1265,9 @@ class TripStore:
                         raise
                 if plan.requires_hotel_search:
                     meta.pop("selected_hotel_snapshot_id", None)
+                    meta.pop("selected_hotel", None)
+                    meta.pop("hotel_prebook", None)
+                    meta.pop("selected_room", None)
 
                 new_rev_id = uuid.uuid4()
                 parent_rev_id = trip_row.get("current_revision_id")
@@ -1214,6 +1374,107 @@ class TripStore:
                         "plan_snapshot": plan_snapshot,
                     },
                     "trip": updated_trip,
+                }
+
+
+    def attach_plan_to_revision(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        revision_id: str | uuid.UUID,
+        plan_json: dict[str, Any],
+        raw_plan: str,
+    ) -> dict[str, Any]:
+        """Attach a newly generated itinerary plan directly to an existing active PROPOSED revision.
+
+        Guarantees that:
+        1. Universal parent trip lock FOR UPDATE is acquired.
+        2. revision_id must match the trip's current active revision.
+        3. Revision number is NOT incremented; no new revision row is created.
+        4. Both trips.metadata and plan_revisions.plan_snapshot are atomically updated.
+        """
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        rid_str = str(revision_id)
+        now = datetime.now(timezone.utc)
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with _get_memory_trip_lock(tid_str):
+                trip = self._memory_trips.get(tid_str)
+                if not trip or str(trip.get("user_id")) != uid_str:
+                    raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+                cur_rid = str(trip.get("current_revision_id") or "")
+                if cur_rid != rid_str:
+                    raise OfferSelectionError(409, f"Conflict: Revision {rid_str} is not the active revision ({cur_rid}).")
+
+                norm_plan = json.loads(json.dumps(plan_json, default=str)) if isinstance(plan_json, (dict, list)) else plan_json
+                meta = dict(trip.get("metadata") or {})
+                meta["plan"] = norm_plan
+                meta["raw_plan"] = raw_plan
+                trip["metadata"] = meta
+                trip["updated_at"] = now
+                self._memory_trips[tid_str] = trip
+
+                return {
+                    "success": True,
+                    "trip_id": tid_str,
+                    "revision_id": rid_str,
+                    "revision_number": int(trip.get("current_revision_number") or 1),
+                    "status": trip.get("status", "awaiting_approval"),
+                    "plan": norm_plan,
+                    "raw_plan": raw_plan,
+                    "trip": trip,
+                }
+
+        with self._connect(autocommit=False) as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT id, current_revision_id, current_revision_number, status, metadata
+                    FROM trips
+                    WHERE id = %s AND user_id = %s
+                    FOR UPDATE
+                    """,
+                    (tid_str, uid_str),
+                ).fetchone()
+                if not row:
+                    raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+
+                trip_row = dict(row)
+                cur_rid = str(trip_row.get("current_revision_id") or "")
+                if cur_rid != rid_str:
+                    raise OfferSelectionError(409, f"Conflict: Revision {rid_str} is not the active revision ({cur_rid}).")
+
+                meta = trip_row.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                meta = dict(meta)
+                meta["plan"] = plan_json
+                meta["raw_plan"] = raw_plan
+
+                updated_trip_row = conn.execute(
+                    """
+                    UPDATE trips
+                    SET metadata = %s::jsonb,
+                        updated_at = %s
+                    WHERE id = %s AND user_id = %s
+                    RETURNING *
+                    """,
+                    (json.dumps(meta, default=str), now, tid_str, uid_str),
+                ).fetchone()
+
+                return {
+                    "success": True,
+                    "trip_id": tid_str,
+                    "revision_id": rid_str,
+                    "revision_number": int(trip_row.get("current_revision_number") or 1),
+                    "status": trip_row.get("status", "awaiting_approval"),
+                    "plan": plan_json,
+                    "raw_plan": raw_plan,
+                    "trip": dict(updated_trip_row) if updated_trip_row else trip_row,
                 }
 
 

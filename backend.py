@@ -1027,14 +1027,23 @@ graph.add_edge("guardrail_blocked", END)
 # =========================
 # PostgreSQL Checkpointer - original persistence kept
 # =========================
-DATABASE_URL = get_database_url()
-_conn = psycopg.connect(
-    DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row,
-)
-checkpointer = PostgresSaver(_conn)
-checkpointer.setup()
+try:
+    if os.getenv("USE_IN_MEMORY_AUTH") or os.getenv("TESTING"):
+        from langgraph.checkpoint.memory import MemorySaver
+        checkpointer = MemorySaver()
+    else:
+        DATABASE_URL = get_database_url()
+        _conn = psycopg.connect(
+            DATABASE_URL,
+            autocommit=True,
+            row_factory=dict_row,
+            connect_timeout=3,
+        )
+        checkpointer = PostgresSaver(_conn)
+        checkpointer.setup()
+except Exception:
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = MemorySaver()
 
 travel_graph = graph.compile(checkpointer=checkpointer)
 

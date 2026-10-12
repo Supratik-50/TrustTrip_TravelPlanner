@@ -40,6 +40,7 @@ export type HotelBookingState =
   | 'payment_success'
   | 'payment_failed'
   | 'booking_in_progress'
+  | 'reconciliation_pending'
   | 'confirmed';
 
 export type OverallBookingStatus =
@@ -57,6 +58,8 @@ export interface TravelerContactInfo {
   email: string;
   phone: string;
   special_requests?: string;
+  firstName?: string;
+  lastName?: string;
 }
 
 export interface BookingPriceSummary {
@@ -124,6 +127,24 @@ export interface HotelConfirmationRecord {
   status: 'confirmed' | 'voucher_issued';
 }
 
+export interface HotelReconciliationPendingResult {
+  status: 'reconciliation_pending';
+  transaction_id: string;
+  payment_captured: true;
+  reconciliation_pending: true;
+  message: string;
+  confirmation_code?: string;
+  property_name?: string;
+  property_address?: string;
+  room_name?: string;
+  check_in_date?: string;
+  check_out_date?: string;
+  nights_count?: number;
+  cancellation_policy?: string;
+}
+
+export type HotelPaymentResult = HotelConfirmationRecord | HotelReconciliationPendingResult;
+
 export interface TripConfirmationRecord {
   trip_id: string;
   confirmation_id: string;
@@ -165,6 +186,7 @@ export interface IBookingService {
   initiateFlightHandoff(tripId: string, offerId: string): Promise<ExternalCheckoutHandoff>;
   confirmFlightHandoffReturn(tripId: string, handoffToken: string): Promise<FlightConfirmationRecord>;
   prepareHotelBooking(tripId: string, hotelId: string, offerData?: any, guestInfo?: { name?: string; email?: string; firstName?: string; lastName?: string; phone?: string }): Promise<{ required_amount: number; currency: string; prebook_id?: string }>;
+  hasActiveHotelPrebook?(tripId: string): boolean;
   initiateHotelPaymentOrder?(
     tripId: string,
     contact: TravelerContactInfo,
@@ -187,7 +209,9 @@ export interface IBookingService {
     expectedRevisionNumber?: number,
     paymentDetailsOrTravelers?: { transaction_id?: string; razorpay_order_id?: string; razorpay_payment_id?: string; razorpay_signature?: string } | FlightPassenger[],
     allTravelers?: FlightPassenger[]
-  ): Promise<HotelConfirmationRecord>;
+  ): Promise<HotelPaymentResult>;
+  checkPendingHotelTransaction?(tripId: string): Promise<any>;
+  reconcileHotelPayment?(tripId: string, transactionId: string): Promise<HotelPaymentResult>;
   requestCancellation(tripId: string, request: CancellationRequest): Promise<{ ticket_id?: string; status?: string; message: string }>;
   downloadTravelPlanPdf(tripId: string): Promise<void>;
   downloadTicketPdf(transactionId: string, bookingRef?: string): Promise<void>;

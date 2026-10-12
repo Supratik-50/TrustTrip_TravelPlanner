@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -1081,6 +1082,11 @@ class TripRevisionRequest(BaseModel):
     changes: dict[str, Any] | None = None
 
 
+class GenerateRevisionPlanRequest(BaseModel):
+    message: str | None = None
+    query: str | None = None
+
+
 class TripApprovalRequest(BaseModel):
     revision_id: UUID = Field(..., description="Exact revision ID to approve")
     expected_revision_number: int = Field(..., ge=1, description="Expected monotonically increasing revision number")
@@ -1172,6 +1178,131 @@ async def create_trip_revision(
         raise HTTPException(status_code=500, detail="Trip revision failed due to an internal error.")
 
 
+@router.post("/{trip_id}/revisions/{revision_id}/plan")
+async def generate_revision_plan(
+    trip_id: str,
+    revision_id: str,
+    req: GenerateRevisionPlanRequest | None = None,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Synthesize a multi-day itinerary for an active PROPOSED revision without incrementing revision_number."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or does not belong to you.")
+
+    current_rev_id = trip.get("current_revision_id")
+    if not current_rev_id or str(current_rev_id) != str(revision_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Supplied revision {revision_id} does not match active trip revision ({current_rev_id}).",
+        )
+
+    status = trip.get("status")
+    if status not in ("planning", "awaiting_approval"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Cannot generate plan for trip in '{status}' status.",
+        )
+
+    ev_store = EvidenceRevisionStore()
+    target_rev = ev_store.get_revision(revision_id=str(revision_id), user_id=current_user.id)
+    if not target_rev or str(target_rev.trip_id) != str(trip_id):
+        raise HTTPException(status_code=404, detail="Revision not found or does not belong to this trip.")
+
+    if ev_store.get_approval_for_revision(trip_id, str(revision_id)):
+        raise HTTPException(status_code=409, detail="Conflict: Revision is already approved.")
+    if ev_store.get_rejection_for_revision(trip_id, str(revision_id)):
+        raise HTTPException(status_code=409, detail="Conflict: Revision is already rejected.")
+
+    user_message = ((req and (req.message or req.query)) or "").strip()
+    if not user_message:
+        user_message = "Synthesize multi-day itinerary matching the updated travel constraints and dates."
+
+    from services.planner_service import PlannerService
+    try:
+        result = PlannerService().plan_travel(
+            user_input=user_message,
+            thread_id=trip.get("thread_id") or (trip.get("metadata") or {}).get("thread_id"),
+            authenticated_user_id=str(current_user.id),
+            trip_id=str(trip_id),
+        )
+    except Exception as exc:
+        err_msg = str(exc)
+        if "429" in err_msg or "rate limit" in err_msg.lower():
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "success": False,
+                    "error": err_msg,
+                    "retryable": False,
+                    "status_code": 429,
+                },
+            )
+        if "503" in err_msg or "unavailable" in err_msg.lower():
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "error": err_msg,
+                    "retryable": True,
+                    "status_code": 503,
+                },
+                headers={"Retry-After": "5"},
+            )
+        logger.error("PlannerService invocation failed for revision %s: %s", revision_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to synthesize itinerary due to an internal error.")
+
+    planner_success = result.get("success")
+    if planner_success is None:
+        if result.get("guardrail_allowed") is False or result.get("planning_blocked") is True or result.get("error"):
+            planner_success = False
+        else:
+            planner_success = True
+
+    if not planner_success:
+        err_msg = result.get("error") or result.get("guardrail_reason") or "Travel planning failed."
+        outage_code = result.get("status_code") or result.get("outage_status_code")
+        if outage_code in (429, 503):
+            headers = {"Retry-After": "5"} if outage_code == 503 else None
+            return JSONResponse(
+                status_code=outage_code,
+                content={
+                    "success": False,
+                    "error": err_msg,
+                    "retryable": outage_code == 503,
+                    "status_code": outage_code,
+                },
+                headers=headers,
+            )
+        raise HTTPException(status_code=outage_code or 400, detail=err_msg)
+
+    plan_json = result.get("plan_json")
+    raw_plan = str(result.get("answer") or result.get("itinerary") or "")
+    if not plan_json and not raw_plan:
+        raise HTTPException(status_code=500, detail="Planner did not return an itinerary.")
+
+    attached = trip_store.attach_plan_to_revision(
+        trip_id=trip_id,
+        user_id=current_user.id,
+        revision_id=str(revision_id),
+        plan_json=plan_json,
+        raw_plan=raw_plan,
+    )
+
+    return {
+        "success": True,
+        "trip_id": str(trip_id),
+        "revision_id": str(revision_id),
+        "revision_number": int(trip.get("current_revision_number") or 1),
+        "status": "awaiting_approval",
+        "proposal_status": "PROPOSED",
+        "plan_json": plan_json,
+        "itinerary": raw_plan,
+        "trip": attached["trip"],
+    }
+
+
 @router.post("/{trip_id}/approve")
 async def approve_trip(
     trip_id: str,
@@ -1204,6 +1335,120 @@ async def approve_trip(
         )
 
     meta = trip.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    meta = dict(meta)
+
+    # 1. Check HITL status precedence (rejections and duplicate approvals return 409)
+    rejection = ev_store.get_rejection_for_revision(trip_id, str(req.revision_id))
+    if rejection:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Revision {req.revision_id} is already rejected; cannot approve.",
+        )
+    existing_approval = ev_store.get_approval_for_revision(trip_id, str(req.revision_id))
+    if existing_approval:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: Revision {req.revision_id} is already approved.",
+        )
+
+    # 2. Validate that an itinerary corresponds to authoritative constraints/duration
+    constraints = meta.get("constraints") or {}
+    plan = meta.get("plan") or {}
+    raw_plan = meta.get("raw_plan") or ""
+
+    ps = target_rev.plan_snapshot if isinstance(target_rev.plan_snapshot, dict) else {}
+
+    const_start = str(constraints.get("start_date") or constraints.get("departure_date") or meta.get("start_date") or "")[:10]
+    const_end = str(constraints.get("end_date") or constraints.get("return_date") or meta.get("end_date") or "")[:10]
+
+    # Resolve active itinerary plan:
+    # FIRST prefer trips.metadata.plan when it exists, contains a non-empty itinerary, and matches active revision constraints
+    def _is_valid_working_plan(p: Any) -> bool:
+        if not isinstance(p, dict) or not p:
+            return False
+        p_json = p.get("plan_json") if isinstance(p.get("plan_json"), dict) else p
+        itin = (
+            p_json.get("itinerary")
+            or p_json.get("daily_plan")
+            or p.get("itinerary")
+            or p.get("daily_plan")
+            or []
+        )
+        if not itin:
+            return False
+        dep = str(p_json.get("departure_date") or p.get("departure_date") or "")[:10]
+        ret = str(p_json.get("return_date") or p.get("return_date") or "")[:10]
+        if const_start and dep and dep != const_start:
+            return False
+        if const_end and ret and ret != const_end:
+            return False
+        return True
+
+    if _is_valid_working_plan(plan):
+        itinerary_plan = plan
+    else:
+        # Otherwise fallback to immutable revision snapshot hierarchy
+        ps_meta_plan = (ps.get("metadata") or {}).get("plan") if isinstance(ps.get("metadata"), dict) else None
+        itinerary_plan = (
+            (ps.get("plan_json") if isinstance(ps.get("plan_json"), dict) else None)
+            or (ps.get("plan") if isinstance(ps.get("plan"), dict) else None)
+            or (ps_meta_plan if _is_valid_working_plan(ps_meta_plan) else None)
+            or (plan if isinstance(plan, dict) and plan else None)
+            or ps
+        )
+    if not isinstance(itinerary_plan, dict):
+        itinerary_plan = {}
+
+    plan_start = str(
+        itinerary_plan.get("departure_date")
+        or (itinerary_plan.get("plan_json") or {}).get("departure_date")
+        or ""
+    )[:10]
+    plan_end = str(
+        itinerary_plan.get("return_date")
+        or (itinerary_plan.get("plan_json") or {}).get("return_date")
+        or ""
+    )[:10]
+
+    if (const_start or const_end) and (itinerary_plan or raw_plan):
+        if const_start and plan_start and const_start != plan_start:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot approve revision: Plan departure date ({plan_start}) does not match updated trip constraints ({const_start}). Please generate a revised plan before approving.",
+            )
+        if const_end and plan_end and const_end != plan_end:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot approve revision: Plan return date ({plan_end}) does not match updated trip constraints ({const_end}). Please generate a revised plan before approving.",
+            )
+        if target_rev.parent_revision_id and const_start and const_end:
+            try:
+                from datetime import date
+                d1 = date.fromisoformat(const_start)
+                d2 = date.fromisoformat(const_end)
+                req_days = (d2 - d1).days
+                itinerary = (
+                    (itinerary_plan.get("plan_json") or {}).get("itinerary")
+                    or (itinerary_plan.get("plan_json") or {}).get("daily_plan")
+                    or itinerary_plan.get("itinerary")
+                    or itinerary_plan.get("daily_plan")
+                    or []
+                )
+                if itinerary and len(itinerary) not in (req_days, req_days + 1):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot approve revision: Plan duration ({len(itinerary)} days) does not match updated trip duration ({req_days} or {req_days + 1} days). Please generate a revised plan before approving.",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
     now_iso = datetime.now(timezone.utc).isoformat()
     meta["approved_at"] = now_iso
 
