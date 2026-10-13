@@ -648,14 +648,42 @@ async def reconcile_hotel_payment(
         rz = RazorpayService()
         refund_res = None
         refund_err = None
-        try:
-            refund_res = rz.refund(
-                payment_id=pending.get("razorpay_payment_id"),
-                amount_rupees=float(pending["amount_inr"]),
-                idempotency_key=f"ref_ht_{transaction_id.replace('-', '')[:32]}",
-            )
-        except Exception as rz_exc:
-            refund_err = str(rz_exc)
+        pay_id = pending.get("razorpay_payment_id")
+
+        # Reconcile provider status first: check if refund was already processed at gateway
+        if pay_id:
+            try:
+                pay_obj = rz.fetch_payment(pay_id)
+                if pay_obj and (pay_obj.get("refund_status") == "full" or float(pay_obj.get("amount_refunded", 0)) >= float(pending["amount_inr"]) * 100):
+                    rf_id = None
+                    try:
+                        rf_list = rz._request("GET", f"/payments/{pay_id}/refunds", retry_network=True)
+                        items = rf_list.get("items", [])
+                        if items:
+                            rf_id = items[0].get("id")
+                    except Exception:
+                        pass
+                    refund_res = {"id": rf_id or f"ref_{transaction_id.replace('-', '')[:24]}", "status": "processed"}
+            except Exception:
+                pass
+
+        if not refund_res and pay_id:
+            try:
+                refund_res = rz.refund(
+                    payment_id=pay_id,
+                    amount_rupees=float(pending["amount_inr"]),
+                    idempotency_key=f"ref_ht_{transaction_id.replace('-', '')[:32]}",
+                )
+            except Exception as rz_exc:
+                refund_err = str(rz_exc)
+                # Reconcile ambiguity on timeout or error: verify provider status
+                try:
+                    pay_obj = rz.fetch_payment(pay_id)
+                    if pay_obj and (pay_obj.get("refund_status") == "full" or float(pay_obj.get("amount_refunded", 0)) >= float(pending["amount_inr"]) * 100):
+                        refund_res = {"id": f"ref_{transaction_id.replace('-', '')[:24]}", "status": "processed"}
+                        refund_err = None
+                except Exception:
+                    pass
 
         if refund_res and str(refund_res.get("status", "")).lower() in {"processed", "captured", "refunded"}:
             store.update(
@@ -779,14 +807,41 @@ async def reconcile_hotel_payment(
             rz = RazorpayService()
             refund_res = None
             refund_err = None
-            try:
-                refund_res = rz.refund(
-                    payment_id=pending.get("razorpay_payment_id"),
-                    amount_rupees=float(pending["amount_inr"]),
-                    idempotency_key=f"ref_ht_{transaction_id.replace('-', '')[:32]}",
-                )
-            except Exception as rz_exc:
-                refund_err = str(rz_exc)
+            pay_id = pending.get("razorpay_payment_id")
+
+            # Check provider status first in case refund was already dispatched
+            if pay_id:
+                try:
+                    pay_obj = rz.fetch_payment(pay_id)
+                    if pay_obj and (pay_obj.get("refund_status") == "full" or float(pay_obj.get("amount_refunded", 0)) >= float(pending["amount_inr"]) * 100):
+                        rf_id = None
+                        try:
+                            rf_list = rz._request("GET", f"/payments/{pay_id}/refunds", retry_network=True)
+                            items = rf_list.get("items", [])
+                            if items:
+                                rf_id = items[0].get("id")
+                        except Exception:
+                            pass
+                        refund_res = {"id": rf_id or f"ref_{transaction_id.replace('-', '')[:24]}", "status": "processed"}
+                except Exception:
+                    pass
+
+            if not refund_res and pay_id:
+                try:
+                    refund_res = rz.refund(
+                        payment_id=pay_id,
+                        amount_rupees=float(pending["amount_inr"]),
+                        idempotency_key=f"ref_ht_{transaction_id.replace('-', '')[:32]}",
+                    )
+                except Exception as rz_exc:
+                    refund_err = str(rz_exc)
+                    try:
+                        pay_obj = rz.fetch_payment(pay_id)
+                        if pay_obj and (pay_obj.get("refund_status") == "full" or float(pay_obj.get("amount_refunded", 0)) >= float(pending["amount_inr"]) * 100):
+                            refund_res = {"id": f"ref_{transaction_id.replace('-', '')[:24]}", "status": "processed"}
+                            refund_err = None
+                    except Exception:
+                        pass
 
             if refund_res and str(refund_res.get("status", "")).lower() in {"processed", "captured", "refunded"}:
                 store.update(

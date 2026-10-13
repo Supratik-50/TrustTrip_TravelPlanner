@@ -195,6 +195,7 @@ def test_reconcile_recovers_unprocessed_refund_deterministically():
     }
 
     with patch.object(HotelTransactionStore, "get", return_value=tx_data), \
+         patch.object(RazorpayService, "fetch_payment", return_value={"id": "pay_inc_1", "refund_status": None, "amount_refunded": 0}), \
          patch.object(RazorpayService, "refund", return_value=mock_refund_result) as mock_refund_call, \
          patch.object(HotelTransactionStore, "update") as mock_update:
 
@@ -217,6 +218,57 @@ def test_reconcile_recovers_unprocessed_refund_deterministically():
         assert mock_update.call_args.args[0] == tx_id
         assert mock_update.call_args.kwargs["payment_status"] == "refunded"
         assert mock_update.call_args.kwargs["booking_json"]["refund"]["id"] == "rfnd_test_recovered"
+
+
+def test_reconcile_recovers_already_processed_refund_without_dispatch():
+    client, user = _auth_user("already_ref@example.com")
+    tx_id = str(uuid4())
+    trip_id = str(uuid4())
+
+    tx_data = {
+        "id": tx_id,
+        "customer_ref": str(user["id"]),
+        "trip_id": trip_id,
+        "razorpay_order_id": "order_inc_2",
+        "razorpay_payment_id": "pay_inc_2",
+        "payment_status": "refund_pending",
+        "booking_status": "booking_failed",
+        "amount_inr": 21817.91,
+        "currency": "INR",
+        "error": "Supplier confirmed no booking exists. Refund pending: unprocessed",
+    }
+
+    mock_payment_obj = {
+        "id": "pay_inc_2",
+        "status": "refunded",
+        "refund_status": "full",
+        "amount_refunded": 2181791,
+    }
+
+    mock_refunds_list = {
+        "items": [
+            {"id": "rfnd_gateway_authoritative", "status": "processed", "amount": 2181791}
+        ]
+    }
+
+    with patch.object(HotelTransactionStore, "get", return_value=tx_data), \
+         patch.object(RazorpayService, "fetch_payment", return_value=mock_payment_obj), \
+         patch.object(RazorpayService, "_request", return_value=mock_refunds_list), \
+         patch.object(RazorpayService, "refund") as mock_refund_call, \
+         patch.object(HotelTransactionStore, "update") as mock_update:
+
+        resp = client.post(f"/api/hotel-payments/{tx_id}/reconcile")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["refunded"] is True
+        assert data["status"] == "refunded"
+        assert data["refund_id"] == "rfnd_gateway_authoritative"
+        mock_refund_call.assert_not_called()
+
+        mock_update.assert_called_once()
+        assert mock_update.call_args.args[0] == tx_id
+        assert mock_update.call_args.kwargs["payment_status"] == "refunded"
+        assert mock_update.call_args.kwargs["booking_json"]["refund"]["id"] == "rfnd_gateway_authoritative"
 
 
 def test_get_by_trip_returns_refund_pending_and_prioritizes():
