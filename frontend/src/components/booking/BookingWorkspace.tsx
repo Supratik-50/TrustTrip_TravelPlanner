@@ -313,21 +313,47 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
               status: 'voucher_issued',
             };
             setHotelConfirmation(hotelConf);
-          } else if (res.hotel.status === 'reconciliation_pending' || res.hotel.reconciliation_pending) {
+          } else if (
+            res.hotel.status === 'reconciliation_pending' ||
+            res.hotel.reconciliation_pending ||
+            res.hotel.refund_pending ||
+            res.hotel.payment_status === 'refund_pending' ||
+            (res.hotel.is_captured && !res.hotel.is_booked && res.hotel.payment_status !== 'refunded')
+          ) {
             setHotelState('reconciliation_pending');
             setPendingHotelTransactionId(res.hotel.transaction_id);
           } else if (res.hotel.in_progress || res.hotel.status === 'booking_in_progress') {
             setHotelState('booking_in_progress');
           }
-        } else if (bookingService.checkPendingHotelTransaction) {
+        }
+
+        if (!hasConfirmedHotel && bookingService.checkPendingHotelTransaction) {
           bookingService.checkPendingHotelTransaction(trip.trip_id).then((pTx: any) => {
             if (pTx) {
-              if (pTx.booking_status === 'booked' && pTx.booking) {
+              if (pTx.booking_status === 'booked' && (pTx.booking || pTx.confirmation_code)) {
                 setHotelState('confirmed');
-                setHotelConfirmation(pTx.booking);
-              } else if (pTx.reconciliation_pending || pTx.booking_status === 'reconciliation_pending') {
+                setHotelConfirmation(pTx.booking || {
+                  transaction_id: pTx.transaction_id,
+                  property_name: pTx.hotel_name || 'Confirmed Hotel',
+                  confirmation_code: pTx.confirmation_code || pTx.transaction_id,
+                  room_name: pTx.room_name || 'Standard Room',
+                  check_in_date: pTx.check_in || trip.start_date || '',
+                  check_out_date: pTx.check_out || trip.end_date || '',
+                  total_price: pTx.amount_inr || 0,
+                  currency: pTx.currency || 'INR',
+                  status: 'voucher_issued',
+                });
+              } else if (
+                pTx.reconciliation_pending ||
+                pTx.booking_status === 'reconciliation_pending' ||
+                pTx.booking_status === 'reconciliation_in_progress' ||
+                pTx.refund_pending ||
+                pTx.payment_status === 'refund_pending' ||
+                pTx.payment_status === 'refund_failed' ||
+                (pTx.is_captured && pTx.booking_status !== 'booked' && pTx.payment_status !== 'refunded')
+              ) {
                 setHotelState('reconciliation_pending');
-                setPendingHotelTransactionId(pTx.transaction_id);
+                setPendingHotelTransactionId(pTx.transaction_id || pTx.id);
               }
             }
           }).catch(() => {});

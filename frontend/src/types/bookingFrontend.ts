@@ -128,11 +128,13 @@ export interface HotelConfirmationRecord {
 }
 
 export interface HotelReconciliationPendingResult {
-  status: 'reconciliation_pending';
-  transaction_id: string;
-  payment_captured: true;
-  reconciliation_pending: true;
-  message: string;
+  status: 'reconciliation_pending' | 'refund_pending' | 'refunded';
+  transaction_id?: string;
+  payment_captured?: boolean;
+  reconciliation_pending?: boolean;
+  refund_pending?: boolean;
+  refunded?: boolean;
+  message?: string;
   confirmation_code?: string;
   property_name?: string;
   property_address?: string;

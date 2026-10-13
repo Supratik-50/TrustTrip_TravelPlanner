@@ -993,6 +993,31 @@ export class TrustTripBookingService implements IBookingService {
       };
     }
 
+    if (recRes.refunded || recRes.status === 'refunded') {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.removeItem(`tt_pending_hotel_tx_${tripId}`);
+        }
+      } catch (e) {}
+      this.activeHotelTransactions.delete(tripId);
+      return {
+        status: 'refunded',
+        refunded: true,
+        message: recRes.error || recRes.message || 'Supplier confirmed no booking exists. Payment has been refunded.',
+      } as any;
+    }
+
+    if (recRes.refund_pending || recRes.status === 'refund_pending') {
+      return {
+        status: 'refund_pending',
+        transaction_id: transactionId,
+        payment_captured: true,
+        refund_pending: true,
+        reconciliation_pending: true,
+        message: recRes.error || recRes.message || 'Supplier confirmed no booking exists. Refund is currently processing.',
+      };
+    }
+
     if (recRes.reconciliation_pending || (recRes.payment_captured && !recRes.success && !recRes.refunded)) {
       return {
         status: 'reconciliation_pending',
@@ -1001,16 +1026,6 @@ export class TrustTripBookingService implements IBookingService {
         reconciliation_pending: true,
         message: recRes.error || 'Payment received — reservation verification in progress with supplier.',
       };
-    }
-
-    if (recRes.refunded) {
-      try {
-        if (typeof sessionStorage !== 'undefined') {
-          sessionStorage.removeItem(`tt_pending_hotel_tx_${tripId}`);
-        }
-      } catch (e) {}
-      this.activeHotelTransactions.delete(tripId);
-      throw new Error(recRes.error || 'Supplier confirmed no booking exists. Payment has been refunded.');
     }
 
     throw new Error(recRes.error || 'Unable to reconcile hotel payment status.');
@@ -1022,7 +1037,18 @@ export class TrustTripBookingService implements IBookingService {
   async checkPendingHotelTransaction(tripId: string): Promise<any | null> {
     try {
       const res = await api.getHotelPaymentByTrip(tripId);
-      return res?.transaction || null;
+      if (res?.has_payment && (res.transaction || res.transaction_id)) {
+        return {
+          ...(res.transaction || {}),
+          transaction_id: res.transaction_id || res.transaction?.id,
+          reconciliation_pending: res.reconciliation_pending,
+          refund_pending: res.refund_pending,
+          is_captured: res.is_captured,
+          payment_status: res.payment_status || res.transaction?.payment_status,
+          booking_status: res.booking_status || res.transaction?.booking_status,
+        };
+      }
+      return null;
     } catch (e) {
       return null;
     }

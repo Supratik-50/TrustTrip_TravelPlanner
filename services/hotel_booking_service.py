@@ -144,9 +144,24 @@ class HotelBookingService:
                 "A simulated prebook cannot be used for real payment order creation."
             )
 
-        # 5. Create transaction and payment order
-        tx_id = str(uuid.uuid4())
+        # 5. Check for outstanding captured / pending / refunding transactions on this trip
         effective_customer_ref = str(user_id) if user_id else (customer_ref or "guest")
+        if trip_id:
+            existing_txs = self.tx_store.get_by_trip(str(trip_id), customer_ref=effective_customer_ref)
+            for etx in existing_txs:
+                if etx.get("payment_idempotency_key") == payment_idempotency_key:
+                    continue
+                etx_b = str(etx.get("booking_status") or "").lower()
+                etx_p = str(etx.get("payment_status") or "").lower()
+                if etx_b == "booked":
+                    raise ValueError("Hotel booking has already been confirmed for this trip.")
+                if etx_b in {"reconciliation_pending", "reconciliation_in_progress", "booking_in_progress"} or etx_p == "captured":
+                    raise ValueError("A payment for this hotel stay has already been captured and is pending verification. Please check confirmation status before initiating another order.")
+                if etx_p in {"refund_pending", "refund_failed"}:
+                    raise ValueError("A previous payment refund for this hotel stay is currently being processed. New payment cannot be initiated until earlier refund is resolved.")
+
+        # Create transaction and payment order
+        tx_id = str(uuid.uuid4())
 
         order_id = None
         key_id = "test_key"

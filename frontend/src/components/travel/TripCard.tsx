@@ -249,7 +249,7 @@ export const TripCard: React.FC<TripCardProps> = ({
                   </div>
                 );
               })}
-              {trip.hotels?.map((h: any) => (
+              {trip.hotels?.filter((h: any) => !h.booking_status || h.booking_status === 'booked').map((h: any) => (
                 <div key={h.id} className="flex items-center justify-between text-[11px] bg-[var(--surface-subtle)] px-2 py-1 rounded">
                   <span className="flex items-center gap-1 font-mono text-[var(--status-success)]">
                     <CheckCircle2 className="w-3 h-3" />

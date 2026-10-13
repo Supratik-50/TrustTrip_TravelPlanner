@@ -307,6 +307,10 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                         }, 1200);
                         return;
                       }
+                      if (recRes?.status === 'refund_pending' || recRes?.refund_pending || recRes?.requires_refund) {
+                        setErrorMessage(recRes.message || recRes.error || 'Supplier confirmed no booking exists. A refund has been requested and is currently processing.');
+                        return;
+                      }
                       if (recRes?.status === 'reconciliation_pending' || recRes?.reconciliation_pending) {
                         setErrorMessage(recRes.message || 'Verification is still in progress with supplier. Please check again in a few moments.');
                         return;

@@ -201,6 +201,20 @@ async def create_order(
         raise HTTPException(status_code=503, detail="Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.")
     effective_customer_ref = str(current_user.id)
     store = HotelTransactionStore()
+    if req.trip_id:
+        existing_txs = store.get_by_trip(str(req.trip_id), customer_ref=effective_customer_ref)
+        for etx in existing_txs:
+            if etx.get("payment_idempotency_key") == req.payment_idempotency_key:
+                continue
+            etx_b = str(etx.get("booking_status") or "").lower()
+            etx_p = str(etx.get("payment_status") or "").lower()
+            if etx_b == "booked":
+                raise HTTPException(status_code=409, detail="Hotel booking has already been confirmed for this trip.")
+            if etx_b in {"reconciliation_pending", "reconciliation_in_progress", "booking_in_progress"} or etx_p == "captured":
+                raise HTTPException(status_code=409, detail="A payment for this hotel stay has already been captured and is pending verification. Please check confirmation status before initiating another order.")
+            if etx_p in {"refund_pending", "refund_failed"}:
+                raise HTTPException(status_code=409, detail="A previous payment refund for this hotel stay is currently being processed. New payment cannot be initiated until earlier refund is resolved.")
+
     tx_id = str(uuid.uuid4())
     try:
         reservation = store.reserve_payment_order(
@@ -503,18 +517,44 @@ async def get_hotel_payment_by_trip(
     store = HotelTransactionStore()
     txs = store.get_by_trip(trip_id, customer_ref=str(current_user.id))
     if not txs:
-        return {"transaction": None}
-    latest = txs[0]
+        return {"has_payment": False, "transaction": None}
+
+    # Prioritize: 1) booked, 2) captured/reconciling, 3) refund_pending/refund_failed, 4) newest
+    def _rank(t):
+        b = str(t.get("booking_status") or "").lower()
+        p = str(t.get("payment_status") or "").lower()
+        if b == "booked":
+            return 4
+        if b in {"reconciliation_pending", "reconciliation_in_progress", "booking_in_progress"} or p == "captured":
+            return 3
+        if p in {"refund_pending", "refund_failed"}:
+            return 2
+        return 1
+
+    ranked = sorted(txs, key=_rank, reverse=True)
+    latest = ranked[0]
     b_status = str(latest.get("booking_status") or "").lower()
     p_status = str(latest.get("payment_status") or "").lower()
-    is_captured = p_status == "captured" or b_status in {"payment_captured", "booking_in_progress", "reconciliation_pending", "reconciliation_in_progress", "booked"}
+    is_captured = p_status in {"captured", "refund_pending", "refund_failed"} or b_status in {
+        "payment_captured", "booking_in_progress", "reconciliation_pending", "reconciliation_in_progress", "booked"
+    }
+    is_refund_pending = p_status in {"refund_pending", "refund_failed"}
     return {
+        "has_payment": True,
+        "transaction_id": latest["id"],
+        "payment_status": latest.get("payment_status"),
+        "booking_status": latest.get("booking_status"),
+        "is_captured": is_captured,
+        "reconciliation_pending": b_status in {"reconciliation_pending", "reconciliation_in_progress"},
+        "refund_pending": is_refund_pending,
         "transaction": {
             "transaction_id": latest["id"],
+            "id": latest["id"],
             "payment_status": latest.get("payment_status"),
             "booking_status": latest.get("booking_status"),
             "payment_captured": is_captured,
             "reconciliation_pending": b_status in {"reconciliation_pending", "reconciliation_in_progress"},
+            "refund_pending": is_refund_pending,
             "booking": latest.get("booking_json") if b_status == "booked" else None,
             "amount_inr": float(latest.get("amount_inr") or 0),
             "refunded": p_status == "refunded",
@@ -539,7 +579,10 @@ async def get_hotel_payment_status(
 
     b_status = str(tx.get("booking_status") or "").lower()
     p_status = str(tx.get("payment_status") or "").lower()
-    is_captured = p_status == "captured" or b_status in {"payment_captured", "booking_in_progress", "reconciliation_pending", "reconciliation_in_progress", "booked"}
+    is_captured = p_status in {"captured", "refund_pending", "refund_failed"} or b_status in {
+        "payment_captured", "booking_in_progress", "reconciliation_pending", "reconciliation_in_progress", "booked"
+    }
+    is_refund_pending = p_status in {"refund_pending", "refund_failed"}
 
     return {
         "transaction_id": transaction_id,
@@ -547,6 +590,7 @@ async def get_hotel_payment_status(
         "booking_status": tx.get("booking_status"),
         "payment_captured": is_captured,
         "reconciliation_pending": b_status in {"reconciliation_pending", "reconciliation_in_progress"},
+        "refund_pending": is_refund_pending,
         "booking": tx.get("booking_json") if b_status == "booked" else None,
         "amount_inr": float(tx.get("amount_inr") or 0),
         "refunded": p_status == "refunded",
@@ -598,6 +642,57 @@ async def reconcile_hotel_payment(
             "requires_refund": False,
             "error": pending.get("error") or "Supplier confirmed no booking exists. Payment has been refunded.",
         }
+
+    # Fast path 3: if booking confirmed absent but refund is pending or failed, retry/reconcile refund
+    if p_status in {"refund_pending", "refund_failed"} and b_status == "booking_failed":
+        rz = RazorpayService()
+        refund_res = None
+        refund_err = None
+        try:
+            refund_res = rz.refund(
+                payment_id=pending.get("razorpay_payment_id"),
+                amount_rupees=float(pending["amount_inr"]),
+                idempotency_key=f"ref_ht_{transaction_id.replace('-', '')[:32]}",
+            )
+        except Exception as rz_exc:
+            refund_err = str(rz_exc)
+
+        if refund_res and str(refund_res.get("status", "")).lower() in {"processed", "captured", "refunded"}:
+            store.update(
+                transaction_id,
+                payment_status="refunded",
+                booking_status="booking_failed",
+                booking_json={"refund": refund_res},
+                error=f"Supplier confirmed no booking exists. Payment refunded: {refund_res.get('id')}",
+            )
+            return {
+                "success": False,
+                "status": "refunded",
+                "booking_status": "booking_failed",
+                "transaction_id": transaction_id,
+                "payment_captured": True,
+                "refunded": True,
+                "refund_id": refund_res.get("id"),
+                "requires_refund": False,
+                "error": "Supplier confirmed no booking exists. Payment has been refunded.",
+            }
+        else:
+            store.update(
+                transaction_id,
+                payment_status="refund_failed" if refund_err else "refund_pending",
+                booking_status="booking_failed",
+                error=f"Supplier confirmed no booking exists. Refund pending: {refund_err or 'unprocessed'}",
+            )
+            return {
+                "success": False,
+                "status": "refund_failed" if refund_err else "refund_pending",
+                "booking_status": "booking_failed",
+                "transaction_id": transaction_id,
+                "payment_captured": True,
+                "refunded": False,
+                "requires_refund": True,
+                "error": f"Supplier confirmed no booking exists, but refund could not be completed immediately: {refund_err or 'unprocessed'}.",
+            }
 
     # Atomic concurrency guard: serialize reconciliation execution across workers
     claimed_tx = store.claim_reconciliation(transaction_id)

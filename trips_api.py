@@ -115,6 +115,8 @@ async def list_trips(
 
     hotels_by_trip: dict[str, list[dict[str, Any]]] = {}
     for h in hotels:
+        if str(h.get("booking_status") or "").lower() != "booked":
+            continue
         tid = str(h.get("trip_id") or "")
         if tid:
             hotels_by_trip.setdefault(tid, []).append(h)
