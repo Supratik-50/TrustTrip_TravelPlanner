@@ -143,6 +143,43 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
     );
   }
 
+  // 1C. REFUNDED STATE
+  if (hotelState === 'refunded') {
+    return (
+      <div className="p-6 sm:p-8 rounded-3xl bg-[var(--surface)] border border-emerald-500/40 shadow-xs space-y-4" data-testid="hotel-panel-refunded">
+        <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] pb-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              <span className="text-xs uppercase font-mono tracking-widest text-emerald-600 font-bold">
+                RESERVATION CANCELLED — REFUND PROCESSED
+              </span>
+            </div>
+            <h3 className="text-xl sm:text-2xl font-bold font-editorial text-[var(--text-primary)]">
+              {hotel?.name || 'Stay Reservation'}
+            </h3>
+          </div>
+        </div>
+
+        <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+          The property confirmed no booking exists. Your payment has been fully refunded to your original payment method.
+        </p>
+
+        <div className="flex justify-end pt-2">
+          <Button
+            variant="outline"
+            size="md"
+            onClick={onSelectOtherHotel}
+            rightIcon={<ArrowRight className="w-4 h-4" />}
+            className="shadow-xs"
+          >
+            Select alternative stay
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   // 2. PAYMENT REQUIRED STATE
   if (hotelState === 'payment_required') {
     return (

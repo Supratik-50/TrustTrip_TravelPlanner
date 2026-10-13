@@ -69,7 +69,7 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
   onInitiateOrder,
 }) => {
   const [paymentMethod, setPaymentMethod] = useState<'card' | 'upi' | 'netbanking' | 'pay_at_property'>('card');
-  const [processingState, setProcessingState] = useState<'idle' | 'processing' | 'success' | 'failed' | 'reconciliation_pending'>(
+  const [processingState, setProcessingState] = useState<'idle' | 'processing' | 'success' | 'failed' | 'reconciliation_pending' | 'refunded'>(
     initialReconciliationPending ? 'reconciliation_pending' : 'idle'
   );
   const [activeTransactionId, setActiveTransactionId] = useState<string | null>(initialTransactionId || null);
@@ -316,8 +316,8 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                         return;
                       }
                       if (recRes?.status === 'refunded' || recRes?.refunded) {
-                        setProcessingState('failed');
-                        setErrorMessage('Supplier confirmed no reservation could be made. Your payment has been refunded.');
+                        setProcessingState('refunded');
+                        setErrorMessage(recRes.message || 'Supplier confirmed no reservation could be made. Your payment has been refunded.');
                         return;
                       }
                     }
@@ -329,6 +329,36 @@ export const PaymentReviewModal: React.FC<PaymentReviewModalProps> = ({
                 }}
               >
                 {reconciling ? 'Checking...' : 'Check Confirmation Status'}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* REFUNDED STATE */}
+        {processingState === 'refunded' && (
+          <div className="space-y-4 py-4" data-testid="payment-modal-refunded">
+            <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-xs space-y-2">
+              <div className="flex items-center gap-1.5 font-bold font-mono text-emerald-600">
+                <CheckCircle2 className="w-4 h-4" />
+                Refund Processed
+              </div>
+              <p className="text-[var(--text-primary)] leading-relaxed">
+                {errorMessage || 'Supplier confirmed no booking exists. Your payment has been fully refunded to your original payment method.'}
+              </p>
+              {activeTransactionId && (
+                <div className="text-[11px] font-mono text-[var(--text-secondary)] pt-1">
+                  Transaction Reference: <span className="font-semibold text-[var(--text-primary)]">{activeTransactionId}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <Button
+                variant="outline"
+                size="md"
+                onClick={onClose}
+              >
+                Close
               </Button>
             </div>
           </div>

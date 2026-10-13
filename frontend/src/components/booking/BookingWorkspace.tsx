@@ -322,6 +322,9 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
           ) {
             setHotelState('reconciliation_pending');
             setPendingHotelTransactionId(res.hotel.transaction_id);
+          } else if (res.hotel.status === 'refunded' || res.hotel.payment_status === 'refunded') {
+            setHotelState('refunded');
+            setPendingHotelTransactionId(undefined);
           } else if (res.hotel.in_progress || res.hotel.status === 'booking_in_progress') {
             setHotelState('booking_in_progress');
           }
@@ -354,6 +357,9 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
               ) {
                 setHotelState('reconciliation_pending');
                 setPendingHotelTransactionId(pTx.transaction_id || pTx.id);
+              } else if (pTx.payment_status === 'refunded' || pTx.refunded) {
+                setHotelState('refunded');
+                setPendingHotelTransactionId(undefined);
               }
             }
           }).catch(() => {});

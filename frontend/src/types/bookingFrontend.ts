@@ -41,7 +41,8 @@ export type HotelBookingState =
   | 'payment_failed'
   | 'booking_in_progress'
   | 'reconciliation_pending'
-  | 'confirmed';
+  | 'confirmed'
+  | 'refunded';
 
 export type OverallBookingStatus =
   | 'planning'

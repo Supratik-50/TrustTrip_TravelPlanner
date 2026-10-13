@@ -158,11 +158,17 @@ async function runTests() {
       'BookingWorkspace must guard handleInitiateHotelOrder against pending transactions'
     );
 
+    // 4. Must set hotelState to refunded when transaction is refunded
+    assert.ok(
+      workspaceSource.includes("setHotelState('refunded')"),
+      'BookingWorkspace must set hotelState to refunded when transaction is refunded'
+    );
+
     console.log('✔ Test 4: BookingWorkspace static audit confirms rehydration and duplicate-order guards');
   }
 
   // --------------------------------------------------------------------------
-  // Test 5: PaymentReviewModal static audit — refund_pending handling
+  // Test 5: PaymentReviewModal static audit — refund_pending and refunded handling
   // --------------------------------------------------------------------------
   {
     const modalPath = path.resolve(__dirname, '../components/booking/PaymentReviewModal.tsx');
@@ -176,6 +182,11 @@ async function runTests() {
     assert.ok(
       modalSource.includes("recRes?.status === 'refunded'"),
       'PaymentReviewModal must handle confirmed refunded reconciliation status'
+    );
+
+    assert.ok(
+      modalSource.includes('data-testid="payment-modal-refunded"'),
+      'PaymentReviewModal must render Refund Processed view'
     );
 
     console.log('✔ Test 5: PaymentReviewModal static audit confirms refund reconciliation handling');
@@ -194,6 +205,26 @@ async function runTests() {
     );
 
     console.log('✔ Test 6: TripCard static audit confirms only confirmed hotel bookings display voucher button');
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 7: HotelBookingPanel static audit — refunded view
+  // --------------------------------------------------------------------------
+  {
+    const panelPath = path.resolve(__dirname, '../components/booking/HotelBookingPanel.tsx');
+    const panelSource = fs.readFileSync(panelPath, 'utf8');
+
+    assert.ok(
+      panelSource.includes('data-testid="hotel-panel-refunded"'),
+      'HotelBookingPanel must render Refund Processed view'
+    );
+
+    assert.ok(
+      panelSource.includes('RESERVATION CANCELLED — REFUND PROCESSED'),
+      'HotelBookingPanel must display reservation cancelled refund processed banner'
+    );
+
+    console.log('✔ Test 7: HotelBookingPanel static audit confirms Refund Processed view');
   }
 
   global.fetch = originalFetch;
