@@ -173,6 +173,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   const travelersCount = Math.max(1, Math.min(9, trip.travelers_count || 1));
   const [travelers, setTravelers] = useState<FlightPassenger[]>([]);
   const [isTravelerModalOpen, setIsTravelerModalOpen] = useState(false);
+  const [isCompletingPayment, setIsCompletingPayment] = useState(false);
 
   // Traveler validation helper
   const isTravelerValid = (p?: FlightPassenger): boolean => {
@@ -207,7 +208,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   );
 
   const selectedFlight = trip.selected_flight_offer as FlightOffer | undefined;
-  const selectedHotel = trip.selected_hotel_offer as HotelOffer | undefined;
+  const selectedHotel = (trip.selected_hotel_offer || (trip.metadata as any)?.selected_hotel) as HotelOffer | undefined;
 
   // Load canonical state on mount & synchronize from backend trip
   const syncFromStorage = useCallback(() => {
@@ -240,6 +241,17 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     setFlightConfirmation(undefined);
     setHotelState(saved.hotelState === 'confirmed' ? 'idle' : (saved.hotelState || 'idle'));
     setHotelConfirmation(undefined);
+
+    // Rehydrate authoritative hotel prebook from trip metadata for seamless continuity after refresh
+    const prebookMeta = (trip.metadata as any)?.hotel_prebook;
+    if ((prebookMeta && prebookMeta.prebook_id) || (bookingService.hasActiveHotelPrebook && bookingService.hasActiveHotelPrebook(trip.trip_id, trip.metadata))) {
+      if (prebookMeta) {
+        bookingService.setPrebookData?.(trip.trip_id, prebookMeta, selectedHotel);
+      }
+      if (!saved.hotelState || saved.hotelState === 'idle') {
+        setHotelState('payment_required');
+      }
+    }
 
     // Authoritative Server-Driven Rehydration (Wave 3B)
     bookingService.getTripBookings(trip.trip_id)
@@ -309,9 +321,14 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
           }
         } else if (bookingService.checkPendingHotelTransaction) {
           bookingService.checkPendingHotelTransaction(trip.trip_id).then((pTx: any) => {
-            if (pTx && (pTx.reconciliation_pending || pTx.booking_status === 'reconciliation_pending')) {
-              setHotelState('reconciliation_pending');
-              setPendingHotelTransactionId(pTx.transaction_id);
+            if (pTx) {
+              if (pTx.booking_status === 'booked' && pTx.booking) {
+                setHotelState('confirmed');
+                setHotelConfirmation(pTx.booking);
+              } else if (pTx.reconciliation_pending || pTx.booking_status === 'reconciliation_pending') {
+                setHotelState('reconciliation_pending');
+                setPendingHotelTransactionId(pTx.transaction_id);
+              }
             }
           }).catch(() => {});
         }
@@ -836,30 +853,50 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
   // Prepare Hotel Booking
   const handlePrepareHotel = async () => {
+    const curHotel = (trip.selected_hotel_offer || (trip.metadata as any)?.selected_hotel) as HotelOffer | undefined;
+    if (!curHotel) {
+      const err = new Error('No hotel selected for this trip. Please select a stay from the Stays tab first.');
+      notify(err.message, 'warning', 'Stay Required');
+      throw err;
+    }
+
     const lead = travelers[0];
-    const guestInfo = lead && lead.given_name?.trim()
-      ? {
-          firstName: lead.given_name.trim(),
-          lastName: lead.family_name?.trim() || '',
-          email: (lead.email && lead.email.trim() !== '') ? lead.email.trim() : (currentUser?.email || ''),
-          phone: lead.phone_number?.trim() || '',
-        }
-      : undefined;
+    if (!lead || !lead.given_name?.trim() || !lead.family_name?.trim()) {
+      setIsTravelerModalOpen(true);
+      const err = new Error('Please enter passenger details before preparing the hotel reservation.');
+      notify(err.message, 'warning', 'Traveler Details Required');
+      throw err;
+    }
 
-    const offerPayload = selectedHotel ? {
-      ...selectedHotel,
-      check_in_date: selectedHotel.check_in_date || trip.start_date,
-      check_out_date: selectedHotel.check_out_date || trip.end_date,
-    } : undefined;
+    const guestInfo = {
+      firstName: lead.given_name.trim(),
+      lastName: lead.family_name.trim(),
+      email: (lead.email && lead.email.trim() !== '') ? lead.email.trim() : (currentUser?.email || ''),
+      phone: lead.phone_number?.trim() || '',
+    };
 
-    await bookingService.prepareHotelBooking(
-      trip.trip_id,
-      selectedHotel?.id || selectedHotel?.snapshot_id || '',
-      offerPayload,
-      guestInfo
-    );
-    setHotelState('payment_required');
-    notify('Stay reservation prepared. Ready for payment confirmation.', 'info', 'Reservation Prepared');
+    const snapId = curHotel.snapshot_id || (trip.metadata as any)?.selected_hotel_snapshot_id || curHotel.id || '';
+
+    const offerPayload = {
+      ...curHotel,
+      check_in_date: curHotel.check_in_date || (curHotel as any).checkin || trip.start_date,
+      check_out_date: curHotel.check_out_date || (curHotel as any).checkout || trip.end_date,
+      snapshot_id: snapId,
+    };
+
+    try {
+      await bookingService.prepareHotelBooking(
+        trip.trip_id,
+        snapId,
+        offerPayload,
+        guestInfo
+      );
+      setHotelState('payment_required');
+      notify('Stay reservation prepared. Ready for payment confirmation.', 'info', 'Reservation Prepared');
+    } catch (err: any) {
+      notify(err.message || 'Failed to prepare hotel reservation with supplier.', 'error', 'Reservation Error');
+      throw err;
+    }
   };
 
   // Initiate Hotel Payment Order (Razorpay)
@@ -887,7 +924,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
 
     // Continuity: If an authoritative hotel prebook is not active in this session,
     // prepare it before creating the Razorpay order.
-    if (!bookingService.hasActiveHotelPrebook?.(trip.trip_id)) {
+    if (!bookingService.hasActiveHotelPrebook?.(trip.trip_id, trip.metadata)) {
       await handlePrepareHotel();
     }
 
@@ -1242,9 +1279,13 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
                 travelersCount={trip.travelers_count || 2}
                 hotelState={hotelState}
                 confirmation={hotelConfirmation}
+                isBookingAuthorized={isBookingAuthorized}
+                canAuthorizeBooking={canAuthorizeBooking}
+                onAuthorizeBooking={handleAuthorizeBooking}
                 onPrepareBooking={handlePrepareHotel}
                 onOpenPaymentModal={() => setIsPaymentModalOpen(true)}
                 onSelectOtherHotel={() => onNavigateTab('hotels')}
+                onEditTravelers={() => setIsTravelerModalOpen(true)}
               />
             </div>
           </div>
@@ -1280,15 +1321,36 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
                   <Button
                     variant="primary"
                     size="md"
+                    isLoading={isCompletingPayment}
+                    disabled={isCompletingPayment}
                     onClick={async () => {
-                      if (!bookingService.hasActiveHotelPrebook?.(trip.trip_id)) {
-                        try {
-                          await handlePrepareHotel();
-                        } catch {
-                          return;
-                        }
+                      if (isCompletingPayment) return;
+
+                      // 1. If already pending reconciliation, open modal to inspect status
+                      if (hotelState === 'reconciliation_pending' || pendingHotelTransactionId) {
+                        setIsPaymentModalOpen(true);
+                        return;
                       }
-                      setIsPaymentModalOpen(true);
+
+                      // 2. Validate passenger / traveler details
+                      if (!isAllTravelersComplete(travelers, travelersCount)) {
+                        notify('Please enter complete passenger details before proceeding to payment.', 'warning', 'Traveler Details Required');
+                        setIsTravelerModalOpen(true);
+                        return;
+                      }
+
+                      // 3. Ensure authoritative hotel prebook is active
+                      setIsCompletingPayment(true);
+                      try {
+                        if (!bookingService.hasActiveHotelPrebook?.(trip.trip_id, trip.metadata)) {
+                          await handlePrepareHotel();
+                        }
+                        setIsPaymentModalOpen(true);
+                      } catch (err: any) {
+                        notify(err.message || 'Unable to prepare hotel reservation for payment.', 'error', 'Payment Preparation Failed');
+                      } finally {
+                        setIsCompletingPayment(false);
+                      }
                     }}
                     rightIcon={<CreditCard className="w-4 h-4" />}
                     className="shadow-xs shrink-0"

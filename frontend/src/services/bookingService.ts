@@ -491,6 +491,7 @@ export class TrustTripBookingService implements IBookingService {
       guests: offerData?.adults_count || 2,
       guest_name: guestName,
       guest_email: guestEmail,
+      offer: offerData,
     });
 
     const prebookRecord = {
@@ -525,15 +526,39 @@ export class TrustTripBookingService implements IBookingService {
   }
 
   /**
+   * Registers or rehydrates authoritative prebook data for a trip.
+   */
+  setPrebookData(tripId: string, prebookRecord: any, offerData?: any): void {
+    if (!prebookRecord || !prebookRecord.prebook_id) return;
+    const pid = String(prebookRecord.prebook_id);
+    this.activePrebookIds.set(tripId, pid);
+    this.activePrebookData.set(tripId, prebookRecord);
+    if (offerData) {
+      this.activeHotelOffers.set(tripId, offerData);
+    }
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.setItem(`tt_prebook_${tripId}`, JSON.stringify(prebookRecord));
+        if (offerData) {
+          sessionStorage.setItem(`tt_hotel_offer_${tripId}`, JSON.stringify(offerData));
+        }
+      }
+    } catch {}
+  }
+
+  /**
    * Returns whether an authoritative hotel prebook is active for this trip.
    */
-  hasActiveHotelPrebook(tripId: string): boolean {
+  hasActiveHotelPrebook(tripId: string, tripMeta?: any): boolean {
     if (this.activePrebookIds.has(tripId)) return true;
     try {
       if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(`tt_prebook_${tripId}`)) {
         return true;
       }
     } catch {}
+    if (tripMeta && typeof tripMeta === 'object' && tripMeta.hotel_prebook?.prebook_id) {
+      return true;
+    }
     return false;
   }
 

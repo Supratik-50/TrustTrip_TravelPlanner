@@ -186,7 +186,8 @@ export interface IBookingService {
   initiateFlightHandoff(tripId: string, offerId: string): Promise<ExternalCheckoutHandoff>;
   confirmFlightHandoffReturn(tripId: string, handoffToken: string): Promise<FlightConfirmationRecord>;
   prepareHotelBooking(tripId: string, hotelId: string, offerData?: any, guestInfo?: { name?: string; email?: string; firstName?: string; lastName?: string; phone?: string }): Promise<{ required_amount: number; currency: string; prebook_id?: string }>;
-  hasActiveHotelPrebook?(tripId: string): boolean;
+  hasActiveHotelPrebook?(tripId: string, tripMeta?: any): boolean;
+  setPrebookData?(tripId: string, prebookRecord: any, offerData?: any): void;
   initiateHotelPaymentOrder?(
     tripId: string,
     contact: TravelerContactInfo,

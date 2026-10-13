@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -77,7 +78,16 @@ class HotelSelectRequest(BaseModel):
 
 
 class HotelPrebookRequest(BaseModel):
-    offer: dict[str, Any]
+    trip_id: str | UUID
+    snapshot_id: UUID | str | None = None
+    hotel_id: str | None = None
+    room_id: str | None = None
+    check_in_date: str | None = None
+    check_out_date: str | None = None
+    guests: int | list[dict[str, Any]] | None = None
+    guest_name: str | None = None
+    guest_email: str | None = None
+    offer: dict[str, Any] | None = None
 
 
 @router.get("/config")
@@ -215,7 +225,7 @@ async def search_hotels(
             detail="Invalid canonical traveler count for trip (must be between 1 and 12).",
         )
 
-    # 4b. Canonical child count: strictly from trip, never client request fallback
+    # 4b. Canonical child count: strictly from trip, default 0 when omitted
     canonical_children = (
         constraints.get("children")
         if constraints.get("children") is not None
@@ -231,13 +241,8 @@ async def search_hotels(
         if trip.get("children") is not None
         else trip.get("children_count")
         if trip.get("children_count") is not None
-        else None
+        else 0
     )
-    if canonical_children is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing canonical children count for trip.",
-        )
     try:
         children = int(canonical_children)
         if children < 0 or children > 12:
@@ -248,7 +253,7 @@ async def search_hotels(
             detail="Invalid canonical children count for trip (must be an integer between 0 and 12).",
         )
 
-    # 5. Canonical rooms count: strictly from trip, never client request fallback
+    # 5. Canonical rooms count: strictly from trip, default 1 when omitted
     canonical_rooms = (
         constraints.get("rooms")
         or constraints.get("rooms_count")
@@ -256,12 +261,8 @@ async def search_hotels(
         or meta.get("rooms_count")
         or trip.get("rooms")
         or trip.get("rooms_count")
+        or 1
     )
-    if canonical_rooms is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing canonical rooms count for trip.",
-        )
     try:
         rooms = int(canonical_rooms)
         if rooms < 1 or rooms > 8:
@@ -771,12 +772,164 @@ async def select_hotel(
 
 
 @router.post("/prebook")
-async def prebook_hotel(req: HotelPrebookRequest):
-    offer = req.offer
-    if not offer.get("provider_offer_id") or offer.get("provider") not in {"liteapi", "hotelbeds"}:
-        raise HTTPException(status_code=422, detail="Invalid hotel offer.")
+async def prebook_hotel(
+    req: HotelPrebookRequest,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Prebook a hotel offer with mandatory user authentication and tenant trip verification.
+
+    W3-FIND-01: Canonical prebook contract resolving authoritative offer amount and hold ID.
+    W3-FIND-08: Authentication and tenant ownership validation (rejects anonymous and cross-tenant access).
+    """
+    tid_str = str(req.trip_id)
+    trip = trip_store.get_trip(trip_id=tid_str, user_id=current_user.id)
+    if not trip:
+        # Distinguish cross-user (403) from non-existent (404)
+        unscoped = None
+        if trip_store.use_in_memory or not os.getenv("DATABASE_URL"):
+            unscoped = trip_store._memory_trips.get(tid_str)
+        else:
+            with trip_store._connect() as conn:
+                unscoped = conn.execute("SELECT id, user_id FROM trips WHERE id = %s", (tid_str,)).fetchone()
+        if unscoped and str(unscoped["user_id"]) != str(current_user.id):
+            raise HTTPException(status_code=403, detail="Forbidden: Trip does not belong to you.")
+        raise HTTPException(status_code=404, detail="Trip not found.")
+
+    # Authoritative offer resolution
+    snap_id = req.snapshot_id
+    meta = trip.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if not snap_id:
+        snap_id = meta.get("selected_hotel_snapshot_id") or (meta.get("selected_hotel") or {}).get("snapshot_id")
+    if not snap_id and req.hotel_id:
+        try:
+            UUID(str(req.hotel_id))
+            snap_id = req.hotel_id
+        except ValueError:
+            pass
+
+    # Avoid duplicate supplier holds: if trip metadata already holds an active, unexpired prebook, recover and return it
+    retained_pre = meta.get("hotel_prebook")
+    if retained_pre and isinstance(retained_pre, dict) and retained_pre.get("prebook_id"):
+        retained_snap = retained_pre.get("snapshot_id")
+        retained_hotel = retained_pre.get("hotel_id")
+        matches = False
+        if snap_id and retained_snap and str(retained_snap) == str(snap_id):
+            matches = True
+        elif req.hotel_id and retained_hotel and str(retained_hotel) == str(req.hotel_id):
+            matches = True
+        elif not snap_id and not req.hotel_id:
+            matches = True
+
+        if matches:
+            now_utc = datetime.now(timezone.utc)
+            exp_str = retained_pre.get("expires_at")
+            is_exp = False
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(str(exp_str).replace("Z", "+00:00"))
+                    if exp_dt <= now_utc:
+                        is_exp = True
+                except Exception:
+                    pass
+            if not is_exp:
+                return {
+                    "success": True,
+                    **retained_pre,
+                }
+
+    snap_store = SearchSessionStore()
+    offer_dict: dict[str, Any] | None = None
+    snapshot = None
+
+    if snap_id:
+        snapshot = snap_store.get_snapshot(snap_id, current_user.id)
+        if not snapshot:
+            other_snapshot = None
+            if snap_store.use_in_memory:
+                rec = snap_store._IN_MEMORY_SNAPSHOTS.get(str(snap_id))
+                if rec:
+                    other_snapshot = rec
+            else:
+                with snap_store._connect() as conn:
+                    other_snapshot = conn.execute("SELECT id FROM offer_snapshots WHERE id = %s", (str(snap_id),)).fetchone()
+            if other_snapshot:
+                raise HTTPException(status_code=403, detail="Forbidden: Hotel offer snapshot does not belong to you.")
+            raise HTTPException(status_code=404, detail=f"Hotel offer snapshot '{snap_id}' not found.")
+
+        if snapshot.offer_type != "hotel":
+            raise HTTPException(status_code=422, detail=f"Snapshot '{snap_id}' is not a hotel offer.")
+
+        if snapshot.availability != AvailabilityStatus.AVAILABLE:
+            raise HTTPException(status_code=409, detail="Selected hotel offer is no longer available.")
+
+        now_utc = datetime.now(timezone.utc)
+        if snapshot.expires_at and snapshot.expires_at <= now_utc:
+            raise HTTPException(status_code=409, detail="Selected hotel offer has expired.")
+
+        hotel_offer: HotelOffer = snapshot.normalized_offer
+        offer_dict = {
+            "id": hotel_offer.provider_offer_id,
+            "provider_offer_id": hotel_offer.provider_offer_id,
+            "provider": hotel_offer.provider,
+            "hotel_id": hotel_offer.hotel_id,
+            "hotel_name": hotel_offer.hotel_name,
+            "city": hotel_offer.city,
+            "address": hotel_offer.address,
+            "room_name": hotel_offer.room_name,
+            "board_name": hotel_offer.board_type,
+            "refundable": hotel_offer.refundable,
+            "price": float(hotel_offer.price.total_amount),
+            "currency": str(hotel_offer.price.currency),
+            "price_inr": float(hotel_offer.price.inr_reference_amount) if hotel_offer.price.inr_reference_amount else None,
+            "nights": hotel_offer.nights,
+            "rooms": hotel_offer.rooms_count,
+            "adults": hotel_offer.adults_count,
+            "children": hotel_offer.children_count,
+            "infants": hotel_offer.infants_count,
+            "snapshot_id": str(snapshot.snapshot_id),
+        }
+    elif req.offer and req.offer.get("provider_offer_id") and req.offer.get("provider") in {"liteapi", "hotelbeds"}:
+        offer_dict = dict(req.offer)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="No authoritative hotel offer found. Provide snapshot_id or select a hotel for this trip first.",
+        )
+
+    if not offer_dict.get("provider_offer_id") or offer_dict.get("provider") not in {"liteapi", "hotelbeds"}:
+        raise HTTPException(status_code=422, detail="Invalid hotel offer: provider or provider_offer_id is missing.")
+
     try:
-        result = HotelService().prebook(offer)
-        return {"success": True, "prebook": result}
+        result = HotelService().prebook(offer_dict)
+        prebook_data = {
+            "prebook_id": result.get("prebook_id"),
+            "amount": float(offer_dict.get("price") or 0.0),
+            "currency": str(offer_dict.get("currency") or "INR"),
+            "status": "prebooked",
+            "hotel_name": offer_dict.get("hotel_name", "Hotel"),
+            "snapshot_id": str(snapshot.snapshot_id) if snapshot else (str(snap_id) if snap_id else None),
+            "hotel_id": offer_dict.get("hotel_id"),
+            "room_id": offer_dict.get("room_name"),
+            "expires_at": snapshot.expires_at.isoformat() if (snapshot and snapshot.expires_at) else None,
+            "prebook": result,
+        }
+
+        # Retain authoritative prebook on trip metadata for continuity
+        try:
+            meta["hotel_prebook"] = prebook_data
+            trip_store.update_trip_metadata(tid_str, current_user.id, meta)
+        except Exception as exc:
+            logger.warning("Could not retain hotel_prebook on trip metadata: %s", exc)
+
+        return {
+            "success": True,
+            **prebook_data,
+        }
     except HotelProviderError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

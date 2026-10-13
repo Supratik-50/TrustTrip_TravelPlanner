@@ -77,7 +77,7 @@ async def create_order_from_snapshot(
 class HotelPaymentOrder(BaseModel):
     offer: dict[str, Any]
     customer_ref: str | None = None
-    prebook: dict[str, Any]
+    prebook: dict[str, Any] = Field(default_factory=dict)
     holder: dict[str, Any]
     guests: list[dict[str, Any]]
     trip_id: str

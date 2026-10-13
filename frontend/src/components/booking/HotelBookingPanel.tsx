@@ -10,6 +10,8 @@ import {
   Clock,
   MapPin,
   Sparkles,
+  AlertCircle,
+  X,
 } from 'lucide-react';
 import { HotelOffer } from '../../types/hotel';
 import { HotelBookingState, HotelConfirmationRecord } from '../../types/bookingFrontend';
@@ -23,9 +25,13 @@ interface HotelBookingPanelProps {
   travelersCount?: number;
   hotelState: HotelBookingState | 'idle' | 'preparing' | 'payment_required' | 'confirmed';
   confirmation?: HotelConfirmationRecord;
+  isBookingAuthorized?: boolean;
+  canAuthorizeBooking?: boolean;
+  onAuthorizeBooking?: () => Promise<void>;
   onPrepareBooking: () => Promise<void>;
   onOpenPaymentModal: () => void;
   onSelectOtherHotel: () => void;
+  onEditTravelers?: () => void;
 }
 
 export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
@@ -36,11 +42,17 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
   travelersCount = 2,
   hotelState,
   confirmation,
+  isBookingAuthorized = true,
+  canAuthorizeBooking = false,
+  onAuthorizeBooking,
   onPrepareBooking,
   onOpenPaymentModal,
   onSelectOtherHotel,
+  onEditTravelers,
 }) => {
   const [isPreparing, setIsPreparing] = useState(false);
+  const [prepareError, setPrepareError] = useState<string | null>(null);
+  const [isAuthorizing, setIsAuthorizing] = useState(false);
 
   const roomPrice = hotel ? Number(hotel.total_amount) : 0;
   const taxes = Math.round(roomPrice * 0.1);
@@ -183,15 +195,42 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
             Change stay
           </Button>
 
-          <Button
-            variant="primary"
-            size="lg"
-            onClick={onOpenPaymentModal}
-            rightIcon={<CreditCard className="w-4 h-4" />}
-            className="w-full sm:w-auto shadow-xs"
-          >
-            Continue to payment (${total.toLocaleString()})
-          </Button>
+          {isBookingAuthorized ? (
+            <Button
+              variant="primary"
+              size="lg"
+              onClick={onOpenPaymentModal}
+              rightIcon={<CreditCard className="w-4 h-4" />}
+              className="w-full sm:w-auto shadow-xs"
+            >
+              Continue to payment (${total.toLocaleString()})
+            </Button>
+          ) : (
+            <div className="flex flex-col sm:flex-row items-end sm:items-center gap-2 w-full sm:w-auto">
+              <span className="text-xs text-amber-500 font-medium">
+                Booking authorization required before hotel payment
+              </span>
+              <Button
+                variant="primary"
+                size="md"
+                disabled={!canAuthorizeBooking || isAuthorizing}
+                isLoading={isAuthorizing}
+                onClick={async () => {
+                  if (!onAuthorizeBooking) return;
+                  setIsAuthorizing(true);
+                  try {
+                    await onAuthorizeBooking();
+                  } finally {
+                    setIsAuthorizing(false);
+                  }
+                }}
+                rightIcon={<ShieldCheck className="w-4 h-4" />}
+                className="w-full sm:w-auto shadow-xs bg-amber-600 hover:bg-amber-700"
+              >
+                Authorize for Booking
+              </Button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -215,6 +254,22 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
         </p>
       </div>
 
+      {prepareError && (
+        <div role="alert" className="p-3.5 rounded-2xl bg-red-500/10 border border-red-500/30 text-xs text-red-400 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+            <span>{prepareError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setPrepareError(null)}
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       <div className="p-4 rounded-2xl bg-[var(--surface-muted)]/60 border border-[var(--border)] flex items-center justify-between text-xs">
         <div>
           <span className="text-[var(--text-muted)] block">Selected Property</span>
@@ -234,10 +289,19 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
         <Button
           variant="primary"
           size="md"
+          disabled={isPreparing || !hotel}
           onClick={async () => {
+            if (isPreparing) return;
+            if (!hotel) {
+              setPrepareError('Please select a hotel room from the Stays tab before preparing the reservation.');
+              return;
+            }
             setIsPreparing(true);
+            setPrepareError(null);
             try {
               await onPrepareBooking();
+            } catch (err: any) {
+              setPrepareError(err.message || 'Failed to prepare hotel reservation with supplier. Please check selection and traveler details.');
             } finally {
               setIsPreparing(false);
             }
@@ -246,7 +310,7 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
           rightIcon={<ArrowRight className="w-4 h-4" />}
           className="shadow-xs"
         >
-          Prepare hotel reservation
+          {hotel ? 'Prepare hotel reservation' : 'Select a stay first'}
         </Button>
       </div>
     </div>
