@@ -845,3 +845,480 @@ def test_migration_010_sql_structure():
     # No cascade deletes
     assert "ON DELETE CASCADE" not in sql
     assert "ON DELETE RESTRICT" in sql
+
+
+# =============================================================================
+# Test T: Approved Revision #2 Booking Authorization Exact Invariants
+# =============================================================================
+def test_approved_revision_2_booking_authorization_invariants():
+    client, user_id = _auth_client()
+
+    # 1. Setup base trip and Revision #1
+    trip_id, rev1_id, rev1_num = _create_approved_trip(client)
+
+    # 2. Create Revision #2
+    updated_constraints = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+    }
+    r2_res = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={
+            "feedback": "Extend exploration with new activities",
+            "updated_constraints": updated_constraints,
+        },
+    )
+    assert r2_res.status_code == 200
+    rev2_id = r2_res.json()["revision_id"]
+    assert r2_res.json()["revision_number"] == 2
+
+    # 3. Approve Revision #2
+    appr2_res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={
+            "revision_id": rev2_id,
+            "expected_revision_number": 2,
+            "notes": "Approved Revision #2",
+        },
+    )
+    assert appr2_res.status_code == 200
+
+    # 4. Wrong revision UUID is rejected
+    wrong_uuid = str(uuid4())
+    res_wrong_uuid = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": wrong_uuid, "expected_revision_number": 2},
+    )
+    assert res_wrong_uuid.status_code in (404, 409)
+
+    # 5. Wrong expected revision number is rejected
+    res_wrong_num = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev2_id, "expected_revision_number": 1},
+    )
+    assert res_wrong_num.status_code in (409, 422)
+
+    # 6. Missing revision identity fails closed
+    res_missing_id = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"expected_revision_number": 2},
+    )
+    assert res_missing_id.status_code == 422
+
+    # 7. Approved Revision #2 authorizes successfully using exact active revision UUID
+    res_auth = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={
+            "revision_id": rev2_id,
+            "expected_revision_number": 2,
+            "notes": "Authorize Revision 2",
+        },
+    )
+    assert res_auth.status_code == 200
+    auth_data = res_auth.json()
+    assert auth_data["success"] is True
+    assert auth_data["revision_id"] == rev2_id
+    assert auth_data["revision_number"] == 2
+    assert "authorization_id" in auth_data
+
+    # 8. Authorization record belongs exactly to Revision #2
+    auth_store = AuthorizationStore()
+    record = auth_store.get_booking_authorization(trip_id, rev2_id)
+    assert record is not None
+    assert str(record.revision_id) == rev2_id
+    assert record.revision_number == 2
+    assert str(record.user_id) == str(user_id)
+
+    # 9. No Revision #3 is created; trip remains at Revision #2
+    trip_data = client.get(f"/api/trips/{trip_id}").json()["trip"]
+    assert trip_data["current_revision_id"] == rev2_id
+    assert trip_data["current_revision_number"] == 2
+    assert trip_data["status"] == "approved"
+    assert trip_data["is_booking_authorized"] is True
+
+
+# =============================================================================
+# Issue B: Canonical Room Presence & Authorization Regression Tests (1-10)
+# =============================================================================
+def test_canonical_rooms_same_count_succeeds():
+    """1. Baseline and request both contain the same room count -> authorization succeeds."""
+    client, user_id = _auth_client("same_rooms_user@example.com")
+    constraints = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+        "rooms": 2,
+    }
+    t_res = client.post(
+        "/api/trips",
+        json={"title": "Tokyo 2 Rooms", "origin": "NYC", "destination": "Tokyo", "metadata": {"constraints": constraints}},
+    )
+    assert t_res.status_code == 201
+    trip_id = t_res.json()["trip"]["id"]
+
+    r_res = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={"feedback": "2 rooms requested", "updated_constraints": constraints},
+    )
+    assert r_res.status_code == 200
+    rev_id = r_res.json()["revision_id"]
+
+    assert client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    ).status_code == 200
+
+    # Authorization with matching 2 rooms
+    auth_res = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
+    assert auth_res.status_code == 200
+    assert auth_res.json()["is_authorized"] is True
+
+
+def test_canonical_rooms_different_count_conflict_enforced():
+    """2. Baseline and request contain different room counts -> conflict remains enforced when baseline is authoritative."""
+    client, user_id = _auth_client("diff_rooms_user@example.com")
+    constraints = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+        "rooms": 1,
+    }
+    t_res = client.post(
+        "/api/trips",
+        json={"title": "Tokyo 1 Room", "origin": "NYC", "destination": "Tokyo", "metadata": {"constraints": constraints}},
+    )
+    trip_id = t_res.json()["trip"]["id"]
+
+    r_res = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={"feedback": "1 room base", "updated_constraints": constraints},
+    )
+    rev_id = r_res.json()["revision_id"]
+
+    assert client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    ).status_code == 200
+
+    # Mutate trip constraints to 2 rooms while baseline remains 1 room
+    trip_store = TripStore()
+    trip = trip_store.get_trip(trip_id, user_id)
+    meta = dict(trip.get("metadata") or {})
+    mutated_constraints = dict(meta.get("constraints") or {})
+    mutated_constraints["rooms"] = 2
+    meta["constraints"] = mutated_constraints
+    trip_store.update_trip(trip_id, user_id, metadata=meta)
+
+    auth_res = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
+    assert auth_res.status_code == 409
+    assert "room" in auth_res.json()["detail"].lower() or "occupancy" in auth_res.json()["detail"].lower()
+
+
+def test_canonical_rooms_baseline_no_rooms_selected_offer_succeeds():
+    """3. Baseline has no room-count field but selected offer has valid room count -> authorization succeeds without false mismatch."""
+    from services.search_session_store import SearchSessionStore
+    from domain.live_offer import HotelOffer, PriceBreakdown
+    from decimal import Decimal
+    from datetime import datetime, timezone
+
+    client, user_id = _auth_client("hotel_offer_user@example.com")
+    constraints = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+    }
+    t_res = client.post(
+        "/api/trips",
+        json={"title": "Tokyo General", "origin": "NYC", "destination": "Tokyo", "metadata": {"constraints": constraints}},
+    )
+    trip_id = t_res.json()["trip"]["id"]
+
+    r_res = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={"feedback": "Draft", "updated_constraints": constraints},
+    )
+    rev_id = r_res.json()["revision_id"]
+
+    assert client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    ).status_code == 200
+
+    # Select verified hotel offer
+    snap_store = SearchSessionStore()
+    sess = snap_store.create_session(
+        user_id=user_id,
+        trip_id=trip_id,
+        thread_id=None,
+        search_type="hotels",
+        criteria_hash="crit_h1",
+        trip_revision=1,
+    )
+    snap_id = uuid4()
+    room_uuid = uuid4()
+    offer = HotelOffer(
+        snapshot_id=snap_id,
+        provider="liteapi",
+        provider_offer_id="off_h_reg",
+        hotel_id="h_reg",
+        hotel_name="Tokyo Plaza",
+        city="Tokyo",
+        price=PriceBreakdown(base_amount=Decimal("200.00"), total_amount=Decimal("200.00"), currency="USD"),
+        nightly_price=Decimal("100.00"),
+        nights=2,
+        rooms_count=1,
+        adults_count=2,
+        retrieved_at=datetime.now(timezone.utc),
+    )
+    raw_payload = {
+        "rate": 200,
+        "_internal_rooms": [{"id": str(room_uuid), "name": "Deluxe", "price_per_night": 100.0, "total_price": 200.0, "currency": "USD"}]
+    }
+    snap_store.save_snapshot(sess.session_id, offer, raw_payload=raw_payload)
+
+    sel_res = client.post(
+        "/api/hotels/select",
+        json={"trip_id": trip_id, "snapshot_id": str(snap_id), "room_id": str(room_uuid)},
+    )
+    assert sel_res.status_code == 200
+
+    # Authorize booking: must succeed without false "rooms" presence mismatch
+    auth_res = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
+    assert auth_res.status_code == 200
+    assert auth_res.json()["is_authorized"] is True
+
+
+def test_canonical_rooms_explicit_null_absent_contract():
+    """4. Explicit null, absent, and value room counts behave consistently with API contract."""
+    base = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+    }
+    # Both absent passes
+    assert verify_canonical_booking_state_consistency(base, dict(base)) == (True, None)
+
+    # Both explicit null passes
+    null_state = dict(base, rooms=None)
+    assert verify_canonical_booking_state_consistency(null_state, dict(null_state)) == (True, None)
+
+    # Baseline has rooms: 1, request has rooms: None -> fails mismatch
+    val_baseline = dict(base, rooms=1)
+    req_null = dict(base, rooms=None)
+    consistent, reason = verify_canonical_booking_state_consistency(req_null, val_baseline)
+    assert not consistent
+    assert "rooms" in reason.lower()
+
+    # Baseline has rooms: None, request has rooms: 1 -> fails mismatch
+    consistent2, reason2 = verify_canonical_booking_state_consistency(val_baseline, req_null)
+    assert not consistent2
+    assert "rooms" in reason2.lower()
+
+    # Baseline has rooms: 1, request has absent rooms -> fails presence mismatch
+    req_absent = dict(base)
+    consistent3, reason3 = verify_canonical_booking_state_consistency(req_absent, val_baseline)
+    assert not consistent3
+    assert "presence mismatch for 'rooms'" in reason3.lower()
+
+
+def test_canonical_occupancy_children_infants_mismatches_rejected():
+    """5. Children and infants mismatches remain rejected."""
+    base = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+        "children": 0,
+        "infants": 0,
+    }
+    # Children mismatch
+    changed_child = dict(base, children=1)
+    ok_child, reason_child = verify_canonical_booking_state_consistency(changed_child, base)
+    assert not ok_child
+    assert "children" in reason_child.lower()
+
+    # Infants mismatch
+    changed_infant = dict(base, infants=1)
+    ok_infant, reason_infant = verify_canonical_booking_state_consistency(changed_infant, base)
+    assert not ok_infant
+    assert "infants" in reason_infant.lower()
+
+
+def test_canonical_rooms_wrong_revision_id_or_number_rejected():
+    """6. Wrong revision ID or revision number remains rejected."""
+    client, _ = _auth_client("rev_id_num_user@example.com")
+    trip_id, rev_id, rev_num = _create_approved_trip(client)
+
+    # Wrong UUID
+    res_wrong_uuid = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": str(uuid4()), "expected_revision_number": rev_num},
+    )
+    assert res_wrong_uuid.status_code in (404, 409)
+
+    # Wrong revision number
+    res_wrong_num = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": rev_num + 5},
+    )
+    assert res_wrong_num.status_code in (409, 422)
+
+
+def test_canonical_rooms_wrong_user_or_trip_ownership_rejected():
+    """7. Wrong user or trip ownership remains rejected."""
+    client_owner, _ = _auth_client("trip_owner_a@example.com")
+    client_intruder, _ = _auth_client("trip_intruder_b@example.com")
+    trip_id, rev_id, rev_num = _create_approved_trip(client_owner)
+
+    # Intruder tries to authorize owner's trip
+    res = client_intruder.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": rev_num},
+    )
+    assert res.status_code in (403, 404)
+
+
+def test_canonical_rooms_selected_offer_cannot_bypass_authoritative_baseline():
+    """8. A selected room or hotel offer cannot bypass the existing authorization contract."""
+    from services.search_session_store import SearchSessionStore
+    from domain.live_offer import HotelOffer, PriceBreakdown
+    from decimal import Decimal
+    from datetime import datetime, timezone
+
+    client, user_id = _auth_client("bypass_offer_guard@example.com")
+    # Authoritative baseline requires 1 room
+    constraints = {
+        "origin": "NYC",
+        "destination": "Tokyo",
+        "departure_date": "2026-11-01",
+        "return_date": "2026-11-10",
+        "passengers": 2,
+        "rooms": 1,
+    }
+    t_res = client.post(
+        "/api/trips",
+        json={"title": "Single Room Plan", "origin": "NYC", "destination": "Tokyo", "metadata": {"constraints": constraints}},
+    )
+    trip_id = t_res.json()["trip"]["id"]
+
+    r_res = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={"feedback": "Single room required", "updated_constraints": constraints},
+    )
+    rev_id = r_res.json()["revision_id"]
+
+    assert client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    ).status_code == 200
+
+    # User attempts to select a hotel offer with rooms_count = 2 (conflicting with baseline 1)
+    snap_store = SearchSessionStore()
+    sess = snap_store.create_session(
+        user_id=user_id,
+        trip_id=trip_id,
+        thread_id=None,
+        search_type="hotels",
+        criteria_hash="crit_bypass",
+        trip_revision=1,
+    )
+    snap_id = uuid4()
+    room_uuid = uuid4()
+    offer = HotelOffer(
+        snapshot_id=snap_id,
+        provider="liteapi",
+        provider_offer_id="off_bypass",
+        hotel_id="h_bypass",
+        hotel_name="Two Room Hotel",
+        city="Tokyo",
+        price=PriceBreakdown(base_amount=Decimal("400.00"), total_amount=Decimal("400.00"), currency="USD"),
+        nightly_price=Decimal("200.00"),
+        nights=2,
+        rooms_count=2,  # Conflicting with baseline rooms = 1
+        adults_count=2,
+        retrieved_at=datetime.now(timezone.utc),
+    )
+    raw_payload = {
+        "rate": 400,
+        "_internal_rooms": [{"id": str(room_uuid), "name": "Double Room", "price_per_night": 200.0, "total_price": 400.0, "currency": "USD"}]
+    }
+    snap_store.save_snapshot(sess.session_id, offer, raw_payload=raw_payload)
+
+    client.post(
+        "/api/hotels/select",
+        json={"trip_id": trip_id, "snapshot_id": str(snap_id), "room_id": str(room_uuid)},
+    )
+
+    # Authorization must reject conflicting hotel room count
+    auth_res = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
+    assert auth_res.status_code == 409
+    assert "room" in auth_res.json()["detail"].lower()
+
+
+def test_canonical_rooms_idempotency_intact():
+    """9. Existing booking-authorization idempotency remains intact."""
+    client, _ = _auth_client("idemp_rooms_user@example.com")
+    trip_id, rev_id, rev_num = _create_approved_trip(client)
+
+    # First authorization
+    res1 = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": rev_num},
+    )
+    assert res1.status_code == 200
+    auth_id1 = res1.json()["authorization_id"]
+
+    # Second authorization (idempotent replay)
+    res2 = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": rev_num},
+    )
+    assert res2.status_code == 200
+    auth_id2 = res2.json()["authorization_id"]
+    assert auth_id1 == auth_id2
+
+
+def test_canonical_rooms_no_extra_authorization_or_revision_created():
+    """10. No extra authorization or revision is created by the tests."""
+    client, user_id = _auth_client("no_extra_rev_user@example.com")
+    trip_id, rev_id, rev_num = _create_approved_trip(client)
+
+    auth_res = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev_id, "expected_revision_number": rev_num},
+    )
+    assert auth_res.status_code == 200
+
+    trip_data = client.get(f"/api/trips/{trip_id}").json()["trip"]
+    assert trip_data["current_revision_id"] == rev_id
+    assert trip_data["current_revision_number"] == 1
+    assert trip_data["status"] == "approved"
+
+    # Verify exactly 1 revision in evidence store
+    ev_store = EvidenceRevisionStore()
+    revs = ev_store.list_revisions_for_trip(trip_id, user_id)
+    assert len(revs) == 1

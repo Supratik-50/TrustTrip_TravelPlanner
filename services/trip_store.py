@@ -702,6 +702,7 @@ class TripStore:
                         price_inr_val = float(norm_offer["price_inr"]) if norm_offer.get("price_inr") is not None else None
 
                     hotel_name = getattr(norm_offer, "hotel_name", None) or (norm_offer.get("hotel_name") or norm_offer.get("name") if isinstance(norm_offer, dict) else "Hotel")
+                    rooms_count_val = getattr(norm_offer, "rooms_count", None) or (norm_offer.get("rooms_count") if isinstance(norm_offer, dict) else None)
                     meta["selected_hotel"] = {
                         "id": str(req.snapshot_id),
                         "snapshot_id": str(req.snapshot_id),
@@ -712,6 +713,7 @@ class TripStore:
                         "currency": currency_val,
                         "price_inr": price_inr_val,
                         "room_name": getattr(norm_offer, "room_name", None) or (norm_offer.get("room_name") if isinstance(norm_offer, dict) else None),
+                        "rooms_count": rooms_count_val,
                     }
 
                     # Room selection validation and persistence (Micro-Remediation G, Issue 3)
@@ -875,6 +877,7 @@ class TripStore:
                         price_inr_val = float(norm_offer["price_inr"]) if norm_offer.get("price_inr") is not None else None
 
                     hotel_name = getattr(norm_offer, "hotel_name", None) or (norm_offer.get("hotel_name") or norm_offer.get("name") if isinstance(norm_offer, dict) else "Hotel")
+                    rooms_count_val = getattr(norm_offer, "rooms_count", None) or (norm_offer.get("rooms_count") if isinstance(norm_offer, dict) else None)
                     meta["selected_hotel"] = {
                         "id": str(req.snapshot_id),
                         "snapshot_id": str(req.snapshot_id),
@@ -885,6 +888,7 @@ class TripStore:
                         "currency": currency_val,
                         "price_inr": price_inr_val,
                         "room_name": getattr(norm_offer, "room_name", None) or (norm_offer.get("room_name") if isinstance(norm_offer, dict) else None),
+                        "rooms_count": rooms_count_val,
                     }
 
                     # Room selection validation and persistence (Micro-Remediation G, Issue 3)

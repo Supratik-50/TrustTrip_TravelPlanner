@@ -108,8 +108,13 @@ def extract_canonical_booking_fields(data: dict[str, Any]) -> dict[str, Any]:
             return None
         return parsed
 
-    def _normalize_room(value: Any) -> Any:
-        if isinstance(value, bool) or value is None:
+    def _normalize_room(present: bool, value: Any) -> Any:
+        if not present:
+            return None
+        if value is None:
+            # Explicit null is a valid representation
+            return None
+        if isinstance(value, bool):
             malformed.append("rooms")
             return None
         if isinstance(value, int):
@@ -139,14 +144,22 @@ def extract_canonical_booking_fields(data: dict[str, Any]) -> dict[str, Any]:
     passengers_present, passengers = _get_val("passengers", "adults", "travelers_count", "travelers")
     children_present, children = _get_val("children", "children_count", "child_count")
     infants_present, infants = _get_val("infants", "infant_count")
-    room_present, rooms = _get_val("selected_room", "room_occupancy", "rooms", "rooms_count")
+    room_present, rooms = _get_val("rooms", "rooms_count", "room_occupancy")
+    if not room_present:
+        sel_hotel = meta.get("selected_hotel") if isinstance(meta, dict) else None
+        if isinstance(sel_hotel, dict) and sel_hotel.get("rooms_count") is not None:
+            room_present = True
+            rooms = sel_hotel.get("rooms_count")
+        elif isinstance(meta, dict) and meta.get("selected_room") is not None:
+            room_present = True
+            rooms = 1
     flight_present, flight_snap = _get_val("selected_flight_snapshot_id")
     hotel_present, hotel_snap = _get_val("selected_hotel_snapshot_id")
 
     passengers_int = _normalize_positive_int("passengers", passengers_present, passengers)
     children_int = _normalize_non_negative_int("children", children_present, children)
     infants_int = _normalize_non_negative_int("infants", infants_present, infants)
-    room_value = _normalize_room(rooms) if room_present else None
+    room_value = _normalize_room(room_present, rooms)
 
     return {
         "origin": _normalize_text("origin", origin).upper() if origin_present and origin is not None else None,
@@ -207,9 +220,8 @@ def verify_canonical_booking_state_consistency(
         if t_val != s_val:
             return False, f"Canonical field mismatch for '{f}': trip has '{t_val}', revision snapshot has '{s_val}'."
 
-    # 2. Represented optional/occupancy fields check (fail closed if mismatch)
-    optional_fields = ["children", "infants", "selected_flight_snapshot_id", "selected_hotel_snapshot_id"]
-    for f in optional_fields:
+    # 2. Represented optional occupancy fields check (fail closed if mismatch)
+    for f in ["children", "infants"]:
         if trip_fields["_present"][f] != snap_fields["_present"][f]:
             return False, f"Canonical field presence mismatch for '{f}'."
         t_val = trip_fields.get(f)
@@ -218,11 +230,58 @@ def verify_canonical_booking_state_consistency(
             if t_val != s_val:
                 return False, f"Canonical field mismatch for '{f}': trip has '{t_val}', revision snapshot has '{s_val}'."
 
-    # 3. Rooms / occupancy comparison
-    if trip_fields["_present"]["rooms"] != snap_fields["_present"]["rooms"]:
-        return False, "Canonical field presence mismatch for 'rooms'."
-    if trip_fields.get("rooms") != snap_fields.get("rooms"):
-        return False, "Canonical room/occupancy structure mismatch."
+    # 3. Represented offer snapshot fields check (fail closed if represented on snapshot and mismatch)
+    for f in ["selected_flight_snapshot_id", "selected_hotel_snapshot_id"]:
+        if snap_fields["_present"][f]:
+            if not trip_fields["_present"][f]:
+                return False, f"Canonical field presence mismatch for '{f}'."
+            t_val = trip_fields.get(f)
+            s_val = snap_fields.get(f)
+            if t_val != s_val:
+                return False, f"Canonical field mismatch for '{f}': trip has '{t_val}', revision snapshot has '{s_val}'."
+
+    # 4. Rooms / occupancy comparison
+    # Enforces established canonical field-presence contract for offer-related fields:
+    # If the immutable baseline genuinely represents an authoritative room count/occupancy:
+    if snap_fields["_present"]["rooms"]:
+        if not trip_fields["_present"]["rooms"]:
+            return False, "Canonical field presence mismatch for 'rooms'."
+        t_rooms = trip_fields.get("rooms")
+        s_rooms = snap_fields.get("rooms")
+        if (t_rooms is None) != (s_rooms is None):
+            return False, f"Canonical field mismatch for 'rooms': trip has '{t_rooms}', revision snapshot has '{s_rooms}'."
+        if t_rooms is not None and s_rooms is not None and t_rooms != s_rooms:
+            return False, "Canonical room/occupancy structure mismatch."
+        # Offer guard: selected hotel offer cannot bypass authoritative baseline room count
+        trip_meta = trip.get("metadata") if isinstance(trip, dict) and isinstance(trip.get("metadata"), dict) else {}
+        sel_hotel = trip_meta.get("selected_hotel") if isinstance(trip_meta, dict) else None
+        offer_rooms = None
+        if isinstance(sel_hotel, dict) and sel_hotel.get("rooms_count") is not None:
+            offer_rooms = sel_hotel.get("rooms_count")
+        elif trip_fields.get("selected_hotel_snapshot_id") and trip.get("user_id"):
+            try:
+                from services.search_session_store import SearchSessionStore
+                snap_store = SearchSessionStore()
+                snap = snap_store.get_snapshot(trip_fields["selected_hotel_snapshot_id"], trip["user_id"])
+                if snap and snap.normalized_offer:
+                    offer_rooms = getattr(snap.normalized_offer, "rooms_count", None)
+            except Exception:
+                pass
+        if offer_rooms is not None:
+            try:
+                offer_rooms_int = int(offer_rooms)
+                if isinstance(s_rooms, int) and offer_rooms_int != s_rooms:
+                    return False, f"Canonical room count mismatch: selected hotel has '{offer_rooms_int}' rooms, revision snapshot requires '{s_rooms}'."
+            except (ValueError, TypeError):
+                pass
+    elif trip_fields["_present"]["rooms"]:
+        # Baseline has no room-count field:
+        # If the trip has a valid selected hotel offer snapshot, follow established offer-presence contract
+        if trip_fields["_present"]["selected_hotel_snapshot_id"]:
+            pass
+        else:
+            # Unverified room/occupancy change without a selected offer snapshot -> fail closed
+            return False, "Canonical field presence mismatch for 'rooms'."
 
     return True, None
 
