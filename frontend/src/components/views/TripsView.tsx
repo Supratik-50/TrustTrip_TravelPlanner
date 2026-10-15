@@ -32,6 +32,11 @@ export const TripsView: React.FC<TripsViewProps> = ({ onOpenTrip, onCreateTrip }
     }
   }, []);
 
+  const handleDeleteTrip = useCallback((deletedTripId: string) => {
+    setTrips((prev) => prev.filter((t) => t.trip_id !== deletedTripId && t.id !== deletedTripId));
+    loadTrips();
+  }, [loadTrips]);
+
   useEffect(() => {
     loadTrips();
   }, [loadTrips]);
@@ -186,6 +191,7 @@ export const TripsView: React.FC<TripsViewProps> = ({ onOpenTrip, onCreateTrip }
               trip={trip}
               onOpen={onOpenTrip}
               onContinuePlanning={onOpenTrip}
+              onDelete={handleDeleteTrip}
             />
           ))}
         </div>

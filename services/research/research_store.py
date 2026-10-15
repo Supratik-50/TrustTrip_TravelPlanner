@@ -20,6 +20,7 @@ from domain.research import (
     RagDocument,
     ResearchCitation,
     ResearchEvidence,
+    ResearchHistoryEntry,
     ResearchFreshnessState,
     ResearchIntent,
     ResearchMode,
@@ -50,6 +51,7 @@ class ResearchStore:
     _IN_MEM_CITATIONS: dict[str, list[ResearchCitation]] = {}
     _IN_MEM_DOCS: dict[str, RagDocument] = {}
     _IN_MEM_CHUNKS: dict[str, list[RagChunk]] = {}
+    _IN_MEM_HISTORY: dict[str, dict[str, Any]] = {}
     _LOCK = threading.Lock()
 
     def __init__(self, db_url: str | None = None, schema: str | None = None, use_in_memory: bool | None = None) -> None:
@@ -557,6 +559,201 @@ class ResearchStore:
                 created_at=row["created_at"],
             )
 
+    # ==================== RESEARCH HISTORY ====================
+
+    def save_history_entry(self, entry: dict[str, Any] | ResearchHistoryEntry) -> dict[str, Any]:
+        """Save a completed research result into history, strictly isolated by user_id."""
+        if isinstance(entry, ResearchHistoryEntry):
+            data = entry.model_dump()
+        else:
+            data = dict(entry)
+
+        hid = str(data.get("id") or uuid4())
+        uid = str(data["user_id"])
+        sid = str(data["session_id"])
+        qid = str(data["query_id"])
+        trip_id = str(data["trip_id"]) if data.get("trip_id") else None
+        q_text = str(data["query_text"])
+        mode = str(data.get("mode") or "auto")
+        intent = str(data.get("intent")) if data.get("intent") else None
+        answer = str(data["answer"])
+        ev_status = str(data.get("evidence_status") or "complete")
+        ev_count = int(data.get("evidence_count") or 0)
+        citations = data.get("citations") or []
+        facts = data.get("facts") or []
+        conflicts = data.get("conflicts") or []
+        created_at = data.get("created_at") or datetime.now(timezone.utc)
+
+        record = {
+            "id": hid,
+            "user_id": uid,
+            "session_id": sid,
+            "query_id": qid,
+            "trip_id": trip_id,
+            "query_text": q_text,
+            "mode": mode,
+            "intent": intent,
+            "answer": answer,
+            "evidence_status": ev_status,
+            "evidence_count": ev_count,
+            "citations": citations,
+            "facts": facts,
+            "conflicts": conflicts,
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+        }
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                existing_key = None
+                for k, v in self._IN_MEM_HISTORY.items():
+                    if str(v.get("query_id")) == qid and str(v.get("user_id")) == uid:
+                        existing_key = k
+                        break
+                key = existing_key or hid
+                record["id"] = key
+                self._IN_MEM_HISTORY[key] = record
+                return record
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO research_history (
+                    id, user_id, session_id, query_id, trip_id,
+                    query_text, mode, intent, answer,
+                    evidence_status, evidence_count,
+                    citations, facts, conflicts, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                ON CONFLICT (query_id, user_id) DO UPDATE SET
+                    trip_id = EXCLUDED.trip_id,
+                    query_text = EXCLUDED.query_text,
+                    mode = EXCLUDED.mode,
+                    intent = EXCLUDED.intent,
+                    answer = EXCLUDED.answer,
+                    evidence_status = EXCLUDED.evidence_status,
+                    evidence_count = EXCLUDED.evidence_count,
+                    citations = EXCLUDED.citations,
+                    facts = EXCLUDED.facts,
+                    conflicts = EXCLUDED.conflicts
+                RETURNING *
+                """,
+                (
+                    hid, uid, sid, qid, trip_id,
+                    q_text, mode, intent, answer,
+                    ev_status, ev_count,
+                    json.dumps(citations, default=str),
+                    json.dumps(facts, default=str),
+                    json.dumps(conflicts, default=str),
+                    created_at,
+                ),
+            ).fetchone()
+            return dict(row) if row else record
+
+    def list_history(
+        self,
+        user_id: UUID | str,
+        limit: int = 50,
+        offset: int = 0,
+        trip_id: UUID | str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List authenticated user's persistent research history, ordered newest first."""
+        uid_str = str(user_id)
+        tid_str = str(trip_id) if trip_id else None
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                entries = [
+                    dict(e) for e in self._IN_MEM_HISTORY.values()
+                    if str(e.get("user_id")) == uid_str
+                    and (tid_str is None or str(e.get("trip_id") or "") == tid_str)
+                ]
+                entries.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+                return entries[offset : offset + limit]
+
+        with self._connect() as conn:
+            if tid_str is not None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM research_history
+                    WHERE user_id = %s AND trip_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (uid_str, tid_str, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM research_history
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (uid_str, limit, offset),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_history_entry(
+        self,
+        history_id: UUID | str,
+        user_id: UUID | str,
+    ) -> dict[str, Any] | None:
+        """Fetch a specific history entry, enforcing strict user ownership."""
+        hid_str = str(history_id)
+        uid_str = str(user_id)
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                e = self._IN_MEM_HISTORY.get(hid_str)
+                if e and str(e.get("user_id")) == uid_str:
+                    return dict(e)
+                return None
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM research_history WHERE id = %s AND user_id = %s",
+                (hid_str, uid_str),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def delete_history_entry(
+        self,
+        history_id: UUID | str,
+        user_id: UUID | str,
+    ) -> bool:
+        """Delete an individual history entry. Does NOT delete documents or shared evidence."""
+        hid_str = str(history_id)
+        uid_str = str(user_id)
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                e = self._IN_MEM_HISTORY.get(hid_str)
+                if e and str(e.get("user_id")) == uid_str:
+                    del self._IN_MEM_HISTORY[hid_str]
+                    return True
+                return False
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "DELETE FROM research_history WHERE id = %s AND user_id = %s RETURNING id",
+                (hid_str, uid_str),
+            ).fetchone()
+            return bool(row)
+
+    def clear_history(self, user_id: UUID | str) -> int:
+        """Clear all history entries belonging to user_id."""
+        uid_str = str(user_id)
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with self._LOCK:
+                to_del = [k for k, v in self._IN_MEM_HISTORY.items() if str(v.get("user_id")) == uid_str]
+                for k in to_del:
+                    del self._IN_MEM_HISTORY[k]
+                return len(to_del)
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "DELETE FROM research_history WHERE user_id = %s RETURNING id",
+                (uid_str,),
+            ).fetchall()
+            return len(rows)
+
     def clear(self) -> None:
         with self._LOCK:
             self._IN_MEM_SESSIONS.clear()
@@ -566,6 +763,7 @@ class ResearchStore:
             self._IN_MEM_CITATIONS.clear()
             self._IN_MEM_DOCS.clear()
             self._IN_MEM_CHUNKS.clear()
+            self._IN_MEM_HISTORY.clear()
 
 
 class InMemoryResearchStore(ResearchStore):

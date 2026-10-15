@@ -549,6 +549,29 @@ class ResearchOrchestrator:
         self.research_store.save_evidence_batch(final_evidence)
         self.research_store.save_citations(q_id, user_id, citations)
 
+        # 10. Persist completed research result to user's history
+        try:
+            self.research_store.save_history_entry({
+                "id": uuid4(),
+                "user_id": user_id,
+                "session_id": sess_id,
+                "query_id": q_id,
+                "trip_id": trip_id,
+                "query_text": query_text,
+                "mode": effective_mode.value if hasattr(effective_mode, "value") else str(effective_mode),
+                "intent": intent_decision.intent.value if hasattr(intent_decision.intent, "value") else str(intent_decision.intent),
+                "answer": answer_text,
+                "evidence_status": evidence_status.value if hasattr(evidence_status, "value") else str(evidence_status),
+                "evidence_count": len(final_evidence),
+                "citations": [c.model_dump() if hasattr(c, "model_dump") else c for c in citations],
+                "facts": [f.model_dump() if hasattr(f, "model_dump") else f for f in facts],
+                "conflicts": [cf.model_dump() if hasattr(cf, "model_dump") else cf for cf in conflicts],
+                "created_at": now,
+            })
+        except Exception as hist_err:
+            logger.error("Failed to persist research history entry for user %s: %s", user_id, hist_err, exc_info=True)
+            raise
+
         return ResearchResult(
             research_session_id=sess_id,
             query_id=q_id,

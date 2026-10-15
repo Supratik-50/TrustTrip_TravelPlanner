@@ -345,61 +345,84 @@ class FlightBookingService:
             "expires_at": snapshot.expires_at or (now + timedelta(minutes=30)),
         }
 
-        # 8. Persist
+        # 8. Persist under parent trip row lock
         if self.use_in_memory:
-            self._IN_MEMORY_BOOKINGS[str(booking_id)] = intent_data
+            from services.trip_store import _get_memory_trip_lock
+            with _get_memory_trip_lock(tid_str):
+                t = self.trip_store._memory_trips.get(tid_str)
+                if not t or str(t.get("user_id")) != uid_str:
+                    raise BookingPermissionError(f"Access denied: Trip '{tid_str}' does not belong to you.")
+                if str(t.get("status") or "").lower() == "deleted":
+                    raise BookingNotFoundError(f"Cannot book flight: trip '{tid_str}' is already deleted.")
+                self._IN_MEMORY_BOOKINGS[str(booking_id)] = intent_data
         else:
-            with psycopg.connect(_dsn(), autocommit=True) as conn:
-                # Ensure plan revision row exists for foreign key
-                current_rev_num = resolve_current_revision(trip) or 1
-                rev_row = conn.execute(
-                    "SELECT revision_id FROM plan_revisions WHERE trip_id = %s ORDER BY revision_number DESC LIMIT 1",
-                    (tid_str,),
-                ).fetchone()
-                if rev_row:
-                    revision_id = rev_row[0]
-                else:
-                    revision_id = uuid4()
+            with psycopg.connect(_dsn(), autocommit=False, row_factory=dict_row) as conn:
+                with conn.transaction():
+                    # 1. Acquire parent trip row lock FOR UPDATE in the same transaction
+                    trip_row = conn.execute(
+                        "SELECT id, status, user_id FROM trips WHERE id = %s AND user_id = %s FOR UPDATE",
+                        (tid_str, uid_str),
+                    ).fetchone()
+                    if not trip_row:
+                        unowned = conn.execute("SELECT id FROM trips WHERE id = %s", (tid_str,)).fetchone()
+                        if unowned:
+                            raise BookingPermissionError(f"Access denied: Trip '{tid_str}' does not belong to you.")
+                        raise BookingNotFoundError(f"Trip '{tid_str}' not found.")
+                    t_status = str(trip_row["status"] if "status" in trip_row else trip_row[1]).lower()
+                    if t_status == "deleted":
+                        raise BookingNotFoundError(f"Cannot book flight: trip '{tid_str}' is already deleted.")
+
+                    # 2. Ensure plan revision row exists for foreign key
+                    current_rev_num = resolve_current_revision(trip) or 1
+                    rev_row = conn.execute(
+                        "SELECT revision_id FROM plan_revisions WHERE trip_id = %s ORDER BY revision_number DESC LIMIT 1",
+                        (tid_str,),
+                    ).fetchone()
+                    if rev_row:
+                        revision_id = rev_row["revision_id"] if "revision_id" in rev_row else rev_row[0]
+                    else:
+                        revision_id = uuid4()
+                        conn.execute(
+                            """
+                            INSERT INTO plan_revisions (revision_id, trip_id, user_id, revision_number, change_set, plan_snapshot, is_published, published_at, created_at)
+                            VALUES (%s, %s, %s, %s, '{}'::jsonb, '{}'::jsonb, true, now(), now())
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (revision_id, tid_str, uid_str, current_rev_num),
+                        )
+
+                    # 3. Insert booking_intents inside the same locked transaction
                     conn.execute(
                         """
-                        INSERT INTO plan_revisions (revision_id, trip_id, user_id, revision_number, change_set, plan_snapshot, is_published, published_at, created_at)
-                        VALUES (%s, %s, %s, %s, '{}'::jsonb, '{}'::jsonb, true, now(), now())
-                        ON CONFLICT DO NOTHING
+                        INSERT INTO booking_intents (
+                            id, user_id, trip_id, revision_id, selected_offer_snapshot_id,
+                            current_revalidation_snapshot_id, provider, booking_mode, status,
+                            idempotency_key, passenger_hash, expected_amount, currency,
+                            metadata, created_at, updated_at, expires_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, 'duffel'::booking_provider_enum, 'duffel_api_order'::booking_mode_enum,
+                            %s::booking_status_enum, %s, %s, %s, %s, %s::jsonb, %s, %s, %s
+                        )
                         """,
-                        (revision_id, tid_str, uid_str, current_rev_num),
+                        (
+                            booking_id,
+                            uid_str,
+                            tid_str,
+                            str(revision_id),
+                            oid_str,
+                            oid_str,
+                            BookingStatus.SELECTED.value,
+                            idempotency_key,
+                            pass_hash,
+                            price_total,
+                            currency,
+                            json.dumps(intent_data["metadata"]),
+                            now,
+                            now,
+                            intent_data["expires_at"],
+                        ),
                     )
-
-                conn.execute(
-                    """
-                    INSERT INTO booking_intents (
-                        id, user_id, trip_id, revision_id, selected_offer_snapshot_id,
-                        current_revalidation_snapshot_id, provider, booking_mode, status,
-                        idempotency_key, passenger_hash, expected_amount, currency,
-                        metadata, created_at, updated_at, expires_at
-                    )
-                    VALUES (
-                        %s, %s, %s, %s, %s, %s, 'duffel'::booking_provider_enum, 'duffel_api_order'::booking_mode_enum,
-                        %s::booking_status_enum, %s, %s, %s, %s, %s::jsonb, %s, %s, %s
-                    )
-                    """,
-                    (
-                        booking_id,
-                        uid_str,
-                        tid_str,
-                        str(revision_id),
-                        oid_str,
-                        oid_str,
-                        BookingStatus.SELECTED.value,
-                        idempotency_key,
-                        pass_hash,
-                        price_total,
-                        currency,
-                        json.dumps(intent_data["metadata"]),
-                        now,
-                        now,
-                        intent_data["expires_at"],
-                    ),
-                )
 
         # Add inr price if available from snapshot
         price_inr = None

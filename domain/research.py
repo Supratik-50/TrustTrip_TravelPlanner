@@ -294,3 +294,24 @@ class ResearchAdvisoryProjection(BaseModel):
     conflicts_as_structured_records: list[dict[str, Any]] = Field(default_factory=list)
     is_untrusted: bool = Field(default=True)
     status: str = Field(default="complete")
+
+
+class ResearchHistoryEntry(BaseModel):
+    """Persistent history record of a completed research query and result."""
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: UUID = Field(default_factory=uuid4)
+    user_id: UUID
+    session_id: UUID
+    query_id: UUID
+    trip_id: UUID | None = None
+    query_text: str
+    mode: str = "auto"
+    intent: str | None = None
+    answer: str
+    evidence_status: str = "complete"
+    evidence_count: int = 0
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    facts: list[dict[str, Any]] = Field(default_factory=list)
+    conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

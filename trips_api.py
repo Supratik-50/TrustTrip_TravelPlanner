@@ -242,6 +242,86 @@ async def get_trip(
     return {"success": True, "trip": trip}
 
 
+@router.delete(
+    "/{trip_id}",
+    summary="Safely delete/archive an owned trip when permitted by canonical business rules",
+)
+async def delete_trip(
+    trip_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Safely delete an owned trip.
+
+    Enforces strict safety invariants under database row lock:
+    - User must own the trip (404 if not found or owned by another user).
+    - Trip must not be ongoing (409 Conflict).
+    - Trip must not have confirmed flight or hotel bookings (409 Conflict).
+    - Trip must not have pending or unresolved booking/payment operations (409 Conflict).
+    - Performs atomic soft-delete to preserve referential integrity and audit records.
+    """
+    try:
+        success, reason, _ = trip_store.delete_trip_atomic(
+            trip_id=trip_id,
+            user_id=current_user.id,
+        )
+    except Exception as exc:
+        logger.error("Database invariant or execution error during trip deletion for %s: %s", trip_id, exc, exc_info=True)
+        err_msg = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Trip deletion rejected by database invariant: {err_msg}",
+        )
+
+    if not success:
+        if reason and ("not found" in reason.lower() or "already deleted" in reason.lower()):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=reason,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=reason or "Trip is not eligible for deletion under current business rules.",
+        )
+
+    return {
+        "success": True,
+        "trip_id": str(trip_id),
+        "status": "deleted",
+        "message": "Trip successfully deleted.",
+    }
+
+
+@router.get(
+    "/{trip_id}/deletion-eligibility",
+    summary="Check if a trip is eligible for safe deletion",
+)
+async def get_deletion_eligibility(
+    trip_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+    trip_store: TripStore = Depends(_trip_store),
+):
+    """Return whether an owned trip can be safely deleted."""
+    trip = trip_store.get_trip(trip_id=trip_id, user_id=current_user.id, include_deleted=True)
+    if not trip:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trip not found or does not belong to you.",
+        )
+
+    eligible, reason, _ = trip_store.check_trip_deletion_eligibility(
+        trip_id=trip_id,
+        user_id=current_user.id,
+    )
+    return {
+        "success": True,
+        "trip_id": str(trip_id),
+        "eligible": eligible,
+        "reason": reason,
+    }
+
+
+
 @router.get(
     "/{trip_id}/bookings",
     summary="Get authoritative booking status (flight & hotel) for an owned trip",

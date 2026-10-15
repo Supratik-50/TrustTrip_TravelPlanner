@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 from uuid import UUID
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 
 from dependencies.auth import get_current_user
@@ -298,3 +298,82 @@ async def get_session(
             detail="Research session not found or does not belong to you.",
         )
     return {"success": True, "session": sess.model_dump()}
+
+
+# ==================== RESEARCH HISTORY ENDPOINTS ====================
+
+@router.get(
+    "/history",
+    summary="List authenticated user's persistent research history",
+)
+async def list_research_history(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    trip_id: UUID | None = Query(default=None, description="Optional trip_id filter"),
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    """List research history entries owned by current user."""
+    entries = _research_store.list_history(current_user.id, limit=limit, offset=offset, trip_id=trip_id)
+    return {
+        "success": True,
+        "history": entries,
+        "total": len(entries),
+    }
+
+
+@router.get(
+    "/history/{history_id}",
+    summary="Get specific historical research result",
+)
+async def get_research_history_entry(
+    history_id: UUID,
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Retrieve an authenticated user's historical research result."""
+    entry = _research_store.get_history_entry(history_id, current_user.id)
+    if not entry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Research history entry not found or access denied.",
+        )
+    return {
+        "success": True,
+        "entry": entry,
+    }
+
+
+@router.delete(
+    "/history/{history_id}",
+    summary="Delete an individual historical research entry",
+)
+async def delete_research_history_entry(
+    history_id: UUID,
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Delete a single research history entry. Does not delete documents or evidence."""
+    deleted = _research_store.delete_history_entry(history_id, current_user.id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Research history entry not found or access denied.",
+        )
+    return {
+        "success": True,
+        "deleted": True,
+        "id": str(history_id),
+    }
+
+
+@router.delete(
+    "/history",
+    summary="Clear all research history for the authenticated user",
+)
+async def clear_research_history(
+    current_user: UserResponse = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Clear all historical research entries belonging to the authenticated user."""
+    cleared_count = _research_store.clear_history(current_user.id)
+    return {
+        "success": True,
+        "cleared_count": cleared_count,
+    }

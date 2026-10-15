@@ -128,3 +128,21 @@ export interface ResearchSession {
   updated_at?: string;
   queries: ResearchResult[];
 }
+
+export interface ResearchHistoryItem {
+  id: string;
+  user_id: string;
+  session_id: string;
+  query_id: string;
+  trip_id?: string | null;
+  query_text: string;
+  mode: string;
+  intent?: string | null;
+  answer: string;
+  evidence_status: string;
+  evidence_count: number;
+  citations: ResearchCitation[];
+  facts?: ResearchFact[];
+  conflicts?: ResearchConflict[];
+  created_at: string;
+}

@@ -39,6 +39,7 @@ import {
   ResearchResponse,
   ResearchQueryRequest,
   ResearchSession,
+  ResearchHistoryItem,
 } from '../types/research';
 import {
   getMockSelections,
@@ -56,6 +57,9 @@ import {
   getMockTripRevisions,
   createMockTripRevision,
   clearMockSelections,
+  getMockResearchHistory,
+  deleteMockResearchHistoryEntry,
+  clearMockResearchHistory,
 } from './mockTravelData';
 import { storage } from './storage';
 
@@ -1079,6 +1083,37 @@ export class ApiClient {
     }
   }
 
+  async deleteTrip(tripId: string): Promise<{ success: boolean; trip_id: string; status: string; message: string }> {
+    try {
+      return await this.request<{ success: boolean; trip_id: string; status: string; message: string }>(
+        `/api/trips/${encodeURIComponent(tripId)}`,
+        { method: 'DELETE' }
+      );
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR' && this.isDemoMode()) {
+        const trips = getMockTrips();
+        const updated = trips.filter((t) => t.trip_id !== tripId && t.id !== tripId);
+        saveMockTrips(updated);
+        return { success: true, trip_id: tripId, status: 'deleted', message: 'Trip successfully deleted.' };
+      }
+      throw err;
+    }
+  }
+
+  async getTripDeletionEligibility(tripId: string): Promise<{ success: boolean; trip_id: string; eligible: boolean; reason?: string }> {
+    try {
+      return await this.request<{ success: boolean; trip_id: string; eligible: boolean; reason?: string }>(
+        `/api/trips/${encodeURIComponent(tripId)}/deletion-eligibility`,
+        { method: 'GET' }
+      );
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR' && this.isDemoMode()) {
+        return { success: true, trip_id: tripId, eligible: true };
+      }
+      throw err;
+    }
+  }
+
   async createThread(tripId: string): Promise<{ thread_id: string; trip_id: string }> {
     try {
       const response = await this.request<any>(
@@ -1563,6 +1598,61 @@ export class ApiClient {
           { method: 'GET' }
         );
         if (mock) return mock;
+      }
+      throw err;
+    }
+  }
+
+  async listResearchHistory(limit: number = 50, offset: number = 0, tripId?: string): Promise<ResearchHistoryItem[]> {
+    try {
+      const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+      if (tripId) q.append('trip_id', tripId);
+      const resp = await this.request<{ success: boolean; history: ResearchHistoryItem[]; total: number }>(
+        `/api/research/history?${q.toString()}`,
+        { method: 'GET' }
+      );
+      return resp?.history || [];
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR' && this.isDemoMode()) {
+        return getMockResearchHistory(tripId);
+      }
+      throw err;
+    }
+  }
+
+  async getResearchHistoryEntry(historyId: string): Promise<ResearchHistoryItem> {
+    const resp = await this.request<{ success: boolean; entry: ResearchHistoryItem }>(
+      `/api/research/history/${encodeURIComponent(historyId)}`,
+      { method: 'GET' }
+    );
+    return resp?.entry;
+  }
+
+  async deleteResearchHistoryEntry(historyId: string): Promise<{ success: boolean; deleted: boolean; id: string }> {
+    try {
+      return await this.request<{ success: boolean; deleted: boolean; id: string }>(
+        `/api/research/history/${encodeURIComponent(historyId)}`,
+        { method: 'DELETE' }
+      );
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR' && this.isDemoMode()) {
+        deleteMockResearchHistoryEntry(historyId);
+        return { success: true, deleted: true, id: historyId };
+      }
+      throw err;
+    }
+  }
+
+  async clearResearchHistory(): Promise<{ success: boolean; cleared_count: number }> {
+    try {
+      return await this.request<{ success: boolean; cleared_count: number }>(
+        `/api/research/history`,
+        { method: 'DELETE' }
+      );
+    } catch (err: any) {
+      if (err.code === 'NETWORK_ERROR' && this.isDemoMode()) {
+        clearMockResearchHistory();
+        return { success: true, cleared_count: 0 };
       }
       throw err;
     }

@@ -1,15 +1,17 @@
 import React, { useState } from 'react';
-import { ArrowRight, Calendar, Users, MapPin, Download, CheckCircle2 } from 'lucide-react';
+import { ArrowRight, Calendar, Users, MapPin, Download, CheckCircle2, Trash2 } from 'lucide-react';
 import { TripSummary } from '../../types/trip';
 import { getDestinationImage } from '../../lib/destinationImages';
 import { Button } from '../common/Button';
 import { formatCurrency } from '../../lib/currency';
 import { bookingService } from '../../services/bookingService';
+import { api } from '../../lib/apiClient';
 
 interface TripCardProps {
   trip: TripSummary;
   onOpen: (tripId: string) => void;
   onContinuePlanning?: (tripId: string) => void;
+  onDelete?: (tripId: string) => void;
   featured?: boolean;
 }
 
@@ -17,11 +19,73 @@ export const TripCard: React.FC<TripCardProps> = ({
   trip,
   onOpen,
   onContinuePlanning,
+  onDelete,
   featured = false,
 }) => {
   const [imgError, setImgError] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
   const destMeta = getDestinationImage(trip.destination);
+
+  const isOngoing = (() => {
+    if (!trip.start_date || !trip.end_date) return false;
+    if (trip.status !== 'approved' && trip.status !== 'active') return false;
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      return trip.start_date <= today && today <= trip.end_date;
+    } catch {
+      return false;
+    }
+  })();
+
+  const hasConfirmedFlights = Boolean(
+    trip.flights &&
+      trip.flights.some((f: any) => f && (f.booking_status === 'booked' || f.booking_status === 'completed'))
+  );
+
+  const hasConfirmedHotels = Boolean(
+    trip.hotels &&
+      trip.hotels.some((h: any) => h && (h.booking_status === 'booked' || h.booking_status === 'confirmed'))
+  );
+
+  const ineligibilityReason = isOngoing
+    ? 'Cannot delete an ongoing trip.'
+    : hasConfirmedFlights || hasConfirmedHotels
+    ? 'Cannot delete trip with confirmed bookings.'
+    : null;
+
+  const handleDeleteClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (isDeleting) return;
+
+    setIsDeleting(true);
+    try {
+      // 1. Authoritative server-side deletion eligibility check
+      const check = await api.getTripDeletionEligibility(trip.trip_id);
+      if (!check.eligible) {
+        alert(check.reason || 'This trip is not eligible for deletion under current business rules.');
+        return;
+      }
+
+      // 2. User confirmation dialog
+      const tripName = trip.title || trip.destination || 'this journey';
+      if (!window.confirm(`Are you sure you want to delete "${tripName}"? This draft itinerary will be removed.`)) {
+        return;
+      }
+
+      // 3. Safe atomic deletion
+      const res = await api.deleteTrip(trip.trip_id);
+      if (res.success && onDelete) {
+        onDelete(trip.trip_id);
+      }
+    } catch (err: any) {
+      const msg = err.message || err.detail || 'Failed to delete trip.';
+      alert(msg);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   const handleDownloadTicket = async (e: React.MouseEvent, flightId: string, bookingRef?: string) => {
     e.stopPropagation();
@@ -166,6 +230,20 @@ export const TripCard: React.FC<TripCardProps> = ({
             >
               Open Trip
             </Button>
+            <button
+              type="button"
+              disabled={isDeleting}
+              onClick={handleDeleteClick}
+              title={isDeleting ? 'Deleting trip...' : `Delete ${trip.title || trip.destination}`}
+              aria-label={`Delete trip ${trip.title || trip.destination}`}
+              className={`p-2 rounded-xl transition-all cursor-pointer ${
+                isDeleting
+                  ? 'bg-black/20 text-white/30 cursor-not-allowed opacity-40'
+                  : 'bg-black/40 hover:bg-red-500/30 text-white/80 hover:text-red-300 backdrop-blur-md'
+              }`}
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
           </div>
         </div>
       </div>
@@ -319,18 +397,33 @@ export const TripCard: React.FC<TripCardProps> = ({
             <ArrowRight className="w-3.5 h-3.5" />
           </span>
 
-          {onContinuePlanning && (
+          <div className="flex items-center gap-2">
+            {onContinuePlanning && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onContinuePlanning(trip.trip_id);
+                }}
+                className="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors px-2 py-1 rounded hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
+              >
+                Plan Itinerary
+              </button>
+            )}
+
             <button
               type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onContinuePlanning(trip.trip_id);
-              }}
-              className="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors px-2 py-1 rounded hover:bg-black/5 dark:hover:bg-white/5"
+              disabled={isDeleting}
+              onClick={handleDeleteClick}
+              title={isDeleting ? 'Deleting trip...' : `Delete ${trip.title || trip.destination}`}
+              aria-label={`Delete trip ${trip.title || trip.destination}`}
+              className={`p-1.5 rounded-lg transition-colors cursor-pointer text-[var(--text-secondary)] hover:text-[var(--status-danger)] hover:bg-[var(--status-danger)]/10 ${
+                isDeleting ? 'opacity-40 cursor-not-allowed' : ''
+              }`}
             >
-              Plan Itinerary
+              <Trash2 className="w-3.5 h-3.5" />
             </button>
-          )}
+          </div>
         </div>
       </div>
     </div>

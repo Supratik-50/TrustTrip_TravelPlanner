@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 from domain.live_offer import AvailabilityStatus, FreshnessStatus
 
+# Explicit lifecycle classification for safe trip deletion
+ELIGIBLE_PRE_TRAVEL_STATUSES: frozenset[str] = frozenset({"draft", "planning", "awaiting_approval"})
+ACTUALLY_ONGOING_STATUSES: frozenset[str] = frozenset({"active", "ongoing", "in_progress"})
+
 
 class TripStoreError(Exception):
     """Base error for trip store operations."""
@@ -449,7 +453,12 @@ class TripStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_trip(self, trip_id: str | uuid.UUID, user_id: str | uuid.UUID) -> dict[str, Any] | None:
+    def get_trip(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        include_deleted: bool = False,
+    ) -> dict[str, Any] | None:
         """Fetch trip strictly verifying ownership by user_id."""
         tid_str = str(trip_id)
         uid_str = str(user_id)
@@ -457,54 +466,466 @@ class TripStore:
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             t = self._memory_trips.get(tid_str)
             if t and str(t["user_id"]) == uid_str:
+                if not include_deleted and str(t.get("status") or "").lower() == "deleted":
+                    return None
                 return dict(t)
             return None
 
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM trips WHERE id = %s AND user_id = %s",
-                (tid_str, uid_str),
-            ).fetchone()
+            query = "SELECT * FROM trips WHERE id = %s AND user_id = %s"
+            if not include_deleted:
+                query += " AND status != 'deleted'"
+            row = conn.execute(query, (tid_str, uid_str)).fetchone()
             return dict(row) if row else None
 
-    def list_trips(self, user_id: str | uuid.UUID, limit: int = 50) -> list[dict[str, Any]]:
+    def list_trips(
+        self,
+        user_id: str | uuid.UUID,
+        limit: int = 50,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
         """List all trips owned by user_id. Never returns another user's trips."""
         uid_str = str(user_id)
 
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
-            items = [t for t in self._memory_trips.values() if str(t["user_id"]) == uid_str]
+            items = [
+                t for t in self._memory_trips.values()
+                if str(t["user_id"]) == uid_str and (include_deleted or str(t.get("status") or "").lower() != "deleted")
+            ]
             items.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
             return [dict(t) for t in items[:limit]]
 
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM trips WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
-                (uid_str, limit),
-            ).fetchall()
+            query = "SELECT * FROM trips WHERE user_id = %s"
+            if not include_deleted:
+                query += " AND status != 'deleted'"
+            query += " ORDER BY created_at DESC LIMIT %s"
+            rows = conn.execute(query, (uid_str, limit)).fetchall()
             return [dict(r) for r in rows]
 
-    def delete_trip(self, trip_id: str | uuid.UUID, user_id: str | uuid.UUID) -> bool:
-        """Delete trip strictly scoped by user_id."""
+    def delete_trip(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        soft: bool = True,
+    ) -> bool:
+        """Delete trip strictly scoped by user_id.
+
+        By default performs a safe soft-delete/archive, preserving foreign keys,
+        revision histories, evidence chains, and audit trails intact.
+        """
         tid_str = str(trip_id)
         uid_str = str(user_id)
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
 
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             t = self._memory_trips.get(tid_str)
             if t and str(t["user_id"]) == uid_str:
-                del self._memory_trips[tid_str]
-                # Cascade delete associated threads
-                for th_id, th in list(self._memory_threads.items()):
-                    if str(th.get("trip_id")) == tid_str:
-                        del self._memory_threads[th_id]
-                return True
+                if soft:
+                    if str(t.get("status") or "").lower() == "deleted":
+                        return False
+                    t["status"] = "deleted"
+                    meta = t.setdefault("metadata", {})
+                    if isinstance(meta, dict):
+                        meta["deleted_at"] = now_iso
+                    t["updated_at"] = now
+                    return True
+                else:
+                    del self._memory_trips[tid_str]
+                    for th_id, th in list(self._memory_threads.items()):
+                        if str(th.get("trip_id")) == tid_str:
+                            del self._memory_threads[th_id]
+                    return True
             return False
 
         with self._connect() as conn:
-            row = conn.execute(
-                "DELETE FROM trips WHERE id = %s AND user_id = %s RETURNING id",
-                (tid_str, uid_str),
-            ).fetchone()
-            return bool(row)
+            if soft:
+                row = conn.execute(
+                    """
+                    UPDATE trips
+                    SET status = 'deleted',
+                        metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{deleted_at}', to_jsonb(%s::text)),
+                        updated_at = %s
+                    WHERE id = %s AND user_id = %s AND status != 'deleted'
+                    RETURNING id
+                    """,
+                    (now_iso, now, tid_str, uid_str),
+                ).fetchone()
+                return bool(row)
+            else:
+                row = conn.execute(
+                    "DELETE FROM trips WHERE id = %s AND user_id = %s RETURNING id",
+                    (tid_str, uid_str),
+                ).fetchone()
+                return bool(row)
+
+    def check_trip_deletion_eligibility(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        """Check whether a trip is safe and eligible for deletion under canonical business rules.
+
+        Returns:
+            (is_eligible: bool, refusal_reason: str | None, trip: dict | None)
+        """
+        trip = self.get_trip(trip_id, user_id, include_deleted=True)
+        if not trip:
+            return False, "Trip not found or does not belong to you.", None
+
+        if str(trip.get("status") or "").lower() == "deleted":
+            return False, "Trip is already deleted.", trip
+
+        # 1. Ongoing trip check
+        meta = trip.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        constraints = meta.get("constraints") or {}
+        if isinstance(constraints, str):
+            try:
+                constraints = json.loads(constraints)
+            except Exception:
+                constraints = {}
+        if not isinstance(constraints, dict):
+            constraints = {}
+
+        plan = meta.get("plan") or {}
+        if isinstance(plan, str):
+            try:
+                plan = json.loads(plan)
+            except Exception:
+                plan = {}
+        if not isinstance(plan, dict):
+            plan = {}
+
+        raw_start = (
+            trip.get("start_date")
+            or meta.get("start_date")
+            or constraints.get("start_date")
+            or constraints.get("departure_date")
+            or plan.get("departure_date")
+            or plan.get("start_date")
+        )
+        raw_end = (
+            trip.get("end_date")
+            or meta.get("end_date")
+            or constraints.get("end_date")
+            or constraints.get("return_date")
+            or plan.get("return_date")
+            or plan.get("end_date")
+        )
+
+        now_utc = datetime.now(timezone.utc)
+        today = now_utc.date()
+
+        status_norm = str(trip.get("status") or "").strip().lower()
+
+        # 1. Reject trips whose authoritative lifecycle explicitly indicates travel is underway
+        if status_norm in ACTUALLY_ONGOING_STATUSES:
+            return False, f"Cannot delete trip: lifecycle state '{status_norm}' represents active or ongoing travel.", trip
+
+        # 2. Date-range ongoing check:
+        # Pre-travel planning states ('draft', 'planning', 'awaiting_approval') must not be considered
+        # ongoing solely because today's date falls between planned dates.
+        # For non-planning lifecycles, reject if current date falls within the trip's date range.
+        if status_norm not in ELIGIBLE_PRE_TRAVEL_STATUSES:
+            if raw_start and raw_end:
+                try:
+                    from datetime import date
+                    d_start = date.fromisoformat(str(raw_start)[:10])
+                    d_end = date.fromisoformat(str(raw_end)[:10])
+                    if d_start <= today <= d_end:
+                        return False, f"Cannot delete trip: travel is currently ongoing ({d_start.isoformat()} to {d_end.isoformat()}).", trip
+                except Exception as date_err:
+                    logger.warning("Could not parse trip dates for trip %s: %s", trip_id, date_err)
+                    if status_norm in ACTUALLY_ONGOING_STATUSES:
+                        return False, "Cannot delete trip with unverified dates in active status.", trip
+
+        # 2. Check bookings and payments using BookingReadService
+        try:
+            from services.booking_read_service import BookingReadService
+            booking_svc = BookingReadService()
+            bookings = booking_svc.get_trip_bookings(trip_id, user_id)
+        except Exception as exc:
+            logger.error("Failed to query booking records for trip %s: %s", trip_id, exc, exc_info=True)
+            return False, "Cannot verify booking safety state for trip deletion. Request failed closed.", trip
+
+        flight_info = bookings.get("flight")
+        if flight_info:
+            f_status = str(flight_info.get("status") or "").lower()
+            if flight_info.get("is_booked") or f_status in {"completed", "booked"}:
+                ref = flight_info.get("booking_reference") or flight_info.get("pnr") or "Confirmed"
+                return False, f"Cannot delete trip: confirmed flight booking exists (Reference: {ref}). Financial records are protected.", trip
+            if flight_info.get("in_progress") or f_status in {"handed_off", "revalidating", "ready_for_booking", "pending", "processing"}:
+                return False, "Cannot delete trip: flight booking or ticketing is currently in progress.", trip
+
+        hotel_info = bookings.get("hotel")
+        if hotel_info:
+            h_status = str(hotel_info.get("status") or "").lower()
+            h_pay_status = str(hotel_info.get("payment_status") or "").lower()
+            if hotel_info.get("is_booked") or h_status in {"booked", "confirmed"}:
+                conf = hotel_info.get("confirmation_code") or "Booked"
+                return False, f"Cannot delete trip: confirmed hotel booking exists (Confirmation: {conf}). Financial records are protected.", trip
+            if hotel_info.get("in_progress") or h_status in {"booking_in_progress", "awaiting_payment", "pending", "processing"}:
+                return False, "Cannot delete trip: hotel booking or reservation is currently in progress.", trip
+            if h_pay_status in {"captured", "authorized", "pending", "processing"}:
+                return False, "Cannot delete trip: unresolved or captured hotel payment exists.", trip
+
+        # 3. Direct inspection of booking_intents and hotel_transactions for unresolved or protected records
+        try:
+            from services.flight_booking_service import FlightBookingService, _dsn
+            if self.use_in_memory or not os.getenv("DATABASE_URL"):
+                for intent in FlightBookingService._IN_MEMORY_BOOKINGS.values():
+                    if str(intent.get("trip_id")) == str(trip_id) and str(intent.get("user_id")) == str(user_id):
+                        ist = str(intent.get("status") or "").upper()
+                        if ist in {"SELECTED", "COMPLETED", "HANDED_OFF", "REVALIDATING", "READY_FOR_BOOKING", "PENDING"}:
+                            return False, f"Cannot delete trip: protected flight booking intent in state '{ist}'.", trip
+            else:
+                with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+                    rows = conn.execute(
+                        "SELECT status FROM booking_intents WHERE trip_id = %s AND user_id = %s",
+                        (str(trip_id), str(user_id)),
+                    ).fetchall()
+                    for r in rows:
+                        ist = str(r["status"]).upper()
+                        if ist in {"SELECTED", "COMPLETED", "HANDED_OFF", "REVALIDATING", "READY_FOR_BOOKING", "PENDING"}:
+                            return False, f"Cannot delete trip: protected flight booking intent in state '{ist}'.", trip
+        except Exception as exc:
+            logger.error("Error inspecting flight booking intents for trip %s: %s", trip_id, exc, exc_info=True)
+            return False, "Could not verify flight booking intents. Deletion failed closed.", trip
+
+        try:
+            from services.hotel_transaction_store import HotelTransactionStore
+            if self.use_in_memory or not os.getenv("DATABASE_URL"):
+                for htx in BookingReadService._IN_MEMORY_HOTEL_BOOKINGS.values():
+                    if str(htx.get("trip_id")) == str(trip_id) and str(htx.get("customer_ref")) == str(user_id):
+                        bs = str(htx.get("booking_status") or "").lower()
+                        ps = str(htx.get("payment_status") or "").lower()
+                        if bs in {"booked", "confirmed", "booking_in_progress", "awaiting_payment"} or ps in {"captured", "authorized", "pending"}:
+                            return False, f"Cannot delete trip: protected hotel transaction in status '{bs}/{ps}'.", trip
+            else:
+                hstore = HotelTransactionStore()
+                htxs = hstore.get_by_trip(str(trip_id), customer_ref=str(user_id))
+                for htx in htxs:
+                    bs = str(htx.get("booking_status") or "").lower()
+                    ps = str(htx.get("payment_status") or "").lower()
+                    if bs in {"booked", "confirmed", "booking_in_progress", "awaiting_payment"} or ps in {"captured", "authorized", "pending"}:
+                        return False, f"Cannot delete trip: protected hotel transaction in status '{bs}/{ps}'.", trip
+        except Exception as exc:
+            logger.error("Error inspecting hotel transactions for trip %s: %s", trip_id, exc, exc_info=True)
+            return False, "Could not verify hotel transactions. Deletion failed closed.", trip
+
+        return True, None, trip
+
+    def delete_trip_atomic(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        """Atomically verify safe deletion eligibility under trip row lock and soft-delete.
+
+        Guarantees:
+        1. Universal parent trip row lock (SELECT ... FOR UPDATE) inside a single transaction.
+        2. Inspects latest committed canonical trip state, flight booking intents, and hotel transactions.
+        3. Prevents race conditions with concurrent booking or payment transitions.
+        4. Soft-deletes trip safely preserving audit trails, financial history, and foreign keys.
+
+        Returns:
+            (success: bool, error_reason: str | None, deleted_trip: dict | None)
+        """
+        try:
+            return self._delete_trip_atomic_internal(trip_id, user_id)
+        except psycopg.Error as db_err:
+            logger.error("Database error during atomic trip deletion for trip %s: %s", trip_id, db_err, exc_info=True)
+            err_msg = getattr(getattr(db_err, "diag", None), "message_primary", None) or str(db_err)
+            return False, f"Database invariant rejection: {err_msg}", None
+        except Exception as exc:
+            logger.error("Unexpected error during atomic trip deletion for trip %s: %s", trip_id, exc, exc_info=True)
+            return False, f"Trip deletion failed: {exc}", None
+
+    def _delete_trip_atomic_internal(
+        self,
+        trip_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        tid_str = str(trip_id)
+        uid_str = str(user_id)
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+
+        if self.use_in_memory or not os.getenv("DATABASE_URL"):
+            with _get_memory_trip_lock(tid_str):
+                t = self._memory_trips.get(tid_str)
+                if not t or str(t["user_id"]) != uid_str:
+                    return False, "Trip not found or does not belong to you.", None
+                if str(t.get("status") or "").lower() == "deleted":
+                    return False, "Trip not found or already deleted.", t
+
+                eligible, reason, _ = self.check_trip_deletion_eligibility(tid_str, uid_str)
+                if not eligible:
+                    return False, reason, t
+
+                t["status"] = "deleted"
+                meta = t.setdefault("metadata", {})
+                if isinstance(meta, dict):
+                    meta["deleted_at"] = now_iso
+                t["updated_at"] = now
+                return True, None, dict(t)
+
+        with self._connect(autocommit=False) as conn:
+            with conn.transaction():
+                # 1. Acquire parent trip row lock
+                row = conn.execute(
+                    "SELECT * FROM trips WHERE id = %s AND user_id = %s FOR UPDATE",
+                    (tid_str, uid_str),
+                ).fetchone()
+                if not row:
+                    return False, "Trip not found or does not belong to you.", None
+
+                trip = dict(row)
+                if str(trip.get("status") or "").lower() == "deleted":
+                    return False, "Trip not found or already deleted.", trip
+
+                # 2. Check ongoing dates
+                meta = trip.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+
+                constraints = meta.get("constraints") or {}
+                if isinstance(constraints, str):
+                    try:
+                        constraints = json.loads(constraints)
+                    except Exception:
+                        constraints = {}
+                if not isinstance(constraints, dict):
+                    constraints = {}
+
+                plan = meta.get("plan") or {}
+                if isinstance(plan, str):
+                    try:
+                        plan = json.loads(plan)
+                    except Exception:
+                        plan = {}
+                if not isinstance(plan, dict):
+                    plan = {}
+
+                raw_start = (
+                    trip.get("start_date")
+                    or meta.get("start_date")
+                    or constraints.get("start_date")
+                    or constraints.get("departure_date")
+                    or plan.get("departure_date")
+                    or plan.get("start_date")
+                )
+                raw_end = (
+                    trip.get("end_date")
+                    or meta.get("end_date")
+                    or constraints.get("end_date")
+                    or constraints.get("return_date")
+                    or plan.get("return_date")
+                    or plan.get("end_date")
+                )
+                today = now.date()
+                status_norm = str(trip.get("status") or "").strip().lower()
+
+                # 1. Reject trips whose authoritative lifecycle explicitly indicates travel is underway
+                if status_norm in ACTUALLY_ONGOING_STATUSES:
+                    return False, f"Cannot delete trip: lifecycle state '{status_norm}' represents active or ongoing travel.", trip
+
+                # 2. Date-range ongoing check:
+                # Pre-travel planning states ('draft', 'planning', 'awaiting_approval') must not be considered
+                # ongoing solely because today's date falls between planned dates.
+                # For non-planning lifecycles, reject if current date falls within the trip's date range.
+                if status_norm not in ELIGIBLE_PRE_TRAVEL_STATUSES:
+                    if raw_start and raw_end:
+                        try:
+                            from datetime import date
+                            d_start = date.fromisoformat(str(raw_start)[:10])
+                            d_end = date.fromisoformat(str(raw_end)[:10])
+                            if d_start <= today <= d_end:
+                                return False, f"Cannot delete trip: travel is currently ongoing ({d_start.isoformat()} to {d_end.isoformat()}).", trip
+                        except Exception as date_err:
+                            logger.warning("Could not parse dates for trip %s under lock: %s", tid_str, date_err)
+                            if status_norm in ACTUALLY_ONGOING_STATUSES:
+                                return False, "Cannot delete trip with unverified dates in active status.", trip
+
+                # 3. Direct inspection of flight booking intents inside locked connection
+                intent_rows = conn.execute(
+                    "SELECT status, provider_reference, metadata FROM booking_intents WHERE trip_id = %s AND user_id = %s",
+                    (tid_str, uid_str),
+                ).fetchall()
+                for ir in intent_rows:
+                    ist = str(ir["status"]).upper()
+                    imeta = ir.get("metadata") or {}
+                    if isinstance(imeta, str):
+                        try:
+                            imeta = json.loads(imeta)
+                        except Exception:
+                            imeta = {}
+                    is_cancelled = (
+                        imeta.get("status") == "CANCELLED"
+                        or imeta.get("cancellation")
+                        or imeta.get("cancelled_at")
+                    )
+                    if ist == "COMPLETED" and not is_cancelled:
+                        ref = ir.get("provider_reference") or imeta.get("booking_reference") or "Confirmed"
+                        return False, f"Cannot delete trip: confirmed flight booking exists (Reference: {ref}). Financial records are protected.", trip
+                    if ist in {"SELECTED", "HANDED_OFF", "REVALIDATING", "READY_FOR_BOOKING", "PENDING"}:
+                        return False, f"Cannot delete trip: flight booking intent is in progress ('{ist}').", trip
+
+                # 4. Direct inspection of hotel transactions inside locked connection
+                htx_rows = conn.execute(
+                    "SELECT booking_status, payment_status, booking_json FROM trust_trip_hotel_transactions WHERE trip_id = %s AND customer_ref = %s",
+                    (tid_str, uid_str),
+                ).fetchall()
+                for hr in htx_rows:
+                    hbs = str(hr["booking_status"] or "").lower()
+                    hps = str(hr["payment_status"] or "").lower()
+                    hjson = hr.get("booking_json") or {}
+                    if isinstance(hjson, str):
+                        try:
+                            hjson = json.loads(hjson)
+                        except Exception:
+                            hjson = {}
+                    if hbs in {"booked", "confirmed"}:
+                        conf = hjson.get("confirmation_code") or hjson.get("booking_id") or "Confirmed"
+                        return False, f"Cannot delete trip: confirmed hotel booking exists (Confirmation: {conf}). Financial records are protected.", trip
+                    if hbs in {"booking_in_progress", "awaiting_payment"}:
+                        return False, "Cannot delete trip: hotel booking or reservation is currently in progress.", trip
+                    if hps in {"captured", "authorized", "pending", "processing"}:
+                        return False, f"Cannot delete trip: unresolved or captured hotel payment exists ('{hps}').", trip
+
+                # 5. Perform safe soft-delete within the same locked transaction
+                updated = conn.execute(
+                    """
+                    UPDATE trips
+                    SET status = 'deleted',
+                        metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{deleted_at}', to_jsonb(%s::text)),
+                        updated_at = %s
+                    WHERE id = %s AND user_id = %s AND status != 'deleted'
+                    RETURNING *
+                    """,
+                    (now_iso, now, tid_str, uid_str),
+                ).fetchone()
+
+                if not updated:
+                    return False, "Trip deletion could not be completed. State may have changed concurrently.", trip
+
+                return True, None, dict(updated)
+
+
 
     def update_trip(
         self,
@@ -605,6 +1026,8 @@ class TripStore:
                 t = self._memory_trips.get(tid_str)
                 if not t or str(t["user_id"]) != uid_str:
                     raise OfferSelectionError(404, "Trip not found or does not belong to you.")
+                if str(t.get("status") or "").lower() == "deleted":
+                    raise OfferSelectionError(404, "Trip not found or already deleted.")
                 trip = dict(t)
 
                 current_revision = resolve_current_revision(trip)
@@ -777,6 +1200,8 @@ class TripStore:
                 if not row:
                     raise OfferSelectionError(404, "Trip not found or does not belong to you.")
                 trip = dict(row)
+                if str(trip.get("status") or "").lower() == "deleted":
+                    raise OfferSelectionError(404, "Trip not found or already deleted.")
 
                 # 2. Strict revision resolution
                 current_revision = resolve_current_revision(trip)

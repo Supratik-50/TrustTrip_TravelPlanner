@@ -40,47 +40,72 @@ class HotelTransactionStore:
             VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (d['id'],d.get('customer_ref'),d['provider'],d.get('hotel_name'),json.dumps(d['offer']),json.dumps(d['prebook']),json.dumps(d['holder']),json.dumps(d['guests']),d['amount_inr'],d.get('razorpay_order_id'),'created','awaiting_payment',d.get('trip_id'),d.get('revision_id'),d.get('revision_number'),d.get('payment_idempotency_key')))
     def reserve_payment_order(self, **d):
-        with self.connect() as c:
-            row = c.execute("""
-                INSERT INTO trust_trip_hotel_transactions
-                (id,customer_ref,provider,hotel_name,offer_json,prebook_json,holder_json,guests_json,
-                 amount_inr,razorpay_order_id,payment_status,booking_status,trip_id,revision_id,
-                 revision_number,payment_idempotency_key)
-                VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,NULL,
-                        'created','awaiting_payment',%s,%s,%s,%s)
-                ON CONFLICT (payment_idempotency_key)
-                WHERE payment_idempotency_key IS NOT NULL
-                DO NOTHING
-                RETURNING *
-            """, (d['id'], d.get('customer_ref'), d['provider'], d.get('hotel_name'),
-                  json.dumps(d['offer']), json.dumps(d['prebook']), json.dumps(d['holder']),
-                  json.dumps(d['guests']), d['amount_inr'], d.get('trip_id'),
-                  d.get('revision_id'), d.get('revision_number'), d['payment_idempotency_key'])).fetchone()
-            if row:
-                return row
-            existing = c.execute(
-                "SELECT * FROM trust_trip_hotel_transactions WHERE payment_idempotency_key=%s FOR UPDATE",
-                (d['payment_idempotency_key'],),
-            ).fetchone()
-            if existing:
-                def json_value(value):
-                    if isinstance(value, str):
-                        return json.loads(value)
-                    return value
-                same_request = (
-                    str(existing.get('customer_ref') or '') == str(d.get('customer_ref') or '')
-                    and str(existing.get('provider') or '') == str(d.get('provider') or '')
-                    and str(existing.get('trip_id') or '') == str(d.get('trip_id') or '')
-                    and str(existing.get('revision_id') or '') == str(d.get('revision_id') or '')
-                    and int(existing.get('revision_number') or 0) == int(d.get('revision_number') or 0)
-                    and round(float(existing.get('amount_inr') or 0), 2) == round(float(d.get('amount_inr') or 0), 2)
-                    and json_value(existing.get('offer_json')) == d.get('offer')
-                    and json_value(existing.get('holder_json')) == d.get('holder')
-                    and json_value(existing.get('guests_json')) == d.get('guests')
-                )
-                if not same_request:
-                    raise ValueError("payment_idempotency_key was already used with a different hotel payment request.")
-            return existing
+        trip_id = d.get('trip_id')
+        customer_ref = d.get('customer_ref')
+        with psycopg.connect(self.url, autocommit=False, row_factory=dict_row) as c:
+            with c.transaction():
+                if trip_id:
+                    # 1. Acquire row-level lock on authoritative parent trip row in the same transaction
+                    if customer_ref:
+                        trip_row = c.execute(
+                            "SELECT id, status, user_id FROM trips WHERE id = %s AND user_id = %s FOR UPDATE",
+                            (str(trip_id), str(customer_ref)),
+                        ).fetchone()
+                    else:
+                        trip_row = c.execute(
+                            "SELECT id, status, user_id FROM trips WHERE id = %s FOR UPDATE",
+                            (str(trip_id),),
+                        ).fetchone()
+                    if not trip_row:
+                        unowned = c.execute("SELECT id FROM trips WHERE id = %s", (str(trip_id),)).fetchone()
+                        if unowned:
+                            raise ValueError(f"Access denied: Trip '{trip_id}' does not belong to you.")
+                        raise ValueError(f"Trip '{trip_id}' not found.")
+                    t_status = str(trip_row["status"] if "status" in trip_row else trip_row[1]).lower()
+                    if t_status == "deleted":
+                        raise ValueError(f"Cannot initialize hotel booking: trip '{trip_id}' is already deleted.")
+
+                # 2. Insert transaction inside the exact same locked transaction
+                row = c.execute("""
+                    INSERT INTO trust_trip_hotel_transactions
+                    (id,customer_ref,provider,hotel_name,offer_json,prebook_json,holder_json,guests_json,
+                     amount_inr,razorpay_order_id,payment_status,booking_status,trip_id,revision_id,
+                     revision_number,payment_idempotency_key)
+                    VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,NULL,
+                            'created','awaiting_payment',%s,%s,%s,%s)
+                    ON CONFLICT (payment_idempotency_key)
+                    WHERE payment_idempotency_key IS NOT NULL
+                    DO NOTHING
+                    RETURNING *
+                """, (d['id'], d.get('customer_ref'), d['provider'], d.get('hotel_name'),
+                      json.dumps(d['offer']), json.dumps(d['prebook']), json.dumps(d['holder']),
+                      json.dumps(d['guests']), d['amount_inr'], d.get('trip_id'),
+                      d.get('revision_id'), d.get('revision_number'), d['payment_idempotency_key'])).fetchone()
+                if row:
+                    return row
+                existing = c.execute(
+                    "SELECT * FROM trust_trip_hotel_transactions WHERE payment_idempotency_key=%s FOR UPDATE",
+                    (d['payment_idempotency_key'],),
+                ).fetchone()
+                if existing:
+                    def json_value(value):
+                        if isinstance(value, str):
+                            return json.loads(value)
+                        return value
+                    same_request = (
+                        str(existing.get('customer_ref') or '') == str(d.get('customer_ref') or '')
+                        and str(existing.get('provider') or '') == str(d.get('provider') or '')
+                        and str(existing.get('trip_id') or '') == str(d.get('trip_id') or '')
+                        and str(existing.get('revision_id') or '') == str(d.get('revision_id') or '')
+                        and int(existing.get('revision_number') or 0) == int(d.get('revision_number') or 0)
+                        and round(float(existing.get('amount_inr') or 0), 2) == round(float(d.get('amount_inr') or 0), 2)
+                        and json_value(existing.get('offer_json')) == d.get('offer')
+                        and json_value(existing.get('holder_json')) == d.get('holder')
+                        and json_value(existing.get('guests_json')) == d.get('guests')
+                    )
+                    if not same_request:
+                        raise ValueError("payment_idempotency_key was already used with a different hotel payment request.")
+                return existing
     def list_recent(self, limit=50, customer_ref=None):
         with self.connect() as c:
             if customer_ref:

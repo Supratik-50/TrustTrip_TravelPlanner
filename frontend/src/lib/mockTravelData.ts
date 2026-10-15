@@ -745,6 +745,43 @@ export const getMockResearchSession = (sessionId: string, tripId?: string): Rese
   return defaultSession;
 };
 
+export const MOCK_STORAGE_HISTORY_KEY = 'trusttrip_demo_mock_history';
+
+export const getMockResearchHistory = (tripId?: string): ResearchHistoryItem[] => {
+  try {
+    const raw = localStorage.getItem(MOCK_STORAGE_HISTORY_KEY);
+    const parsed: ResearchHistoryItem[] = raw ? JSON.parse(raw) : [];
+    if (tripId) {
+      return parsed.filter((item) => !item.trip_id || item.trip_id === tripId);
+    }
+    return parsed;
+  } catch {
+    return [];
+  }
+};
+
+export const saveMockResearchHistoryItem = (item: ResearchHistoryItem): void => {
+  try {
+    const list = getMockResearchHistory();
+    const updated = [item, ...list.filter((x) => x.id !== item.id && x.query_id !== item.query_id)];
+    localStorage.setItem(MOCK_STORAGE_HISTORY_KEY, JSON.stringify(updated));
+  } catch {}
+};
+
+export const deleteMockResearchHistoryEntry = (historyId: string): void => {
+  try {
+    const list = getMockResearchHistory();
+    const updated = list.filter((x) => x.id !== historyId);
+    localStorage.setItem(MOCK_STORAGE_HISTORY_KEY, JSON.stringify(updated));
+  } catch {}
+};
+
+export const clearMockResearchHistory = (): void => {
+  try {
+    localStorage.removeItem(MOCK_STORAGE_HISTORY_KEY);
+  } catch {}
+};
+
 export const saveMockResearchQuery = (
   sessionId: string,
   response: ResearchResponse
@@ -763,6 +800,25 @@ export const saveMockResearchQuery = (
     session.updated_at = new Date().toISOString();
     parsed[sessionId] = session;
     localStorage.setItem(MOCK_STORAGE_SESSIONS_KEY, JSON.stringify(parsed));
+
+    const historyItem: ResearchHistoryItem = {
+      id: `rh_${response.query_id || Date.now().toString(36)}`,
+      user_id: 'usr_demo',
+      session_id: sessionId,
+      query_id: response.query_id || `q_${Date.now().toString(36)}`,
+      trip_id: response.trip_id,
+      query_text: response.query_text || response.question || 'Travel query',
+      mode: response.mode || 'auto',
+      intent: response.intent,
+      answer: response.answer,
+      evidence_status: response.evidence_status || 'complete',
+      evidence_count: response.evidence_count || response.citations?.length || 0,
+      citations: response.citations || [],
+      facts: response.facts || [],
+      conflicts: response.conflicts || [],
+      created_at: response.created_at || new Date().toISOString(),
+    };
+    saveMockResearchHistoryItem(historyItem);
   } catch {}
 };
 
