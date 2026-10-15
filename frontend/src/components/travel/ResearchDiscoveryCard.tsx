@@ -250,7 +250,11 @@ export const ResearchDiscoveryCard: React.FC<ResearchDiscoveryCardProps> = ({
         {/* Citations Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {result.citations.map((cit, idx) => {
-            const isDoc = cit.source_type === 'document' || cit.source_type === 'rag';
+            const isDoc =
+              cit.source_type === 'document' ||
+              cit.source_type === 'rag' ||
+              cit.domain === 'local.document' ||
+              (Boolean(cit.canonical_url) && cit.canonical_url.startsWith('document://'));
             const displayTitle = cit.title || cit.domain || 'Verified Knowledge Source';
             return (
               <div

@@ -159,6 +159,10 @@ class ResearchCitation(BaseModel):
     locator: str | None = None
     cited_claims: list[str] = Field(default_factory=list)
     source_id: UUID | None = None
+    source_type: str | None = None
+    snippet: str | None = None
+    url: str | None = None
+    publisher: str | None = None
 
 
 class ResearchFact(BaseModel):

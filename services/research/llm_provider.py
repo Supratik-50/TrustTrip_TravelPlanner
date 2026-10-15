@@ -29,13 +29,13 @@ class GroqLLMProvider(LLMProviderPort):
         model: str | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("GROQ_API_KEY", "")
-        self.model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.model = model or os.getenv("RESEARCH_GROQ_MODEL", "openai/gpt-oss-20b")
 
     async def synthesize(
         self,
         system_instruction: str,
         untrusted_evidence_prompt: str,
-        call_timeout: float = 20.0,
+        call_timeout: float = 25.0,
     ) -> str:
         if not self.api_key:
             raise LLMProviderUnavailableError("GROQ_API_KEY is not configured.")
@@ -44,37 +44,71 @@ class GroqLLMProvider(LLMProviderPort):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": untrusted_evidence_prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 1024,
-        }
 
-        try:
-            async with httpx.AsyncClient(timeout=call_timeout) as client:
-                response = await client.post(self.BASE_URL, headers=headers, json=payload)
+        candidate_models = [self.model]
+        for fb in ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"):
+            if fb not in candidate_models:
+                candidate_models.append(fb)
 
-            if response.status_code == 429:
-                raise LLMProviderUnavailableError("Groq API rate limit exceeded (HTTP 429).")
-            if not response.is_success:
-                raise LLMProviderUnavailableError(f"Groq API returned HTTP {response.status_code}: {response.text}")
+        import asyncio
+        last_error_text = ""
+        for mod in candidate_models:
+            for attempt in range(2):
+                payload = {
+                    "model": mod,
+                    "messages": [
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": untrusted_evidence_prompt},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 4096,
+                }
 
-            data = response.json()
-            choices = data.get("choices") or []
-            if not choices:
-                raise LLMProviderUnavailableError("Groq returned empty choices.")
+                try:
+                    async with httpx.AsyncClient(timeout=call_timeout) as client:
+                        response = await client.post(self.BASE_URL, headers=headers, json=payload)
 
-            content = (choices[0].get("message") or {}).get("content") or ""
-            return content.strip()
+                    if response.status_code == 429:
+                        retry_after = 1.5
+                        try:
+                            ra_header = response.headers.get("retry-after")
+                            if ra_header:
+                                retry_after = max(1.0, min(5.0, float(ra_header)))
+                        except Exception:
+                            pass
+                        last_error_text = f"Groq API rate limit (429) on model '{mod}'"
+                        await asyncio.sleep(retry_after)
+                        continue
 
-        except httpx.TimeoutException as exc:
-            raise LLMProviderUnavailableError(f"Groq API timed out after {call_timeout}s: {exc}") from exc
-        except httpx.RequestError as exc:
-            raise LLMProviderUnavailableError(f"Groq network connection failed: {exc}") from exc
+                    if response.status_code in (400, 404) and "model" in response.text.lower():
+                        last_error_text = response.text
+                        break  # Try next candidate model
+
+                    if not response.is_success:
+                        last_error_text = f"Groq API returned HTTP {response.status_code}: {response.text}"
+                        break  # Try next candidate model
+
+                    data = response.json()
+                    choices = data.get("choices") or []
+                    if not choices:
+                        last_error_text = "Groq returned empty choices."
+                        break
+
+                    content = (choices[0].get("message") or {}).get("content") or ""
+                    if not content.strip():
+                        last_error_text = f"Model '{mod}' returned empty content (reasoning exhausted tokens)."
+                        break  # Try next candidate model
+
+                    return content.strip()
+
+                except httpx.TimeoutException as exc:
+                    last_error_text = f"Groq API timed out after {call_timeout}s: {exc}"
+                    break
+                except httpx.RequestError as exc:
+                    last_error_text = f"Groq network connection failed: {exc}"
+                    break
+
+        raise LLMProviderUnavailableError(f"Groq candidate models failed: {last_error_text}")
 
 
 class DeterministicTestLLMProvider(LLMProviderPort):

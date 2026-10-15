@@ -84,6 +84,18 @@ def pg_schema():
             with open(m006_path, "r", encoding="utf-8") as f:
                 cur.execute(f.read())
 
+            # Load migration 008
+            m008_path = r"n:\Documents\GitHub\TrustTrip_TravelPlanner\migrations\008_research_evidence_nullable_metadata.sql"
+            if os.path.exists(m008_path):
+                with open(m008_path, "r", encoding="utf-8") as f:
+                    cur.execute(f.read())
+
+            # Load migration 013
+            m013_path = r"n:\Documents\GitHub\TrustTrip_TravelPlanner\migrations\013_rag_chunks_bge_vector_384.sql"
+            if os.path.exists(m013_path):
+                with open(m013_path, "r", encoding="utf-8") as f:
+                    cur.execute(f.read())
+
         yield schema_name
 
     finally:
@@ -311,7 +323,7 @@ def test_postgres_vector_store_persistence_across_restart(pg_schema):
     # Step 1: Upsert using first instance
     store_1 = PostgresVectorStore(db_url=DB_URL, schema=pg_schema)
 
-    # Validate 128 dimension enforcement
+    # Validate 384 dimension enforcement
     invalid_emb = [0.1] * 64
     chunk = RagChunk(
         chunk_id=uuid4(),
@@ -323,11 +335,11 @@ def test_postgres_vector_store_persistence_across_restart(pg_schema):
         content_hash="hash_validity",
         metadata={"category": "passport"},
     )
-    with pytest.raises(ValueError, match="Embedding dimension must be exactly 128"):
+    with pytest.raises(ValueError, match="Embedding dimension must be exactly 384"):
         store_1.upsert_chunks([chunk], [invalid_emb])
 
-    # Valid 128-dimensional embedding
-    valid_emb = [0.0] * 128
+    # Valid 384-dimensional embedding
+    valid_emb = [0.0] * 384
     valid_emb[0] = 1.0  # Unit vector on first axis
     count = store_1.upsert_chunks([chunk], [valid_emb])
     assert count == 1
@@ -336,7 +348,7 @@ def test_postgres_vector_store_persistence_across_restart(pg_schema):
     store_2 = PostgresVectorStore(db_url=DB_URL, schema=pg_schema)
 
     # Query with exact matching vector
-    query_vec = [0.0] * 128
+    query_vec = [0.0] * 384
     query_vec[0] = 1.0
     results = store_2.query_similar(query_vec, user_id=user_a, top_k=5)
     assert len(results) == 1
@@ -639,5 +651,196 @@ def test_postgres_cross_tenant_composite_fk_rejection(pg_schema):
                         id, document_id, user_id, chunk_index, text_content, token_count, content_hash, created_at
                     ) VALUES (%s, %s, %s, 0, 'Cross-tenant text', 5, 'cth', %s)
                 """, (uuid4(), doc_a, user_b, now))
+    finally:
+        conn.close()
+
+
+def test_postgres_document_persistence_atomic_service_path(pg_schema):
+    """Verify that ResearchStore.save_document atomically persists parent document
+    before dependent chunks with 384-dim embeddings, enables PostgresVectorStore similarity retrieval,
+    supports safe retries without duplicate chunks, and cascades on deletion."""
+    from services.research.research_store import ResearchStore
+    from services.research.rag.vector_store import PostgresVectorStore
+    from domain.research import RagDocument, RagChunk
+
+    user_id = uuid4()
+    other_user_id = uuid4()
+    conn = psycopg.connect(DB_URL, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {pg_schema}, public;")
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s), (%s, %s, %s)",
+                (user_id, f"docuser_{user_id.hex[:6]}@example.com", "hash",
+                 other_user_id, f"other_{other_user_id.hex[:6]}@example.com", "hash"),
+            )
+    finally:
+        conn.close()
+
+    # 1. Instantiate real PostgreSQL ResearchStore and VectorStore
+    store = ResearchStore(schema=pg_schema)
+    vstore = PostgresVectorStore(db_url=DB_URL, schema=pg_schema)
+
+    doc_id = uuid4()
+    chunk1_id = uuid4()
+    chunk2_id = uuid4()
+
+    doc = RagDocument(
+        document_id=doc_id,
+        user_id=user_id,
+        filename="tokyo_guide.pdf",
+        content_type="application/pdf",
+        file_size_bytes=4096,
+        content_hash="hash_tokyo_doc",
+        chunk_count=2,
+        title="Tokyo Travel Guide",
+    )
+
+    chunk1 = RagChunk(
+        chunk_id=chunk1_id,
+        document_id=doc_id,
+        user_id=user_id,
+        chunk_index=0,
+        text_content="Shinjuku Gyoen is a large park and garden in Shinjuku and Shibuya, Tokyo.",
+        token_count=16,
+        content_hash="hash_shinjuku",
+        metadata={"neighborhood": "Shinjuku"},
+    )
+
+    chunk2 = RagChunk(
+        chunk_id=chunk2_id,
+        document_id=doc_id,
+        user_id=user_id,
+        chunk_index=1,
+        text_content="Senso-ji is an ancient Buddhist temple located in Asakusa, Tokyo.",
+        token_count=13,
+        content_hash="hash_sensoji",
+        metadata={"neighborhood": "Asakusa"},
+    )
+
+    emb1 = [0.0] * 384
+    emb1[0] = 1.0  # Unit vector for chunk 1
+    emb2 = [0.0] * 384
+    emb2[1] = 1.0  # Unit vector for chunk 2
+
+    # 2. Persist parent document and dependent chunks atomically
+    store.save_document(doc, chunks=[chunk1, chunk2], embeddings=[emb1, emb2])
+
+    # 3. Verify parent document exists and is retrievable
+    user_docs = store.list_documents(user_id)
+    assert len(user_docs) == 1
+    assert user_docs[0].document_id == doc_id
+    assert user_docs[0].title == "Tokyo Travel Guide"
+
+    # 4. Verify vector retrieval via PostgresVectorStore
+    # Query matching chunk 1
+    query_vec1 = [0.0] * 384
+    query_vec1[0] = 1.0
+    results1 = vstore.query_similar(query_vec1, user_id=user_id, top_k=5)
+    assert len(results1) == 2
+    assert results1[0][0].chunk_id == chunk1_id
+    assert results1[0][1] > 0.99
+    assert "Shinjuku Gyoen" in results1[0][0].text_content
+
+    # Query matching chunk 2
+    query_vec2 = [0.0] * 384
+    query_vec2[1] = 1.0
+    results2 = vstore.query_similar(query_vec2, user_id=user_id, top_k=5)
+    assert results2[0][0].chunk_id == chunk2_id
+    assert results2[0][1] > 0.99
+    assert "Senso-ji" in results2[0][0].text_content
+
+    # 5. Verify tenant isolation: other user sees zero documents and zero chunks
+    other_docs = store.list_documents(other_user_id)
+    assert len(other_docs) == 0
+    other_results = vstore.query_similar(query_vec1, user_id=other_user_id, top_k=5)
+    assert len(other_results) == 0
+
+    # 6. Verify retry behavior without duplicate chunks or unique key violation
+    store.save_document(doc, chunks=[chunk1, chunk2], embeddings=[emb1, emb2])
+    # Total chunk count in database must still be exactly 2
+    conn = psycopg.connect(DB_URL, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {pg_schema}, public;")
+            cur.execute("SELECT COUNT(*) FROM rag_chunks WHERE document_id = %s", (doc_id,))
+            assert cur.fetchone()[0] == 2
+    finally:
+        conn.close()
+
+    # 7. Verify document deletion cleans up dependent chunks and vectors
+    deleted = store.delete_document(doc_id, user_id)
+    assert deleted is True
+    assert len(store.list_documents(user_id)) == 0
+
+    conn = psycopg.connect(DB_URL, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {pg_schema}, public;")
+            cur.execute("SELECT COUNT(*) FROM rag_chunks WHERE document_id = %s", (doc_id,))
+            assert cur.fetchone()[0] == 0, "Dependent rag_chunks must be cleanly deleted on parent document deletion"
+    finally:
+        conn.close()
+
+
+def test_postgres_document_persistence_rolls_back_on_chunk_failure(pg_schema):
+    """Verify that if chunk/vector persistence fails, the parent document insert
+    is rolled back transactionally and not left orphaned or falsely completed."""
+    from services.research.research_store import ResearchStore
+    from domain.research import RagDocument, RagChunk
+
+    user_id = uuid4()
+    conn = psycopg.connect(DB_URL, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {pg_schema}, public;")
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)",
+                (user_id, f"roll_{user_id.hex[:6]}@example.com", "hash"),
+            )
+    finally:
+        conn.close()
+
+    store = ResearchStore(schema=pg_schema)
+    failed_doc_id = uuid4()
+
+    doc = RagDocument(
+        document_id=failed_doc_id,
+        user_id=user_id,
+        filename="corrupted.pdf",
+        content_type="application/pdf",
+        file_size_bytes=2048,
+        content_hash="hash_corrupted",
+        chunk_count=1,
+        title="Corrupted Document",
+    )
+
+    # Chunk with invalid embedding dimension (64 instead of 384) to force vector insert rejection
+    bad_chunk = RagChunk(
+        chunk_id=uuid4(),
+        document_id=failed_doc_id,
+        user_id=user_id,
+        chunk_index=0,
+        text_content="This chunk has an invalid embedding.",
+        token_count=7,
+        content_hash="hash_bad",
+    )
+    invalid_embedding = [0.1] * 64
+
+    with pytest.raises(Exception):
+        store.save_document(doc, chunks=[bad_chunk], embeddings=[invalid_embedding])
+
+    # Assert parent document was rolled back and does not exist in PostgreSQL
+    user_docs = store.list_documents(user_id)
+    assert not any(d.document_id == failed_doc_id for d in user_docs), "Failed document must be rolled back"
+
+    conn = psycopg.connect(DB_URL, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {pg_schema}, public;")
+            cur.execute("SELECT COUNT(*) FROM rag_documents WHERE id = %s", (failed_doc_id,))
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT COUNT(*) FROM rag_chunks WHERE document_id = %s", (failed_doc_id,))
+            assert cur.fetchone()[0] == 0
     finally:
         conn.close()

@@ -61,8 +61,11 @@ _ROUTE_PATTERNS = [
 ]
 
 _DESTINATION_PATTERNS = [
-    r"\b(best time to visit|weather in|climate in|rainy season|peak season|off-peak|attractions in|culture in|safety in|tipping in)\b",
-    r"\b(what to pack|local customs|currency in|getting around|neighborhoods in)\b",
+    r"\b(best time to visit|weather|climate|rainy season|monsoon|monsoon season|peak season|off-peak)\b",
+    r"\b(attractions?|things to do|places to visit|sightseeing|monuments?|cultural attractions?|beaches?|beach|food|cuisine|dishes|local food|restaurants?)\b",
+    r"\b(what to pack|local customs|currency in|getting around|neighborhoods?|traditional neighborhoods?|culture|cultural|safety in|tipping in)\b",
+    r"\b(difference|differences|compare|contrast|versus|vs\.?)\b",
+    r"\b(before visiting|what should (i|travelers?|tourists?) know|guide to|overview of|things to know|must-know)\b",
 ]
 
 _ADVISORY_PATTERNS = [
@@ -98,7 +101,7 @@ class ResearchIntentRouter:
                 intent=ResearchIntent.AMBIGUOUS_RESEARCH,
                 confidence=0.0,
                 matched_rules=["empty_query"],
-                clarification_prompt="Please provide a travel research question or flight query.",
+                clarification_prompt="Please provide a travel research question.",
             )
 
         # Check ambiguous or vague queries
@@ -109,13 +112,12 @@ class ResearchIntentRouter:
                 confidence=0.30,
                 matched_rules=["vague_query"],
                 requires_live_handoff=False,
-                suggested_mode=ResearchMode.AUTO,
-                clarification_prompt="Could you clarify your travel research question? For live bookings, specify your departure and destination dates.",
+                suggested_mode=explicit_mode if explicit_mode != ResearchMode.AUTO else ResearchMode.AUTO,
+                clarification_prompt="Could you clarify your travel research question?",
             )
 
         # 1. Check live flight shopping signals first (hard boundary)
         live_matches = [p for p in _LIVE_SHOPPING_PATTERNS if re.search(p, clean_q)]
-        # However, if query explicitly asks about policy or baggage even if containing flight word
         policy_matches = [p for p in _POLICY_PATTERNS if re.search(p, clean_q)]
 
         if live_matches and not policy_matches:
@@ -127,7 +129,17 @@ class ResearchIntentRouter:
                 suggested_mode=ResearchMode.AUTO,
             )
 
-        # 2. Check document/RAG references
+        # 2. Check explicit mode contracts
+        if explicit_mode == ResearchMode.RAG:
+            return IntentDecision(
+                intent=ResearchIntent.DOCUMENT_RAG_RESEARCH,
+                confidence=0.95,
+                matched_rules=["explicit_rag_mode"],
+                requires_live_handoff=False,
+                suggested_mode=ResearchMode.RAG,
+            )
+
+        # Check document/RAG references
         doc_matches = [p for p in _DOCUMENT_PATTERNS if re.search(p, clean_q)]
         has_doc_intent = bool(doc_matches) or (has_docs and explicit_mode in (ResearchMode.RAG, ResearchMode.HYBRID))
 
@@ -144,17 +156,49 @@ class ResearchIntentRouter:
             explicit_mode == ResearchMode.WEB
         )
 
-        # Combined Web + RAG (documents present + research topic or explicit hybrid)
-        if (has_docs and has_web_intent) or (has_doc_intent and has_web_intent) or (has_docs and explicit_mode == ResearchMode.HYBRID):
+        if explicit_mode == ResearchMode.HYBRID:
             return IntentDecision(
                 intent=ResearchIntent.COMBINED_WEB_RAG_RESEARCH,
-                confidence=0.90,
-                matched_rules=(doc_matches + policy_matches + advisory_matches)[:5] or ["documents_attached"],
+                confidence=0.95,
+                matched_rules=(doc_matches + dest_matches + policy_matches)[:5] or ["explicit_hybrid_mode"],
                 requires_live_handoff=False,
                 suggested_mode=ResearchMode.HYBRID,
             )
 
-        if doc_matches or (has_doc_intent and (explicit_mode == ResearchMode.RAG or (has_docs and not has_web_intent))):
+        if explicit_mode == ResearchMode.WEB:
+            target_intent = ResearchIntent.DESTINATION_RESEARCH
+            if policy_matches:
+                target_intent = ResearchIntent.POLICY_RESEARCH
+            elif advisory_matches:
+                target_intent = ResearchIntent.TRAVEL_ADVISORY_RESEARCH
+            elif airport_matches:
+                target_intent = ResearchIntent.AIRPORT_RESEARCH
+            elif airline_matches:
+                target_intent = ResearchIntent.AIRLINE_RESEARCH
+            elif route_matches:
+                target_intent = ResearchIntent.ROUTE_RESEARCH
+            elif re.search(r"\b(flights?|fly|flying|plane|airlines?)\b", clean_q):
+                target_intent = ResearchIntent.GLOBAL_FLIGHT_RESEARCH
+
+            return IntentDecision(
+                intent=target_intent,
+                confidence=0.95,
+                matched_rules=dest_matches or policy_matches or ["explicit_web_mode"],
+                requires_live_handoff=False,
+                suggested_mode=ResearchMode.WEB,
+            )
+
+        # Combined Web + RAG (documents present + research topic or explicit hybrid)
+        if (has_docs and has_web_intent) or (has_doc_intent and has_web_intent):
+            return IntentDecision(
+                intent=ResearchIntent.COMBINED_WEB_RAG_RESEARCH,
+                confidence=0.90,
+                matched_rules=(doc_matches + policy_matches + advisory_matches + dest_matches)[:5] or ["documents_attached"],
+                requires_live_handoff=False,
+                suggested_mode=ResearchMode.HYBRID,
+            )
+
+        if doc_matches or (has_doc_intent and (has_docs and not has_web_intent)):
             return IntentDecision(
                 intent=ResearchIntent.DOCUMENT_RAG_RESEARCH,
                 confidence=0.90,
@@ -214,7 +258,7 @@ class ResearchIntentRouter:
                 confidence=0.85,
                 matched_rules=dest_matches,
                 requires_live_handoff=False,
-                suggested_mode=ResearchMode.WEB,
+                suggested_mode=ResearchMode.WEB if not has_docs else ResearchMode.HYBRID,
             )
 
         # Fallback to general flight research if mentions flights, flying, travel
@@ -224,8 +268,25 @@ class ResearchIntentRouter:
                 confidence=0.75,
                 matched_rules=["general_flight_keyword"],
                 requires_live_handoff=False,
-                suggested_mode=ResearchMode.WEB,
+                suggested_mode=ResearchMode.WEB if not has_docs else ResearchMode.HYBRID,
             )
+
+        # General travel question fallback (queries with 3+ tokens not asking for a booking)
+        if len(tokens) >= 3 and not any(w in tokens for w in ("book", "buy", "ticket", "tickets")):
+            return IntentDecision(
+                intent=ResearchIntent.DESTINATION_RESEARCH,
+                confidence=0.75,
+                matched_rules=["general_travel_query"],
+                requires_live_handoff=False,
+                suggested_mode=ResearchMode.WEB if not has_docs else ResearchMode.HYBRID,
+            )
+
+        is_flight_query = any(w in clean_q for w in ("flight", "flights", "fare", "fares"))
+        clarification = (
+            "For live bookings, specify your departure and destination dates."
+            if is_flight_query
+            else "Could you clarify your travel research question?"
+        )
 
         # Otherwise ambiguous
         return IntentDecision(
@@ -234,5 +295,5 @@ class ResearchIntentRouter:
             matched_rules=["no_confident_match"],
             requires_live_handoff=False,
             suggested_mode=ResearchMode.AUTO,
-            clarification_prompt="Could you clarify your travel research question? For live bookings, specify your departure and destination dates.",
+            clarification_prompt=clarification,
         )

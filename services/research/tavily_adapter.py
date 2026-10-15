@@ -18,7 +18,18 @@ from services.research.ports import (
     ResearchRateLimitError,
     ResearchTimeoutError,
 )
-from services.research.source_normalizer import build_normalized_source
+from services.research.source_normalizer import (
+    build_normalized_source,
+    clean_web_snippet,
+    is_community_or_video_domain,
+    is_substantive_content,
+)
+
+_EXCLUDED_COMMUNITY_DOMAINS: list[str] = [
+    "youtube.com", "youtu.be", "instagram.com", "tiktok.com",
+    "pinterest.com", "facebook.com", "twitter.com", "x.com",
+    "quora.com", "reddit.com",
+]
 
 
 class TavilyResearchProvider(ResearchProviderPort):
@@ -34,7 +45,7 @@ class TavilyResearchProvider(ResearchProviderPort):
         timeout_seconds: float | None = None,
         max_retries: int = 2,
     ) -> None:
-        self.api_key = api_key or os.getenv("TAVILY_API_KEY", "")
+        self.api_key = api_key if api_key is not None else os.getenv("TAVILY_API_KEY", "")
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self.default_timeout = timeout_seconds if timeout_seconds is not None else default_timeout
         self.timeout_seconds = self.default_timeout
@@ -61,7 +72,7 @@ class TavilyResearchProvider(ResearchProviderPort):
             raise ResearchProviderError("TAVILY_API_KEY is not configured.")
 
         timeout_sec = min(call_timeout, self.default_timeout)
-        max_res = max(1, min(10, max_results))
+        candidate_count = min(12, max(max_results * 2, 8))
 
         payload = {
             "api_key": self.api_key,
@@ -69,7 +80,8 @@ class TavilyResearchProvider(ResearchProviderPort):
             "search_depth": "advanced",
             "include_answer": False,
             "include_raw_content": False,
-            "max_results": max_res,
+            "max_results": candidate_count,
+            "exclude_domains": _EXCLUDED_COMMUNITY_DOMAINS,
         }
 
         async with self._semaphore:
@@ -108,16 +120,24 @@ class TavilyResearchProvider(ResearchProviderPort):
                         url = item.get("url") or ""
                         if not url or url in seen_urls:
                             continue
+                        if is_community_or_video_domain(url):
+                            continue
                         seen_urls.add(url)
                         title = item.get("title")
                         content = item.get("content") or ""
+                        cleaned_snippet = clean_web_snippet(content)
+                        # Require substantive content (Requirement 2 & 3)
+                        if not is_substantive_content(cleaned_snippet, min_chars=100):
+                            continue
                         source = build_normalized_source(
                             raw_url=url,
                             title=title,
-                            snippet=content[:2000],
+                            snippet=cleaned_snippet[:2500],
                             source_type=SourceType.WEB_PAGE,
                         )
                         sources.append(source)
+                        if len(sources) >= max_results:
+                            break
 
                     return sources
 

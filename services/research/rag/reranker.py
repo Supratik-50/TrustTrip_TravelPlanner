@@ -35,6 +35,8 @@ class LexicalSemanticReranker(RerankerPort):
         query_words = set(re.findall(r"\w+", clean_query))
         query_phrases = [p.strip() for p in clean_query.split() if len(p) > 3]
 
+        from services.research.source_normalizer import is_community_or_video_domain
+
         scored: list[ScoredPassage] = []
         for p in passages:
             trust_weight = 1.0
@@ -42,25 +44,32 @@ class LexicalSemanticReranker(RerankerPort):
                 if len(p) >= 2 and isinstance(p[1], SourceTrustClass):
                     item, text = p[0], p[0]
                     tc = p[1]
-                    if tc == SourceTrustClass.OFFICIAL:
-                        trust_weight = 1.2
-                    elif tc == SourceTrustClass.TRUSTED_SECONDARY:
-                        trust_weight = 1.1
-                    elif tc == SourceTrustClass.USER_PROVIDED:
-                        trust_weight = 1.05
                 elif len(p) >= 2 and isinstance(p[1], str) and len(p[1]) > len(str(p[0])):
                     item, text = p[0], p[1]
+                    tc = getattr(item, "trust_class", None)
                 else:
                     item, text = p[0], str(p[0])
+                    tc = getattr(item, "trust_class", None)
             elif isinstance(p, str):
                 item, text = p, p
+                tc = None
             else:
                 item, text = p, getattr(p, "text_content", str(p))
                 tc = getattr(p, "trust_class", None)
-                if tc == SourceTrustClass.OFFICIAL:
-                    trust_weight = 1.2
-                elif tc == SourceTrustClass.TRUSTED_SECONDARY:
-                    trust_weight = 1.1
+
+            # Assign quality weights based on authority and publisher tier
+            if tc == SourceTrustClass.OFFICIAL:
+                trust_weight = 1.35
+            elif tc == SourceTrustClass.TRUSTED_SECONDARY:
+                trust_weight = 1.20
+            elif tc == SourceTrustClass.USER_PROVIDED:
+                trust_weight = 1.10
+
+            # Demote user-generated forums, video snippets, and social media
+            url = getattr(item, "canonical_url", "") or getattr(item, "url", "")
+            domain = getattr(item, "domain", "")
+            if is_community_or_video_domain(domain) or is_community_or_video_domain(url) or "/shorts/" in str(url):
+                trust_weight = 0.55
 
             if not text:
                 scored.append(ScoredPassage(passage=item, score=0.0))

@@ -33,6 +33,8 @@ _OFFICIAL_TLDS: tuple[str, ...] = (
 _OFFICIAL_AUTHORITIES: tuple[str, ...] = (
     "who.int", "iata.org", "icao.int", "cdc.gov", "tsa.gov", "cbp.gov",
     "faa.gov", "caa.co.uk", "dgca.gov.in",
+    "incredibleindia.gov.in", "incredibleindia.org", "goatourism.gov.in",
+    "goatourism.org", "tourism.gov.in", "unesco.org",
 )
 
 _OFFICIAL_AIRLINES: tuple[str, ...] = (
@@ -49,7 +51,23 @@ _TRUSTED_SECONDARY_DOMAINS: tuple[str, ...] = (
     "bbc.com", "reuters.com", "cntraveler.com", "thepointsguy.com",
     "travelandleisure.com", "roughguides.com", "frequentmiler.com",
     "headforpoints.com", "seatguru.com", "flightradar24.com",
+    "wikivoyage.org", "fodors.com", "frommers.com", "theculturetrip.com",
+    "holidify.com", "thrillophilia.com", "trawell.in", "makemytrip.com",
+    "transindus.co.uk", "astorgoa.com",
 )
+
+_COMMUNITY_OR_VIDEO_DOMAINS: tuple[str, ...] = (
+    "youtube.com", "youtu.be", "quora.com", "reddit.com", "pinterest.com",
+    "tiktok.com", "instagram.com", "facebook.com", "twitter.com", "x.com",
+)
+
+
+def is_community_or_video_domain(hostname_or_url: str) -> bool:
+    """Check if domain is a user-generated forum, video, or social platform."""
+    for dom in _COMMUNITY_OR_VIDEO_DOMAINS:
+        if matches_domain(hostname_or_url, dom):
+            return True
+    return False
 
 
 def matches_domain(hostname_or_url: str, target_domain: str) -> bool:
@@ -150,19 +168,102 @@ def classify_source_trust(hostname: str) -> SourceTrustClass:
     return SourceTrustClass.UNKNOWN
 
 
+def clean_web_snippet(text: str) -> str:
+    """Remove navigation menus, cookie notices, brochures, and header boilerplate from web content."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    import re
+    # Strip HTML tags if any
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+
+    # 1. If an H1/H2 header '# ...' or '## ...' appears preceded by menu/nav lines, start from header
+    header_match = re.search(r"(?:^|\n)(#{1,3}\s+[^\n]+)", cleaned)
+    if header_match and header_match.start() < 800:
+        preceding = cleaned[:header_match.start()]
+        nav_indicators = [
+            "home", "brochure", "book", "login", "sign up", "menu",
+            "contact", "about us", "categories", "subscribe", "newsletter",
+            "skip to content", "toggle", "site-logo"
+        ]
+        if any(ind in preceding.lower() for ind in nav_indicators) or len(preceding.split("\n")) > 3:
+            cleaned = cleaned[header_match.start():].strip()
+
+    # 2. Strip common cookie banners, navigation breadcrumbs, and menu boilerplate lines
+    lines = cleaned.split("\n")
+    cleaned_lines: list[str] = []
+    skipping_nav = True
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if not skipping_nav:
+                cleaned_lines.append("")
+            continue
+
+        lower = stripped.lower()
+        if any(lower.startswith(p) for p in [
+            "cookie", "accept all", "privacy policy", "terms of use", "terms & conditions",
+            "you are here:", "home /", "home >", "navigation", "main menu",
+            "book your stay", "hotel brochure", "corporate brochure", "site-logo",
+            "toggle navigation", "skip to content", "advertisement",
+            "table of contents", "share on", "follow us", "posted by",
+            "log in", "sign up", "subscribe to", "leave a reply",
+        ]):
+            continue
+
+        if stripped.startswith("+ ") or stripped.startswith("* USA") or stripped.startswith("* UK"):
+            continue
+        if len(stripped.split()) <= 4 and any(w in lower for w in [
+            "menu", "login", "sign up", "contact us", "about us", "categoriesblog",
+            "all rights reserved", "copyright", "view cart"
+        ]):
+            continue
+
+        skipping_nav = False
+        cleaned_lines.append(line)
+
+    res = "\n".join(cleaned_lines).strip()
+    res = re.sub(r"\n{3,}", "\n\n", res)
+    res = re.sub(r"[ \t]{2,}", " ", res)
+    return res
+
+
+def is_substantive_content(text: str, min_chars: int = 100) -> bool:
+    """Determine whether extracted text contains substantive usable evidence content.
+
+    Rejects empty text, pure navigation/cookie boilerplate, or snippets too short to convey facts.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = clean_web_snippet(text)
+    if len(cleaned.strip()) < min_chars:
+        return False
+    lower = cleaned.lower()
+    if any(boilerplate in lower for boilerplate in [
+        "login to your account", "sign in to continue", "cookie preferences",
+        "enable javascript", "please turn javascript on", "403 forbidden",
+        "access denied", "page not found", "404 not found"
+    ]) and len(cleaned.split()) < 30:
+        return False
+    return True
+
+
 def build_normalized_source(
     raw_url: str,
     title: str | None = None,
     snippet: str = "",
     source_type: SourceType = SourceType.WEB_PAGE,
 ) -> ResearchSource:
-    """Create a canonical ResearchSource with normalized URL and computed content hash."""
+    """Create a canonical ResearchSource with normalized URL, cleaned snippet, and computed content hash."""
     canonical = normalize_canonical_url(raw_url)
     parsed = urlparse(canonical)
     domain = parsed.hostname or ""
 
+    cleaned_snippet = clean_web_snippet(snippet) if snippet else ""
+
     trust = classify_source_trust(domain)
-    content_hash = hashlib.sha256(f"{canonical}:{title or ''}:{snippet}".encode("utf-8")).hexdigest()
+    content_hash = hashlib.sha256(f"{canonical}:{title or ''}:{cleaned_snippet}".encode("utf-8")).hexdigest()
 
     return ResearchSource(
         source_id=uuid4(),
@@ -173,7 +274,7 @@ def build_normalized_source(
         source_type=source_type,
         trust_class=trust,
         content_hash=content_hash,
-        metadata={"snippet": snippet},
+        metadata={"snippet": cleaned_snippet},
     )
 
 

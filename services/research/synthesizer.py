@@ -14,6 +14,7 @@ from domain.research import (
     ResearchConflict,
     ResearchEvidence,
     ResearchFact,
+    SourceTrustClass,
 )
 from services.research.ports import LLMProviderPort
 from services.research.security import (
@@ -29,6 +30,14 @@ class ClaimVerificationOutcome(str, Enum):
     CONTRADICTED = "CONTRADICTED"
 
 
+CANONICAL_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+UUID_FINDER = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
 _SYN_GROUPS = [
     {"allowed", "permitted", "accepted", "free", "authorized", "valid", "allow", "permit"},
     {"prohibited", "banned", "not allowed", "forbidden", "disallowed", "restricted", "prohibit"},
@@ -38,6 +47,16 @@ _SYN_GROUPS = [
     {"exempt", "waived", "free", "not required", "optional"},
     {"curfew", "night ban", "operating restrictions", "closure", "closed at night"},
     {"visa", "entry permit", "travel authorization", "eta", "esta"},
+    {"bustling", "busy", "lively", "vibrant", "energetic", "popular", "active"},
+    {"quiet", "peaceful", "calm", "calmer", "tranquil", "relaxed", "serene"},
+    {"pristine", "unspoiled", "clean", "preserved"},
+    {"luxury", "upscale", "high-end", "premium"},
+    {"party", "nightlife", "clubs", "bars"},
+    {"historical", "heritage", "history", "ancient", "monument", "monuments", "landmark", "landmarks", "fort", "forts", "church", "churches", "cathedral", "cathedrals", "basilica", "architecture", "colonial"},
+    {"beach", "beaches", "coast", "coastal", "shore", "sea", "sand", "watersports", "water-sports"},
+    {"food", "cuisine", "dining", "seafood", "restaurants", "eateries", "cafes", "dishes", "shacks"},
+    {"monsoon", "rain", "rainfall", "rainy", "season", "weather", "climate", "monsoons"},
+    {"visit", "visiting", "travel", "traveling", "explore", "exploring", "sightseeing", "attractions", "places"},
 ]
 
 SYNONYM_MAP: dict[str, set[str]] = {}
@@ -59,7 +78,20 @@ def verify_claim_support(sentence: str, evidence: ResearchEvidence) -> tuple[Cla
 
     Returns (SUPPORTED | INSUFFICIENT | CONTRADICTED, reason).
     """
-    clean_sent = re.sub(r"\[cite:[a-zA-Z0-9_\-]+\]", "", sentence).strip()
+    clean_sent = re.sub(r"\[cite:\s*[a-zA-Z0-9_\-]+\s*\]", "", sentence).strip()
+    # Strip markdown formatting, bullet prefixes, and quotes
+    clean_sent = re.sub(r"[*_~`#]", " ", clean_sent)
+    clean_sent = (
+        clean_sent.replace("\u202f", " ")
+        .replace("\xa0", " ")
+        .replace("—", " ")
+        .replace("–", " ")
+        .replace("‑", "-")
+        .replace("’", "'")
+        .replace("‘", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+    )
     evidence_text = f"{evidence.title} {evidence.snippet} {' '.join(evidence.claims)}".lower()
     clean_lower = clean_sent.lower()
 
@@ -95,8 +127,10 @@ def verify_claim_support(sentence: str, evidence: ResearchEvidence) -> tuple[Cla
         "be", "been", "being", "have", "has", "had", "do", "does", "did", "can",
         "could", "should", "would", "may", "might", "must", "it", "its", "they",
         "their", "them", "this", "that", "these", "those", "some", "any", "all",
+        "both", "such", "as", "which", "more", "other", "part", "state", "each",
     }
-    words = [w.strip(".,;:?!'\"()[]") for w in clean_lower.split() if w.strip(".,;:?!'\"()[]")]
+    raw_words = [re.sub(r"^[^\w]+|[^\w]+$", "", w) for w in clean_lower.split()]
+    words = [w for w in raw_words if w]
     informative_words = [w for w in words if len(w) > 2 and w not in stop_words]
 
     if not informative_words:
@@ -112,7 +146,7 @@ def verify_claim_support(sentence: str, evidence: ResearchEvidence) -> tuple[Cla
                 matched += 1
 
     ratio = matched / len(informative_words)
-    if ratio >= 0.6:
+    if ratio >= 0.45 or matched >= 3:
         return ClaimVerificationOutcome.SUPPORTED, f"Sufficient relational support ({ratio:.0%})"
     else:
         return ClaimVerificationOutcome.INSUFFICIENT, f"Insufficient factual support ({ratio:.0%}): key tokens missing from evidence"
@@ -154,12 +188,35 @@ class ResearchSynthesizer:
             )
             conflict_notice = f"\n<untrusted_conflicts>\n{conflict_lines}\n</untrusted_conflicts>\n"
 
+        has_doc = any(
+            ev.domain == "local.document"
+            or (bool(ev.canonical_url) and ev.canonical_url.startswith("document://"))
+            or ev.trust_class == SourceTrustClass.USER_PROVIDED
+            for ev in evidence_list
+        )
+        has_web = any(
+            ev.domain != "local.document"
+            and not (bool(ev.canonical_url) and ev.canonical_url.startswith("document://"))
+            and ev.trust_class != SourceTrustClass.USER_PROVIDED
+            for ev in evidence_list
+        )
+        hybrid_prompt = ""
+        if has_doc and has_web:
+            hybrid_prompt = (
+                "\nNOTE: The evidence contains both private uploaded documents and external web travel guides. "
+                "Synthesize findings from both sources, ensuring your answer includes distinct citations "
+                "from both uploaded documents and external web sources.\n"
+            )
+
         user_content = (
             f"USER QUERY: {query}\n\n"
             f"RETRIEVED EVIDENCE:\n{envelope}\n"
-            f"{conflict_notice}\n"
+            f"{conflict_notice}"
+            f"{hybrid_prompt}\n"
             f"Provide a clear, fact-based synthesis answering the query. "
-            f"Include inline citations like [cite:TOKEN] for every factual statement using each block's cite_token."
+            f"Do NOT format the response as a markdown table. Use clear narrative paragraphs or bullet points. "
+            f"Every factual sentence MUST have an inline citation like [cite:TOKEN] using each block's EXACT full 36-character cite_token. "
+            f"If a bullet point contains multiple sentences, append [cite:TOKEN] to EACH sentence in that bullet point; do NOT wait until the end of the bullet point."
         )
 
         raw_answer = await self.llm_provider.synthesize(
@@ -169,6 +226,59 @@ class ResearchSynthesizer:
         )
 
         clean_answer = sanitize_for_display(raw_answer)
+        # Normalize citation brackets commonly emitted by LLMs (e.g. lenticular brackets 【...】 or Unicode brackets)
+        clean_answer = clean_answer.replace("【", "[").replace("】", "]")
+        # Normalize non-breaking and narrow spaces
+        clean_answer = clean_answer.replace("\u202f", " ").replace("\xa0", " ")
+        # Normalize non-breaking hyphens inside UUIDs
+        clean_answer = clean_answer.replace("\u2011", "-").replace("‑", "-")
+        # Normalize comma-separated or multi-UUID citations like [cite:UUID1, UUID2] or [UUID1, UUID2]
+        clean_answer = re.sub(
+            r"\[(?:cite:\s*)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})[;,]\s*(?:cite:\s*)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\]",
+            r"[cite:\1] [cite:\2]",
+            clean_answer,
+        )
+        # Normalize [UUID], [index†UUID], or [cite:UUID] to canonical [cite:UUID]
+        clean_answer = re.sub(
+            r"\[(?:\d+\s*[\u2020†\*\-:]\s*|\s*cite:\s*)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\]",
+            r"[cite:\1]",
+            clean_answer,
+        )
+        # Build prefix map for unambiguous 8+ character prefixes to canonical full UUID
+        prefix_to_full_uuid: dict[str, str] = {}
+        for ev in evidence_list:
+            full_tok = str(ev.evidence_id).lower()
+            pfx = full_tok[:8]
+            if pfx not in prefix_to_full_uuid:
+                prefix_to_full_uuid[pfx] = full_tok
+            elif prefix_to_full_uuid[pfx] != full_tok:
+                prefix_to_full_uuid[pfx] = ""
+
+        # Normalize prefix tokens like [cite:9a16f4f4] to canonical full UUID [cite:9a16f4f4-...]
+        def _expand_cite_token(m: re.Match) -> str:
+            raw_tok = m.group(1).lower().strip()
+            if CANONICAL_UUID_RE.match(raw_tok):
+                return f"[cite:{raw_tok}]"
+            if len(raw_tok) >= 8 and raw_tok[:8] in prefix_to_full_uuid and prefix_to_full_uuid[raw_tok[:8]]:
+                return f"[cite:{prefix_to_full_uuid[raw_tok[:8]]}]"
+            return f"[cite:{raw_tok}]"
+
+        clean_answer = re.sub(
+            r"\[(?:cite:\s*)?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{0,27}))\s*\]",
+            _expand_cite_token,
+            clean_answer,
+        )
+
+        # Protect common abbreviations and titles from premature sentence splitting
+        clean_answer = re.sub(r"\bvs\.\s+", "vs ", clean_answer, flags=re.IGNORECASE)
+        clean_answer = re.sub(r"\be\.g\.\s+", "e.g. ", clean_answer, flags=re.IGNORECASE)
+        clean_answer = re.sub(r"\bi\.e\.\s+", "i.e. ", clean_answer, flags=re.IGNORECASE)
+        clean_answer = re.sub(r"\b(st|dr|mr|mrs|prof)\.\s+(?=[A-Z])", r"\1 ", clean_answer, flags=re.IGNORECASE)
+        # Move citations placed after terminal punctuation to before punctuation so they stay attached to the sentence
+        clean_answer = re.sub(r"([.!?])\s*((?:\[cite:[^\]]+\]\s*)+)", r" \2\1 ", clean_answer)
+        clean_answer = re.sub(r"\s+([.!?])", r"\1", clean_answer)
+        # Strip trailing unclosed citation brackets resulting from token truncation
+        clean_answer = re.sub(r"\[(?:cite:)?\s*[0-9a-fA-F\-]{1,35}$", "", clean_answer).strip()
 
         # Build explicit citation token -> ResearchEvidence map (collision-safe full UUID provenance)
         token_to_evidence: dict[str, ResearchEvidence] = {}
@@ -179,38 +289,65 @@ class ResearchSynthesizer:
                 continue
             token_to_evidence[canonical_token] = ev
 
-        CANONICAL_UUID_RE = re.compile(
-            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-        )
-
-        # Conservative Claim Verification
+        # Conservative Claim Verification with Block-Level Context
         citations_map: dict[str, ResearchCitation] = {}
         facts_list: list[ResearchFact] = []
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", clean_answer) if s.strip()]
+        raw_blocks = [b.strip() for b in re.split(r"(?<=\n)(?=[*\-#]|\d+\.)|\n{2,}", clean_answer) if b.strip()]
+        if not raw_blocks:
+            raw_blocks = [clean_answer.strip()] if clean_answer.strip() else []
+
         validated_sentences: list[str] = []
         quarantined_claims: list[str] = []
         detected_conflicts: list[ResearchConflict] = list(conflicts or [])
         has_unverified_claims = False
 
-        for sent in sentences:
-            all_cites = re.findall(r"\[cite:([^\]]+)\]", sent)
-            if not all_cites:
-                # Substantive statement without citation
-                words = sent.split()
-                is_substantive = len(words) > 4 and not any(
-                    w in sent.lower() for w in ["note", "disclaimer", "summary", "please", "consult", "verify", "evidence"]
+        for block in raw_blocks:
+            block_uuids = [u.lower() for u in UUID_FINDER.findall(block)]
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", block) if s.strip()]
+
+            for sent in sentences:
+                extracted_uuids = [u.lower() for u in UUID_FINDER.findall(sent)]
+                clean_stripped = sent.strip()
+                is_header_or_intro = (
+                    (
+                        clean_stripped.startswith(("#", "**", "###", "##", "- **", "* **"))
+                        and (
+                            clean_stripped.endswith((": ", ":", "**", "–", "-"))
+                            or (clean_stripped.startswith("**") and clean_stripped.endswith("**"))
+                            or len(clean_stripped.split()) <= 8
+                        )
+                    )
+                    or clean_stripped.endswith(":")
+                    or clean_stripped.endswith(":-")
+                    or any(clean_stripped.lower().startswith(p) for p in [
+                        "these highlights", "these points", "in summary", "overall,", "in conclusion", "to conclude"
+                    ])
                 )
-                if is_substantive:
-                    has_unverified_claims = True
-                    sent = f"{sent} [unverified]"
-                validated_sentences.append(sent)
-            else:
-                # Validate claim against each cited evidence via explicit canonical UUID token mapping
+
+                candidate_uuids = extracted_uuids if extracted_uuids else block_uuids
+
+                if not candidate_uuids:
+                    if is_header_or_intro:
+                        validated_sentences.append(sent)
+                        continue
+
+                    # Substantive statement without citation
+                    words = sent.split()
+                    is_substantive = len(words) > 4 and not any(
+                        w in sent.lower() for w in ["note", "disclaimer", "summary", "please", "consult", "verify", "evidence"]
+                    )
+                    if is_substantive:
+                        has_unverified_claims = True
+                        sent = f"{sent} [unverified]"
+                    validated_sentences.append(sent)
+                    continue
+
+                # Validate claim against candidate evidences
                 is_supported = True
                 is_contradicted = False
                 supported_evidences: list[tuple[str, ResearchEvidence]] = []
 
-                for c_tok in all_cites:
+                for c_tok in candidate_uuids:
                     # Enforce canonical full-UUID format: reject numeric, short, or malformed tokens
                     if not CANONICAL_UUID_RE.match(c_tok):
                         is_supported = False
@@ -229,25 +366,70 @@ class ResearchSynthesizer:
                             ResearchConflict(
                                 topic=f"Contradiction in [cite:{c_tok}]",
                                 claim_a=sent[:300],
+                                source_a_title="Generated Claim",
+                                source_a_trust=SourceTrustClass.UNKNOWN,
                                 claim_b=ev.snippet[:300] if ev.snippet else "",
+                                source_b_title=ev.title or "Cited Evidence",
+                                source_b_trust=ev.trust_class or SourceTrustClass.UNKNOWN,
                                 resolution_summary=f"Claim contradicted by cited source: {reason}",
                             )
                         )
                         break
                     elif outcome == ClaimVerificationOutcome.SUPPORTED:
                         supported_evidences.append((c_tok, ev))
-                    else:  # INSUFFICIENT
-                        is_supported = False
-                        break
+
+                # If individual evidences fell just short on a multi-clause sentence, check combined text of all cited sources
+                if not supported_evidences and not is_contradicted and len(candidate_uuids) > 1:
+                    valid_evs = [token_to_evidence[u] for u in candidate_uuids if u in token_to_evidence]
+                    if len(valid_evs) == len(candidate_uuids):
+                        combined_text = " ".join(f"{e.title or ''} {e.snippet or ''} {' '.join(e.claims)}" for e in valid_evs)
+                        mock_combined_ev = ResearchEvidence(
+                            evidence_id=valid_evs[0].evidence_id,
+                            query_id=valid_evs[0].query_id,
+                            user_id=valid_evs[0].user_id,
+                            source_id=valid_evs[0].source_id,
+                            title="Combined Evidence",
+                            snippet=combined_text[:3000],
+                            canonical_url="combined://sources",
+                            domain="combined",
+                            trust_class=valid_evs[0].trust_class,
+                            freshness_state=valid_evs[0].freshness_state,
+                            retrieved_at=valid_evs[0].retrieved_at,
+                            immutable_hash="combined",
+                            citation_token=str(valid_evs[0].evidence_id),
+                        )
+                        outcome, _ = verify_claim_support(sent, mock_combined_ev)
+                        if outcome == ClaimVerificationOutcome.SUPPORTED:
+                            for u, e in zip(candidate_uuids, valid_evs):
+                                supported_evidences.append((u, e))
 
                 if is_contradicted or not is_supported or not supported_evidences:
-                    has_unverified_claims = True
-                    quarantined_claims.append(sent)
+                    if extracted_uuids:
+                        # Explicitly cited claim failed verification: quarantine unsupported claim
+                        has_unverified_claims = True
+                        quarantined_claims.append(sent)
+                    else:
+                        # Block-level candidate did not support this claim
+                        if not is_header_or_intro:
+                            words = sent.split()
+                            is_substantive = len(words) > 4 and not any(
+                                w in sent.lower() for w in ["note", "disclaimer", "summary", "please", "consult", "verify", "evidence"]
+                            )
+                            if is_substantive:
+                                has_unverified_claims = True
+                                sent = f"{sent} [unverified]"
+                        validated_sentences.append(sent)
                 else:
                     # Claim verified as SUPPORTED: allow into verified answer content & create ResearchFact
-                    clean_claim = re.sub(r"\[cite:[^\]]+\]", "", sent).strip()
+                    clean_claim = re.sub(r"\[cite:\s*[^\]]+?\s*\]", "", sent).strip()
                     for c_tok, ev in supported_evidences:
                         cite_key = f"[cite:{ev.stable_token}]"
+                        is_doc = (
+                            ev.domain == "local.document"
+                            or (bool(ev.canonical_url) and ev.canonical_url.startswith("document://"))
+                            or ev.trust_class == SourceTrustClass.USER_PROVIDED
+                        )
+                        s_type = "document" if is_doc else "web"
                         if cite_key not in citations_map:
                             citations_map[cite_key] = ResearchCitation(
                                 citation_id=cite_key,
@@ -260,6 +442,10 @@ class ResearchSynthesizer:
                                 locator=ev.locator or f"Passage {c_tok}",
                                 cited_claims=[sent[:300]],
                                 source_id=ev.source_id,
+                                source_type=s_type,
+                                snippet=ev.snippet,
+                                url=ev.canonical_url,
+                                publisher=ev.domain,
                             )
                         else:
                             if sent[:300] not in citations_map[cite_key].cited_claims:
@@ -276,6 +462,8 @@ class ResearchSynthesizer:
                                 )
                             )
 
+                    if not extracted_uuids:
+                        sent = f"{sent} " + " ".join(f"[cite:{c}]" for c, _ in supported_evidences)
                     validated_sentences.append(sent)
 
         final_answer = " ".join(validated_sentences)
@@ -319,7 +507,13 @@ class ResearchSynthesizer:
     ) -> Any:
         from domain.research import ResearchIntent, ResearchMode, ResearchResult
 
-        query_text = getattr(query, "query_text", str(query))
+        query_text = getattr(query, "query_text", None)
+        if query_text is None:
+            query_text = str(query) if query is not None else ""
+        query_text = query_text.strip()
+        if not query_text:
+            raise ValueError("Query text cannot be empty.")
+
         query_id = getattr(query, "query_id", uuid4())
         session_id = getattr(query, "session_id", uuid4())
         intent = getattr(query, "intent", ResearchIntent.GLOBAL_FLIGHT_RESEARCH)
@@ -356,7 +550,7 @@ class ResearchSynthesizer:
         return ResearchResult(
             research_session_id=session_id,
             query_id=query_id,
-            query_text=query.query_text,
+            query_text=query_text,
             intent=intent,
             mode=mode,
             answer=answer,

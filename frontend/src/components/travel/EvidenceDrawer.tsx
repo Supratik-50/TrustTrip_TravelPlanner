@@ -53,7 +53,13 @@ export const EvidenceDrawer: React.FC<EvidenceDrawerProps> = ({
     }
   };
 
-  const badge = getSourceTypeBadge(citation.source_type || 'web');
+  const isDoc =
+    citation.source_type === 'document' ||
+    citation.source_type === 'rag' ||
+    citation.domain === 'local.document' ||
+    (Boolean(citation.canonical_url) && citation.canonical_url.startsWith('document://'));
+  const resolvedType = isDoc ? 'document' : (citation.source_type || 'web');
+  const badge = getSourceTypeBadge(resolvedType);
 
   return (
     <div className="fixed inset-0 z-50 overflow-hidden">

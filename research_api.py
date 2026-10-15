@@ -22,7 +22,7 @@ from domain.research import (
 )
 from domain.user import UserResponse
 from services.research.orchestrator import ResearchOrchestrator
-from services.research.rag.embedding import DeterministicEmbeddingProvider
+from services.research.rag.embedding import get_embedding_provider
 from services.research.rag.ingestion import MAX_DOCUMENT_BYTES, IngestionError, ingest_document
 from services.research.rag.vector_store import get_vector_store
 from services.research.research_store import ResearchStore
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/research", tags=["research"])
 
 _vector_store = get_vector_store()
-_embedding_provider = DeterministicEmbeddingProvider()
+_embedding_provider = get_embedding_provider()
 _orchestrator = ResearchOrchestrator(vector_store=_vector_store, embedding_provider=_embedding_provider)
 _research_store = ResearchStore()
 _trip_store = TripStore()
@@ -141,13 +141,21 @@ def sanitize_upload_filename(raw_name: str | None, max_length: int = 128) -> str
 )
 async def upload_document(
     file: UploadFile = File(...),
-    trip_id: UUID | None = Form(default=None),
+    trip_id: str | None = Form(default=None),
     title: str | None = Form(default=None),
     current_user: UserResponse = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Upload and chunk a document for private RAG vector retrieval."""
-    if trip_id:
-        trip = _trip_store.get_trip(trip_id, current_user.id)
+    parsed_trip_id: UUID | None = None
+    if trip_id and str(trip_id).strip() and str(trip_id).strip() not in ("null", "undefined"):
+        try:
+            parsed_trip_id = UUID(str(trip_id).strip())
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid trip_id format.",
+            )
+        trip = _trip_store.get_trip(parsed_trip_id, current_user.id)
         if not trip:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -210,7 +218,7 @@ async def upload_document(
             filename=safe_filename,
             raw_bytes=raw_bytes,
             content_type=file.content_type,
-            trip_id=trip_id,
+            trip_id=parsed_trip_id,
             title=title,
         )
     except IngestionError as exc:
@@ -220,12 +228,15 @@ async def upload_document(
             detail="Document ingestion failed. Ensure document format and text encoding are valid.",
         )
 
-    # 4. Embed and index chunks with client-safe error handling
+    # 4. Embed and persist document and chunks atomically
     try:
         texts = [c.text_content for c in chunks]
         embeddings = _embedding_provider.embed_texts(texts)
-        _vector_store.upsert_chunks(chunks, embeddings)
-        _research_store.save_document(doc_record, chunks)
+        _research_store.save_document(doc_record, chunks=chunks, embeddings=embeddings)
+        from services.research.rag.vector_store import MemoryVectorStore
+        vstore = get_vector_store()
+        if isinstance(vstore, MemoryVectorStore):
+            vstore.upsert_chunks(chunks, embeddings)
     except Exception as exc:
         logger.error("Failed to index and store document for user %s: %s", current_user.id, exc, exc_info=True)
         raise HTTPException(

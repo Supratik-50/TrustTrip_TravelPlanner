@@ -6,6 +6,7 @@ Enforces strict tenant isolation: all queries require user_id scoping.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from datetime import datetime, timezone
@@ -51,11 +52,28 @@ class ResearchStore:
     _IN_MEM_CHUNKS: dict[str, list[RagChunk]] = {}
     _LOCK = threading.Lock()
 
-    def __init__(self) -> None:
-        self.use_in_memory = bool(os.getenv("USE_IN_MEMORY_AUTH"))
+    def __init__(self, db_url: str | None = None, schema: str | None = None, use_in_memory: bool | None = None) -> None:
+        self._force_in_memory = use_in_memory
+        self.db_url = db_url
+        self.schema = schema
+
+    @property
+    def use_in_memory(self) -> bool:
+        if self._force_in_memory is not None:
+            return self._force_in_memory
+        return bool(os.getenv("USE_IN_MEMORY_AUTH")) or not bool(os.getenv("DATABASE_URL"))
+
+    @use_in_memory.setter
+    def use_in_memory(self, val: bool | None) -> None:
+        self._force_in_memory = val
 
     def _connect(self):
-        return psycopg.connect(_dsn(), row_factory=dict_row, autocommit=True)
+        dsn = self.db_url or _dsn()
+        conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
+        if self.schema:
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {self.schema}, public;")
+        return conn
 
     # ==================== SESSIONS ====================
 
@@ -155,6 +173,22 @@ class ResearchStore:
                 return source
 
         with self._connect() as conn:
+            # Check if source with (user_id, canonical_url, content_hash) already exists
+            row = conn.execute(
+                "SELECT id FROM research_sources WHERE user_id = %s AND canonical_url = %s AND content_hash = %s",
+                (str(user_id), source.canonical_url, source.content_hash),
+            ).fetchone()
+            if row:
+                return source.model_copy(update={"source_id": UUID(str(row["id"]))})
+
+            # Check if source with id already exists
+            row = conn.execute(
+                "SELECT id FROM research_sources WHERE id = %s",
+                (str(source.source_id),),
+            ).fetchone()
+            if row:
+                return source
+
             conn.execute(
                 """
                 INSERT INTO research_sources (
@@ -349,56 +383,93 @@ class ResearchStore:
 
     # ==================== RAG DOCUMENTS & CHUNKS ====================
 
-    def save_document(self, doc: RagDocument, chunks: list[RagChunk]) -> None:
+    def save_document(
+        self,
+        doc: RagDocument,
+        chunks: list[RagChunk] | None = None,
+        embeddings: list[list[float]] | None = None,
+        embedding_model: str = "BAAI/bge-small-en-v1.5",
+    ) -> None:
         doc_str = str(doc.document_id)
         uid_str = str(doc.user_id)
 
         if self.use_in_memory or not os.getenv("DATABASE_URL"):
             with self._LOCK:
                 self._IN_MEM_DOCS[doc_str] = doc
-                self._IN_MEM_CHUNKS[doc_str] = chunks
+                self._IN_MEM_CHUNKS[doc_str] = chunks or []
                 return
 
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO rag_documents (
-                    id, user_id, trip_id, title, filename, content_type,
-                    file_size_bytes, content_hash, chunk_count, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    doc_str,
-                    uid_str,
-                    str(doc.trip_id) if doc.trip_id else None,
-                    doc.title,
-                    doc.filename,
-                    doc.content_type,
-                    doc.file_size_bytes,
-                    doc.content_hash,
-                    doc.chunk_count,
-                    doc.created_at,
-                ),
-            )
-            for c in chunks:
+            with conn.transaction():
+                # 1. Persist parent document first (fulfills foreign key requirement)
                 conn.execute(
                     """
-                    INSERT INTO rag_chunks (
-                        id, document_id, user_id, chunk_index, text_content,
-                        token_count, content_hash, metadata, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+                    INSERT INTO rag_documents (
+                        id, user_id, trip_id, title, filename, content_type,
+                        file_size_bytes, content_hash, chunk_count, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        chunk_count = EXCLUDED.chunk_count;
                     """,
                     (
-                        str(c.chunk_id),
                         doc_str,
                         uid_str,
-                        c.chunk_index,
-                        c.text_content,
-                        c.token_count,
-                        c.content_hash,
-                        json.dumps(c.metadata),
+                        str(doc.trip_id) if doc.trip_id else None,
+                        doc.title,
+                        doc.filename,
+                        doc.content_type,
+                        doc.file_size_bytes,
+                        doc.content_hash,
+                        doc.chunk_count,
+                        doc.created_at,
                     ),
                 )
+
+                # 2. Persist chunks and vectors exactly once within the same transaction
+                if chunks:
+                    emb_list = embeddings if embeddings and len(embeddings) == len(chunks) else None
+                    for idx, c in enumerate(chunks):
+                        vec_str = None
+                        if emb_list:
+                            emb = emb_list[idx]
+                            if len(emb) not in (384, 128):
+                                raise ValueError(f"Embedding dimension mismatch: expected 384, got {len(emb)}")
+                            for val in emb:
+                                if not math.isfinite(val):
+                                    raise ValueError("Embedding values must be finite numbers")
+                            vec_str = "[" + ",".join(str(float(x)) for x in emb) + "]"
+
+                        conn.execute(
+                            """
+                            INSERT INTO rag_chunks (
+                                id, document_id, user_id, chunk_index, text_content,
+                                token_count, content_hash, metadata, embedding, embedding_model, created_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s,
+                                %s, %s, %s::jsonb, %s::vector, %s, now()
+                            )
+                            ON CONFLICT (id) DO UPDATE SET
+                                text_content = EXCLUDED.text_content,
+                                token_count = EXCLUDED.token_count,
+                                content_hash = EXCLUDED.content_hash,
+                                metadata = EXCLUDED.metadata,
+                                embedding = COALESCE(EXCLUDED.embedding, rag_chunks.embedding),
+                                embedding_model = COALESCE(EXCLUDED.embedding_model, rag_chunks.embedding_model);
+                            """,
+                            (
+                                str(c.chunk_id),
+                                doc_str,
+                                uid_str,
+                                c.chunk_index,
+                                c.text_content,
+                                c.token_count,
+                                c.content_hash,
+                                json.dumps(c.metadata),
+                                vec_str,
+                                embedding_model if vec_str else None,
+                            ),
+                        )
 
     def list_documents(self, user_id: UUID) -> list[RagDocument]:
         uid_str = str(user_id)

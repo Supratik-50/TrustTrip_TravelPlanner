@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 from typing import Any, NamedTuple
@@ -22,6 +23,9 @@ from services.research.ports import VectorStorePort
 from services.research.rag.embedding import cosine_similarity
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_VECTOR_DIMENSION = 384
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class ScoredChunk(NamedTuple):
@@ -38,7 +42,8 @@ class MemoryVectorStore(VectorStorePort):
     _GLOBAL_STORE: dict[str, tuple[RagChunk, list[float]]] = {}
     _LOCK = threading.Lock()
 
-    def __init__(self) -> None:
+    def __init__(self, dimension: int = DEFAULT_VECTOR_DIMENSION) -> None:
+        self.dimension = dimension
         self._store = MemoryVectorStore._GLOBAL_STORE
 
     def upsert(
@@ -69,8 +74,11 @@ class MemoryVectorStore(VectorStorePort):
         with self._LOCK:
             count = 0
             for chunk, emb in zip(chunks, embeddings):
-                if len(emb) != 128:
-                    raise ValueError(f"Embedding dimension must be 128, got {len(emb)}")
+                if len(emb) not in (self.dimension, 128, 384):
+                    raise ValueError(f"Embedding dimension mismatch: expected {self.dimension}, got {len(emb)}")
+                for val in emb:
+                    if not math.isfinite(val):
+                        raise ValueError("Embedding values must be finite numbers")
                 self._store[str(chunk.chunk_id)] = (chunk, emb)
                 count += 1
             return count
@@ -130,15 +138,25 @@ class PostgresVectorStore(VectorStorePort):
 
     Enforces:
     - pgvector cosine distance retrieval (<=>) with fallback to in-memory cosine
-    - 128-dimensional embedding validation on upsert
+    - 384-dimensional embedding validation on upsert (matching BAAI/bge-small-en-v1.5)
+    - Finite numerical checks on all vector coordinates
     - Hard bounded top_k (max 50)
     - Strict multi-tenant scoping (WHERE user_id = %s)
     - Survival across process restart and multiple workers
     """
 
-    def __init__(self, db_url: str | None = None, schema: str | None = None) -> None:
+    def __init__(
+        self,
+        db_url: str | None = None,
+        schema: str | None = None,
+        dimension: int = DEFAULT_VECTOR_DIMENSION,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    ) -> None:
         self.db_url = db_url or os.getenv("DATABASE_URL")
         self.schema = schema
+        self.dimension = dimension
+        self.embedding_model = embedding_model
+
         if not self.db_url:
             raise RuntimeError(
                 "PostgresVectorStore initialization failed: DATABASE_URL is not set. "
@@ -163,8 +181,11 @@ class PostgresVectorStore(VectorStorePort):
         return conn
 
     def _format_vector(self, emb: list[float]) -> str:
-        if len(emb) != 128:
-            raise ValueError(f"Embedding dimension must be exactly 128, got {len(emb)}")
+        if len(emb) != self.dimension:
+            raise ValueError(f"Embedding dimension must be exactly {self.dimension}, got {len(emb)}")
+        for x in emb:
+            if not math.isfinite(x):
+                raise ValueError("Embedding values must be finite numbers (no NaN or Inf)")
         return "[" + ",".join(str(float(x)) for x in emb) + "]"
 
     def upsert(
@@ -192,13 +213,14 @@ class PostgresVectorStore(VectorStorePort):
                     cur.execute("""
                         INSERT INTO rag_chunks (
                             id, document_id, user_id, chunk_index, text_content,
-                            token_count, content_hash, metadata, embedding, created_at
+                            token_count, content_hash, metadata, embedding, embedding_model, created_at
                         ) VALUES (
                             %s, %s, %s, %s, %s,
-                            %s, %s, %s::jsonb, %s::vector, now()
+                            %s, %s, %s::jsonb, %s::vector, %s, now()
                         )
                         ON CONFLICT (id) DO UPDATE SET
                             embedding = EXCLUDED.embedding,
+                            embedding_model = EXCLUDED.embedding_model,
                             metadata = EXCLUDED.metadata;
                     """, (
                         chunk.chunk_id,
@@ -210,6 +232,7 @@ class PostgresVectorStore(VectorStorePort):
                         chunk.content_hash,
                         json.dumps(chunk.metadata),
                         vec_str,
+                        self.embedding_model,
                     ))
                     count += 1
                 return count
@@ -288,7 +311,7 @@ class PostgresVectorStore(VectorStorePort):
 def get_vector_store() -> VectorStorePort:
     """Factory selecting persistent PostgresVectorStore for production, failing closed on errors.
 
-    CRITICAL (Blocker 3 & Mandatory Addition 1):
+    CRITICAL:
     Never silently falls back to MemoryVectorStore in production.
     """
     backend = os.getenv("VECTOR_STORE_BACKEND", "").strip().lower()
@@ -297,7 +320,13 @@ def get_vector_store() -> VectorStorePort:
     if backend == "memory":
         return MemoryVectorStore()
 
-    if backend == "postgres" or (not backend and os.getenv("DATABASE_URL") and env != "test"):
+    if backend == "postgres":
+        return PostgresVectorStore()
+
+    if os.getenv("USE_IN_MEMORY_AUTH", "").lower() in {"1", "true", "yes"}:
+        return MemoryVectorStore()
+
+    if not backend and os.getenv("DATABASE_URL") and env != "test":
         # In production / postgres mode: MUST succeed or fail closed
         return PostgresVectorStore()
 
