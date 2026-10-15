@@ -183,6 +183,8 @@ class HotelOfferView(BaseModel):
     limitations: list[ProviderLimitationWarning] = Field(default_factory=list)
     is_recommended: bool = False
     recommendation_rank: int = 1
+    checkin: str | None = None
+    checkout: str | None = None
 
 
 # =====================================================================
@@ -268,6 +270,8 @@ class HotelOffer(BaseModel):
     limitations: list[ProviderLimitationWarning] = Field(default_factory=list)
     is_recommended: bool = False
     recommendation_rank: int = 1
+    checkin: str | None = None
+    checkout: str | None = None
 
     def to_client_view(self) -> HotelOfferView:
         data = self.model_dump(exclude={"provider_offer_id"})

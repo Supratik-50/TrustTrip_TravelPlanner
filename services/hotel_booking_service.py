@@ -46,6 +46,8 @@ class HotelBookingService:
         payment_idempotency_key: str,
         customer_ref: str | None = None,
         final_confirmation: bool = False,
+        prebook: dict[str, Any] | None = None,
+        prebook_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate snapshot ownership, revalidate rates, and initiate existing TrustTrip hotel checkout order.
 
@@ -90,6 +92,50 @@ class HotelBookingService:
 
         # 3. Format offer for existing HotelService and HotelTransactionStore
         hotel_offer: HotelOffer = snapshot.normalized_offer
+        checkin_date = getattr(hotel_offer, "checkin", None)
+        checkout_date = getattr(hotel_offer, "checkout", None)
+
+        trip_rec = None
+        t_meta: dict[str, Any] = {}
+        if trip_id:
+            from services.trip_store import TripStore
+            try:
+                trip_rec = TripStore().get_trip(str(trip_id), user_id)
+                if trip_rec:
+                    raw_meta = trip_rec.get("metadata") or {}
+                    if isinstance(raw_meta, str):
+                        try:
+                            t_meta = json.loads(raw_meta)
+                        except Exception:
+                            t_meta = {}
+                    elif isinstance(raw_meta, dict):
+                        t_meta = raw_meta
+            except Exception:
+                trip_rec = None
+
+        if not checkin_date or not checkout_date:
+            t_const = t_meta.get("constraints") or {}
+            if not checkin_date:
+                checkin_date = (
+                    t_const.get("checkin")
+                    or t_const.get("check_in")
+                    or t_const.get("start_date")
+                    or t_const.get("departure_date")
+                    or t_meta.get("checkin")
+                    or t_meta.get("start_date")
+                    or (trip_rec.get("start_date") if trip_rec else None)
+                )
+            if not checkout_date:
+                checkout_date = (
+                    t_const.get("checkout")
+                    or t_const.get("check_out")
+                    or t_const.get("end_date")
+                    or t_const.get("return_date")
+                    or t_meta.get("checkout")
+                    or t_meta.get("end_date")
+                    or (trip_rec.get("end_date") if trip_rec else None)
+                )
+
         offer_dict = {
             "id": hotel_offer.provider_offer_id,
             "provider_offer_id": hotel_offer.provider_offer_id,
@@ -110,6 +156,8 @@ class HotelBookingService:
             "children": hotel_offer.children_count,
             "infants": hotel_offer.infants_count,
             "snapshot_id": str(snapshot_id),
+            "checkin": str(checkin_date)[:10] if checkin_date else None,
+            "checkout": str(checkout_date)[:10] if checkout_date else None,
         }
 
         # Calculate INR amount for payment
@@ -122,14 +170,27 @@ class HotelBookingService:
             except Exception:
                 amount_inr = round(float(offer_dict["price"]) * 85.0, 2)
 
-        # 4. Perform prebook via existing HotelService
-        # Section 10: A simulated/fallback prebook MUST NOT proceed to payment order creation.
+        # 4. Use existing valid prebook hold or perform prebook via existing HotelService
         prebook_data = {}
-        try:
-            prebook_res = self.hotel_service.prebook(offer_dict)
-            prebook_data = prebook_res if isinstance(prebook_res, dict) else {}
-        except Exception:
-            prebook_data = {}
+        candidate_pre = dict(prebook) if isinstance(prebook, dict) else {}
+        if not candidate_pre.get("prebook_id") and prebook_id:
+            candidate_pre = {"prebook_id": str(prebook_id), "status": "confirmed"}
+        if not candidate_pre.get("prebook_id") and trip_id:
+            retained_pre = t_meta.get("hotel_prebook")
+            if isinstance(retained_pre, dict) and retained_pre.get("prebook_id"):
+                candidate_pre = retained_pre
+
+        if candidate_pre.get("prebook_id") and str(candidate_pre.get("status", "")).lower() != "simulated":
+            prebook_data = candidate_pre
+        else:
+            try:
+                prebook_res = self.hotel_service.prebook(offer_dict)
+                prebook_data = prebook_res if isinstance(prebook_res, dict) else {}
+            except Exception as exc:
+                msg = str(exc)
+                if "no prebook availability" in msg.lower() or "withdrawn" in msg.lower() or "expired" in msg.lower():
+                    raise ValueError("Rate is no longer available from supplier. Please refresh stays and select a valid offer.") from exc
+                prebook_data = {}
 
         # Reject simulated prebook: a UUID-only prebook without a real supplier reference
         # cannot be used as a valid supplier hold. Fail closed rather than continue.

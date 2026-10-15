@@ -25,12 +25,78 @@ def build_hotel_booking_pdf(record: dict) -> bytes:
     """
     booking = record.get("booking_json") or {}
     offer = record.get("offer_json") or {}
+    prebook = record.get("prebook_json") or {}
     holder = record.get("holder_json") or {}
     guests = record.get("guests_json") or []
     provider = record.get("provider") or booking.get("provider") or offer.get("provider") or "Hotel provider"
     status = record.get("booking_status") or booking.get("status") or "pending"
     confirmation = booking.get("confirmation_code") or booking.get("booking_id") or "Pending"
     hotel_name = record.get("hotel_name") or offer.get("hotel_name") or "Hotel booking"
+
+    checkin_val = (
+        offer.get("checkin")
+        or offer.get("check_in")
+        or offer.get("checkIn")
+        or prebook.get("checkin")
+        or prebook.get("check_in")
+        or prebook.get("checkIn")
+        or booking.get("checkin")
+        or booking.get("check_in")
+        or booking.get("checkIn")
+        or booking.get("startDate")
+        or record.get("checkin")
+        or record.get("check_in")
+    )
+    checkout_val = (
+        offer.get("checkout")
+        or offer.get("check_out")
+        or offer.get("checkOut")
+        or prebook.get("checkout")
+        or prebook.get("check_out")
+        or prebook.get("checkOut")
+        or booking.get("checkout")
+        or booking.get("check_out")
+        or booking.get("checkOut")
+        or booking.get("endDate")
+        or record.get("checkout")
+        or record.get("check_out")
+    )
+
+    if (not checkin_val or not checkout_val) and record.get("trip_id"):
+        try:
+            from services.trip_store import TripStore
+            t_rec = TripStore().get_trip(str(record["trip_id"]), record.get("customer_ref"))
+            if t_rec:
+                t_meta = t_rec.get("metadata") or {}
+                if isinstance(t_meta, str):
+                    try:
+                        import json as _j
+                        t_meta = _j.loads(t_meta)
+                    except Exception:
+                        t_meta = {}
+                t_const = t_meta.get("constraints") or {}
+                if not checkin_val:
+                    checkin_val = (
+                        t_const.get("checkin")
+                        or t_const.get("check_in")
+                        or t_const.get("start_date")
+                        or t_const.get("departure_date")
+                        or t_meta.get("checkin")
+                        or t_meta.get("start_date")
+                        or t_rec.get("start_date")
+                    )
+                if not checkout_val:
+                    checkout_val = (
+                        t_const.get("checkout")
+                        or t_const.get("check_out")
+                        or t_const.get("end_date")
+                        or t_const.get("return_date")
+                        or t_meta.get("checkout")
+                        or t_meta.get("end_date")
+                        or t_rec.get("end_date")
+                    )
+        except Exception:
+            pass
 
     styles = getSampleStyleSheet()
     title = ParagraphStyle("HotelTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=18, leading=22, spaceAfter=4, textColor=colors.HexColor("#0f172a"))
@@ -68,8 +134,8 @@ def build_hotel_booking_pdf(record: dict) -> bytes:
         [Paragraph("Hotel Name", bold_label), Paragraph(escape(str(hotel_name)), body)],
         [Paragraph("Room Description", bold_label), Paragraph(escape(str(offer.get("room_name") or "Standard Room")), body)],
         [Paragraph("Board Type", bold_label), Paragraph(escape(str(offer.get("board_name") or offer.get("board_type") or "Room Only")), body)],
-        [Paragraph("Check-in Date", bold_label), Paragraph(escape(str(offer.get("checkin") or offer.get("check_in") or "—")), body)],
-        [Paragraph("Check-out Date", bold_label), Paragraph(escape(str(offer.get("checkout") or offer.get("check_out") or "—")), body)],
+        [Paragraph("Check-in Date", bold_label), Paragraph(escape(str(checkin_val if checkin_val else "—")), body)],
+        [Paragraph("Check-out Date", bold_label), Paragraph(escape(str(checkout_val if checkout_val else "—")), body)],
         [Paragraph("Rooms Booked", bold_label), Paragraph(str(offer.get("rooms") or offer.get("rooms_count") or 1), body)],
     ]
     story.append(Paragraph("Reservation Details", h2))

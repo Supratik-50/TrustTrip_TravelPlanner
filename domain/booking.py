@@ -72,3 +72,5 @@ class HotelCheckoutSnapshotRequest(BaseModel):
     guests: list[dict[str, Any]]
     customer_ref: str | None = None
     final_confirmation: bool = False
+    prebook: dict[str, Any] | None = None
+    prebook_id: str | None = None

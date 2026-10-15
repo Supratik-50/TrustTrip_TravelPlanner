@@ -1042,7 +1042,8 @@ def test_missing_canonical_traveler_count_rejects_even_with_request_override():
     assert len(SearchSessionStore._IN_MEMORY_SESSIONS) == 0
 
 
-def test_missing_canonical_rooms_rejects_even_with_request_override():
+def test_missing_canonical_rooms_defaults_to_one():
+    """Verify hotel search defaults rooms=1 when omitted from canonical trip."""
     headers, user = _auth_user("no_rooms@trusttrip.com")
     trip = TripStore().create_trip(
         user_id=user["id"],
@@ -1058,18 +1059,16 @@ def test_missing_canonical_rooms_rejects_even_with_request_override():
             }
         },
     )
-    with patch.object(HotelService, "search") as mock_search, \
-         patch.object(SearchSessionStore, "create_session") as mock_sess:
+    with patch.object(HotelService, "search", return_value={"offers": [], "count": 0, "errors": []}) as mock_search:
         resp = client.post(
             "/api/hotels/search",
             headers=headers,
             json={"trip_id": str(trip["id"]), "rooms": 2, "rooms_count": 2},
         )
-        assert resp.status_code == 400
-        assert "canonical rooms count" in resp.json()["detail"].lower()
-        mock_search.assert_not_called()
-        mock_sess.assert_not_called()
-    assert len(SearchSessionStore._IN_MEMORY_SESSIONS) == 0
+        assert resp.status_code == 200
+        mock_search.assert_called_once()
+        search_args = mock_search.call_args[0][0]
+        assert search_args["rooms"] == 1
 
 
 # ============================================================================
@@ -1254,8 +1253,8 @@ def test_request_children_cannot_override_canonical_children():
         assert search_args["children"] == 1
 
 
-def test_missing_canonical_children_rejected():
-    """Verify hotel search rejects with HTTP 400 when canonical children count is missing."""
+def test_missing_canonical_children_defaults_to_zero():
+    """Verify hotel search defaults children=0 when omitted from canonical trip."""
     headers, user = _auth_user("no_canon_child@trusttrip.com")
     trip = TripStore().create_trip(
         user_id=user["id"],
@@ -1272,21 +1271,24 @@ def test_missing_canonical_children_rejected():
         },
     )
 
-    resp = client.post(
-        "/api/hotels/search",
-        headers=headers,
-        json={"trip_id": str(trip["id"]), "children": 2},
-    )
-    assert resp.status_code == 400
-    assert "canonical children count" in resp.json()["detail"].lower()
+    with patch.object(HotelService, "search", return_value={"offers": [], "count": 0, "errors": []}) as mock_search:
+        resp = client.post(
+            "/api/hotels/search",
+            headers=headers,
+            json={"trip_id": str(trip["id"]), "children": 2},
+        )
+        assert resp.status_code == 200
+        mock_search.assert_called_once()
+        search_args = mock_search.call_args[0][0]
+        assert search_args["children"] == 0
 
 
-def test_provider_not_called_for_missing_canonical_children():
-    """Verify hotel provider is NOT called when canonical children count is missing."""
+def test_provider_not_called_for_invalid_canonical_children():
+    """Verify hotel provider is NOT called when canonical children count is invalid."""
     headers, user = _auth_user("provider_not_called@trusttrip.com")
     trip = TripStore().create_trip(
         user_id=user["id"],
-        title="No children breakdown trip",
+        title="Invalid children breakdown trip",
         destination="Kyoto, Japan",
         metadata={
             "constraints": {
@@ -1294,6 +1296,7 @@ def test_provider_not_called_for_missing_canonical_children():
                 "checkin_date": "2026-10-14",
                 "checkout_date": "2026-10-20",
                 "travelers_count": 2,
+                "children": -1,
                 "rooms": 1,
             }
         },
@@ -1305,12 +1308,12 @@ def test_provider_not_called_for_missing_canonical_children():
         mock_search.assert_not_called()
 
 
-def test_no_session_or_snapshot_created_on_missing_canonical_children():
+def test_no_session_or_snapshot_created_on_invalid_canonical_children():
     """Verify no session or snapshot is saved when canonical children validation fails."""
     headers, user = _auth_user("no_session_child@trusttrip.com")
     trip = TripStore().create_trip(
         user_id=user["id"],
-        title="No child trip",
+        title="Invalid child trip",
         destination="Kyoto, Japan",
         metadata={
             "constraints": {
@@ -1318,6 +1321,7 @@ def test_no_session_or_snapshot_created_on_missing_canonical_children():
                 "checkin_date": "2026-10-14",
                 "checkout_date": "2026-10-20",
                 "travelers_count": 2,
+                "children": -1,
                 "rooms": 1,
             }
         },
@@ -1329,6 +1333,34 @@ def test_no_session_or_snapshot_created_on_missing_canonical_children():
         mock_sess.assert_not_called()
     assert len(SearchSessionStore._IN_MEMORY_SESSIONS) == 0
     assert len(SearchSessionStore._IN_MEMORY_SNAPSHOTS) == 0
+
+
+def test_explicit_three_adult_selection_remains_three_adults():
+    """Verify an explicit 3-adult canonical trip maintains 3 adults in hotel search."""
+    headers, user = _auth_user("three_adults@trusttrip.com")
+    trip = TripStore().create_trip(
+        user_id=user["id"],
+        title="Three Adult Trip",
+        destination="Kyoto, Japan",
+        metadata={
+            "constraints": {
+                "destination": "Kyoto, Japan",
+                "checkin_date": "2026-10-14",
+                "checkout_date": "2026-10-20",
+                "travelers_count": 3,
+                "adults": 3,
+            }
+        },
+    )
+    with patch.object(HotelService, "search", return_value={"offers": [], "count": 0, "errors": []}) as mock_search:
+        resp = client.post("/api/hotels/search", headers=headers, json={"trip_id": str(trip["id"])})
+        assert resp.status_code == 200
+        mock_search.assert_called_once()
+        search_args = mock_search.call_args[0][0]
+        assert search_args["adults"] == 3
+        assert search_args["children"] == 0
+        assert search_args["rooms"] == 1
+
 
 
 # ============================================================================

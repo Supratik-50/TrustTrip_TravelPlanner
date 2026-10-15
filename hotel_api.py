@@ -625,6 +625,8 @@ async def search_hotels(
 
         persisted_raw = _scrub_payload(raw_o)
         persisted_raw["_internal_rooms"] = internal_rooms
+        persisted_raw["checkin"] = d_in.isoformat()
+        persisted_raw["checkout"] = d_out.isoformat()
 
         try:
             hotel_offer_obj = HotelOffer(
@@ -660,6 +662,8 @@ async def search_hotels(
                 availability=AvailabilityStatus.AVAILABLE,
                 is_recommended=is_rec,
                 recommendation_rank=rec_rank,
+                checkin=d_in.isoformat(),
+                checkout=d_out.isoformat(),
             )
             snap_store.save_snapshot(
                 session_id=session.session_id,
@@ -932,4 +936,10 @@ async def prebook_hotel(
             **prebook_data,
         }
     except HotelProviderError as exc:
+        msg = str(exc)
+        if "no prebook availability" in msg.lower() or "withdrawn" in msg.lower() or "expired" in msg.lower():
+            raise HTTPException(
+                status_code=409,
+                detail="Rate is no longer available from supplier. Please refresh stays and select a valid offer.",
+            )
         raise HTTPException(status_code=409, detail=str(exc))
