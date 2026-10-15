@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: trusttrip-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trusttrip
+      POSTGRES_USER: trusttrip
+      POSTGRES_PASSWORD: trusttrip_local
+    ports:
+      - "5433:5432"
+    volumes:
+      - trusttrip_pgdata:/var/lib/postgresql/data
+
+volumes:
+  trusttrip_pgdata:
