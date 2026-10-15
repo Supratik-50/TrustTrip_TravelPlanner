@@ -547,6 +547,21 @@ export class TrustTripBookingService implements IBookingService {
   }
 
   /**
+   * Clears active prebook cache for a trip upon simulation reset.
+   */
+  clearPrebookData(tripId: string): void {
+    this.activePrebookIds.delete(tripId);
+    this.activePrebookData.delete(tripId);
+    this.activeHotelOffers.delete(tripId);
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.removeItem(`tt_prebook_${tripId}`);
+        sessionStorage.removeItem(`tt_hotel_offer_${tripId}`);
+      }
+    } catch {}
+  }
+
+  /**
    * Returns whether an authoritative hotel prebook is active for this trip.
    */
   hasActiveHotelPrebook(tripId: string, tripMeta?: any): boolean {
@@ -1119,6 +1134,24 @@ export class TrustTripBookingService implements IBookingService {
       link.href = url;
       const refPart = bookingRef ? `_${bookingRef}` : '';
       link.setAttribute('download', `TrustTrip_Voucher${refPart}_${transactionId}.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    }
+  }
+
+  /**
+   * Downloads authenticated payment receipt PDF via GET /api/trips/{transaction_id}/receipt.pdf
+   */
+  async downloadPaymentReceiptPdf(transactionId: string, bookingRef?: string): Promise<void> {
+    const blob = await api.downloadPaymentReceiptPdfBlob(transactionId);
+    if (typeof window !== 'undefined') {
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const refPart = bookingRef ? `_${bookingRef}` : '';
+      link.setAttribute('download', `TrustTrip_Receipt${refPart}_${transactionId}.pdf`);
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);

@@ -322,7 +322,16 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
         </div>
       </div>
 
-      <div className="flex justify-end">
+      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+        <Button
+          variant="outline"
+          size="md"
+          onClick={onSelectOtherHotel}
+          className="w-full sm:w-auto"
+        >
+          Change stay / Refresh stays
+        </Button>
+
         <Button
           variant="primary"
           size="md"
@@ -345,7 +354,7 @@ export const HotelBookingPanel: React.FC<HotelBookingPanelProps> = ({
           }}
           isLoading={isPreparing}
           rightIcon={<ArrowRight className="w-4 h-4" />}
-          className="shadow-xs"
+          className="shadow-xs w-full sm:w-auto"
         >
           {hotel ? 'Prepare hotel reservation' : 'Select a stay first'}
         </Button>

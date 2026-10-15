@@ -229,7 +229,12 @@ async function runTests() {
       'card',
       { first_name: 'Dev', last_name: 'Sharma', email: 'dev@trusttrip.com', phone: '+919988776655' },
       'rev_flow_uuid',
-      3
+      3,
+      {
+        razorpay_order_id: 'ord_flow_123',
+        razorpay_payment_id: 'pay_flow_valid',
+        razorpay_signature: 'sig_flow_valid',
+      }
     );
 
     assert.ok(calls.some((u) => u.includes('/api/hotel-payments/create-order')));
@@ -326,7 +331,12 @@ async function runTests() {
         'card',
         { first_name: 'Test', last_name: 'User', email: 'test@example.com', phone: '+919876543210' },
         'rev_123',
-        1
+        1,
+        {
+          razorpay_order_id: 'ord_fail',
+          razorpay_payment_id: 'pay_fail',
+          razorpay_signature: 'sig_fail',
+        }
       );
     } catch (err: any) {
       threw = true;
@@ -466,7 +476,12 @@ async function runTests() {
       'card',
       { first_name: 'Priya', last_name: 'Sen', email: 'priya@example.com', phone: '+919876543210' },
       'rev_auth_1',
-      2
+      2,
+      {
+        razorpay_order_id: 'ord_truth_1',
+        razorpay_payment_id: 'pay_truth_1',
+        razorpay_signature: 'sig_truth_1',
+      }
     );
 
     assert.strictEqual(fullResult.confirmation_code, 'VOUCHER-OBEROI-999');
@@ -516,7 +531,12 @@ async function runTests() {
       'card',
       { first_name: 'Priya', last_name: 'Sen', email: 'priya@example.com', phone: '+919876543210' },
       'rev_auth_2',
-      1
+      1,
+      {
+        razorpay_order_id: 'ord_truth_2',
+        razorpay_payment_id: 'pay_truth_2',
+        razorpay_signature: 'sig_truth_2',
+      }
     );
 
     assert.notStrictEqual(minimalResult.check_in_date, '2026-10-12', 'Must not fabricate 2026-10-12');
@@ -574,7 +594,12 @@ async function runTests() {
         'card',
         { first_name: 'Priya', last_name: 'Sen', email: 'priya@example.com', phone: '+919876543210' },
         'rev_auth_3',
-        1
+        1,
+        {
+          razorpay_order_id: 'ord_fail_verify',
+          razorpay_payment_id: 'pay_fail_verify',
+          razorpay_signature: 'sig_fail_verify',
+        }
       );
     } catch {
       verifyThrew = true;
@@ -665,7 +690,8 @@ async function runTests() {
       const res = await service.processHotelPayment(
         'trip_z_a', 'card',
         { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-        'rev_z_a', 1
+        'rev_z_a', 1,
+        { razorpay_order_id: 'ord_z_a', razorpay_payment_id: 'pay_z_a', razorpay_signature: 'sig_z_a' }
       );
       assert.strictEqual(res.confirmation_code, 'VOUCHER-Z-A');
       assert.strictEqual(res.property_name, 'Grand Hotel Backend');
@@ -716,7 +742,8 @@ async function runTests() {
       const res = await service.processHotelPayment(
         'trip_z_b', 'card',
         { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-        'rev_z_b', 1
+        'rev_z_b', 1,
+        { razorpay_order_id: 'ord_z_b', razorpay_payment_id: 'pay_z_b', razorpay_signature: 'sig_z_b' }
       );
       assert.strictEqual(res.check_in_date, undefined, 'check_in_date must be undefined when backend omits it');
       assert.strictEqual(res.check_out_date, undefined, 'check_out_date must be undefined when backend omits it');
@@ -762,7 +789,8 @@ async function runTests() {
       const res = await service.processHotelPayment(
         'trip_z_c', 'card',
         { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-        'rev_z_c', 1
+        'rev_z_c', 1,
+        { razorpay_order_id: 'ord_z_c', razorpay_payment_id: 'pay_z_c', razorpay_signature: 'sig_z_c' }
       );
       assert.strictEqual(res.nights_count, undefined, 'nights_count must be undefined when backend omits it');
       assert.notStrictEqual(res.nights_count, 999, 'Poison offer nights (999) must NOT appear in confirmation');
@@ -806,7 +834,8 @@ async function runTests() {
       const res = await service.processHotelPayment(
         'trip_z_d', 'card',
         { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-        'rev_z_d', 1
+        'rev_z_d', 1,
+        { razorpay_order_id: 'ord_z_d', razorpay_payment_id: 'pay_z_d', razorpay_signature: 'sig_z_d' }
       );
       assert.strictEqual(res.property_name, undefined, 'property_name must be undefined when backend omits it');
       assert.notStrictEqual(res.property_name, 'POISON_OFFER_HOTEL', 'Poison offer.hotel_name must NOT appear in confirmation');
@@ -852,7 +881,8 @@ async function runTests() {
       const res = await service.processHotelPayment(
         'trip_z_e', 'card',
         { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-        'rev_z_e', 1
+        'rev_z_e', 1,
+        { razorpay_order_id: 'ord_z_e', razorpay_payment_id: 'pay_z_e', razorpay_signature: 'sig_z_e' }
       );
       assert.strictEqual(res.cancellation_policy, undefined, 'cancellation_policy must be undefined when backend omits it');
       assert.notStrictEqual(res.cancellation_policy, 'POISON_OFFER_POLICY', 'Poison offer.cancellation_policy must NOT appear in confirmation');
@@ -898,7 +928,8 @@ async function runTests() {
         await service.processHotelPayment(
           'trip_z_f', 'card',
           { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-          'rev_z_f', 1
+          'rev_z_f', 1,
+          { razorpay_order_id: 'ord_z_f', razorpay_payment_id: 'pay_z_f', razorpay_signature: 'sig_z_f' }
         );
       } catch (err: any) {
         threwOnMissingCode = true;
@@ -961,7 +992,8 @@ async function runTests() {
       const res = await service.processHotelPayment(
         'trip_z_g', 'card',
         { first_name: 'A', last_name: 'B', email: 'a@b.com', phone: '+919999999999' },
-        'rev_z_g', 1
+        'rev_z_g', 1,
+        { razorpay_order_id: 'ord_z_g', razorpay_payment_id: 'pay_z_g', razorpay_signature: 'sig_z_g' }
       );
 
       // Offer data WAS sent to the create-order API (legitimate pre-booking use)

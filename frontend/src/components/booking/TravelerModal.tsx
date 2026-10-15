@@ -125,9 +125,43 @@ export const TravelerModal: React.FC<TravelerModalProps> = ({
         }
       }
 
-      if (idx === 0 && p.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email.trim())) {
-        pErr.email = 'Please enter a valid email address.';
-        hasError = true;
+      // Email validation: required for lead passenger (idx === 0), optional for companions (idx > 0)
+      if (idx === 0) {
+        if (!p.email || !p.email.trim()) {
+          pErr.email = 'Contact email is required for the lead passenger.';
+          hasError = true;
+        } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email.trim())) {
+          pErr.email = 'Please enter a valid email address.';
+          hasError = true;
+        }
+      } else if (p.email && p.email.trim()) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email.trim())) {
+          pErr.email = 'Please enter a valid email address.';
+          hasError = true;
+        }
+      }
+
+      // Phone validation: required for lead passenger (idx === 0), optional for companions (idx > 0)
+      const validatePhone = (rawPhone: string) => {
+        const cleaned = rawPhone.trim().replace(/[\s\-()]/g, '');
+        const formatted = cleaned.startsWith('00') ? '+' + cleaned.slice(2) : cleaned;
+        if (/^\d{10}$/.test(formatted)) return true;
+        return /^\+\d{8,15}$/.test(formatted);
+      };
+
+      if (idx === 0) {
+        if (!p.phone_number || !p.phone_number.trim()) {
+          pErr.phone_number = 'Contact phone number is required for the lead passenger.';
+          hasError = true;
+        } else if (!validatePhone(p.phone_number)) {
+          pErr.phone_number = 'Please enter a valid phone number (e.g. +91 98765 43210).';
+          hasError = true;
+        }
+      } else if (p.phone_number && p.phone_number.trim()) {
+        if (!validatePhone(p.phone_number)) {
+          pErr.phone_number = 'Please enter a valid phone number (e.g. +91 98765 43210).';
+          hasError = true;
+        }
       }
 
       if (Object.keys(pErr).length > 0) {
@@ -416,8 +450,20 @@ export const TravelerModal: React.FC<TravelerModalProps> = ({
                   placeholder="+91 98765 43210"
                   value={currentPassenger.phone_number || ''}
                   onChange={(e) => handleFieldChange(activePassengerIndex, 'phone_number', e.target.value)}
-                  className="w-full h-10 px-3 py-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)] text-xs focus:outline-hidden focus:border-[var(--primary)]"
+                  className={`w-full h-10 px-3 py-2 rounded-xl border text-xs focus:outline-hidden ${
+                    currentErrors.phone_number
+                      ? 'border-red-500 bg-red-500/5 text-[var(--text-primary)]'
+                      : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)] focus:border-[var(--primary)]'
+                  }`}
                 />
+                {currentErrors.phone_number && (
+                  <span className="text-[10px] text-red-400 block">{currentErrors.phone_number}</span>
+                )}
+                {activePassengerIndex === 0 && (
+                  <span className="text-[10px] text-[var(--text-muted)] block">
+                    Operational flight notifications and schedule updates will be sent here.
+                  </span>
+                )}
               </div>
             </div>
           </div>

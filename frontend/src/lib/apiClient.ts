@@ -55,6 +55,7 @@ import {
   executeMockResearchQuery,
   getMockTripRevisions,
   createMockTripRevision,
+  clearMockSelections,
 } from './mockTravelData';
 import { storage } from './storage';
 
@@ -481,11 +482,18 @@ export class ApiClient {
     options: RequestInit = {}
   ): Promise<T> {
     const token = storage.getToken();
+    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
       Accept: 'application/json',
       ...(options.headers as Record<string, string> || {}),
     };
+
+    if (!isFormData && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json';
+    } else if (isFormData) {
+      delete headers['Content-Type'];
+    }
 
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
@@ -712,6 +720,23 @@ export class ApiClient {
       );
       return {
         search_id: `fl_srch_${Date.now().toString(36)}`,
+        offers: results,
+      } as unknown as T;
+    }
+
+    if (endpoint === '/api/flights/search' && method === 'POST') {
+      const body: any = options.body ? JSON.parse(options.body as string) : {};
+      const trip = getMockTrips().find((t) => t.trip_id === body.trip_id);
+      const results = generateMockFlights(
+        trip?.origin || 'SFO',
+        trip?.destination || 'KIX',
+        trip?.start_date || '2026-10-14',
+        trip?.end_date,
+        body.cabin_class || 'economy',
+        trip?.travelers_count || 1
+      );
+      return {
+        success: true,
         offers: results,
       } as unknown as T;
     }
@@ -965,10 +990,14 @@ export class ApiClient {
         method: 'GET',
       });
       if (response && Array.isArray(response.trips)) {
-        return response.trips.map(normalizeBackendTrip);
+        return response.trips
+          .filter((t: any) => (!t.record_type || t.record_type === 'trip') && (t.id || t.trip_id) && (t.destination || t.title || t.metadata?.destination))
+          .map(normalizeBackendTrip);
       }
       if (Array.isArray(response)) {
-        return response.map(normalizeBackendTrip);
+        return response
+          .filter((t: any) => (!t.record_type || t.record_type === 'trip') && (t.id || t.trip_id) && (t.destination || t.title || t.metadata?.destination))
+          .map(normalizeBackendTrip);
       }
       return [];
     } catch (err: any) {
@@ -1196,7 +1225,26 @@ export class ApiClient {
       const rawOffers = response?.offers || [];
       return rawOffers.map((o: any) => (o.offer_id ? toFlightOffer(o) : o));
     } catch (err: any) {
-      if (err.code === 'NETWORK_ERROR' || err.status === 400 || err.status === 404 || err.status === 422 || err.status === 500) {
+      if (
+        this.isDemoMode() ||
+        err.code === 'NETWORK_ERROR' ||
+        err.status === 400 ||
+        err.status === 404 ||
+        err.status === 422 ||
+        err.status === 500 ||
+        err.statusCode === 502 ||
+        err.statusCode === 503
+      ) {
+        if (request.trip_id) {
+          const mockTripSearch = this.handleMockFallback<{ success?: boolean; offers: FlightOffer[] }>(
+            '/api/flights/search',
+            {
+              method: 'POST',
+              body: JSON.stringify(request),
+            }
+          );
+          if (mockTripSearch?.offers) return mockTripSearch.offers;
+        }
         const mock = this.handleMockFallback<{ offers: FlightOffer[] }>(
           '/api/flights/search-flexible',
           {
@@ -1468,11 +1516,12 @@ export class ApiClient {
       formData.append('file', file);
       if (title) formData.append('title', title);
 
-      // In real backend, upload might take FormData
-      return await this.request<ResearchDocument>('/api/research/documents/upload', {
+      // In real backend, upload returns { success: true, document: { ... }, chunks_indexed: N }
+      const res = await this.request<any>('/api/research/documents/upload', {
         method: 'POST',
-        body: formData as any,
+        body: formData,
       });
+      return (res?.document || res) as ResearchDocument;
     } catch (err: any) {
       if (err.code === 'NETWORK_ERROR') {
         const mock = this.handleMockFallback<ResearchDocument>('/api/research/documents/upload', {
@@ -1877,6 +1926,8 @@ export class ApiClient {
           guests: request.guests,
           customer_ref: request.customer_ref,
           final_confirmation: request.final_confirmation,
+          prebook: request.prebook,
+          prebook_id: request.prebook?.prebook_id,
         }),
       });
     }
@@ -2073,6 +2124,34 @@ export class ApiClient {
     });
     if (!response.ok) {
       let message = 'Unable to download hotel voucher PDF.';
+      try {
+        const errorData = await response.json();
+        message = errorData.detail || errorData.error || message;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    return await response.blob();
+  }
+
+  // --- Authenticated Binary Payment Receipt PDF Stream ---
+  async downloadPaymentReceiptPdfBlob(transactionId: string): Promise<Blob> {
+    const token = storage.getToken();
+    const headers: Record<string, string> = {
+      Accept: 'application/pdf, application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    const baseUrl = this.getBaseUrl();
+    const url = `${baseUrl}/api/trips/${encodeURIComponent(transactionId)}/receipt.pdf`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+    });
+    if (!response.ok) {
+      let message = 'Unable to download payment receipt PDF.';
       try {
         const errorData = await response.json();
         message = errorData.detail || errorData.error || message;

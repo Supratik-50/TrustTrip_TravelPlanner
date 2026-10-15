@@ -220,6 +220,7 @@ export interface IBookingService {
   downloadTravelPlanPdf(tripId: string): Promise<void>;
   downloadTicketPdf(transactionId: string, bookingRef?: string): Promise<void>;
   downloadHotelVoucherPdf(transactionId: string, bookingRef?: string): Promise<void>;
+  downloadPaymentReceiptPdf?(transactionId: string, ref?: string): Promise<void>;
 
   // Section 5B / 5C Authoritative Contracts
   selectFlightOffer(tripId: string, offerId: string, passengers: FlightPassenger[]): Promise<any>;
@@ -231,4 +232,7 @@ export interface IBookingService {
   setActiveBookingId(tripId: string, bookingId: string): void;
   getTripBookings(tripId: string): Promise<any>;
   getCanonicalTrip?(tripId: string): Promise<TripDetail>;
+  setPrebookData?(tripId: string, prebookRecord: any, offerData?: any): void;
+  clearPrebookData?(tripId: string): void;
+  hasActiveHotelPrebook?(tripId: string, tripMeta?: any): boolean;
 }

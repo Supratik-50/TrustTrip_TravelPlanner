@@ -20,6 +20,7 @@ import { getDestinationImage } from '../../lib/destinationImages';
 import { Button } from '../common/Button';
 import { useNotification } from '../../context/NotificationContext';
 import { useAuth } from '../../context/AuthContext';
+import { bookingService } from '../../services/bookingService';
 
 interface TripConfirmationViewProps {
   trip: TripDetail;
@@ -43,12 +44,69 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
   onBackToTrips,
 }) => {
   const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadingDoc, setDownloadingDoc] = useState<string | null>(null);
   const [isCancellationModalOpen, setIsCancellationModalOpen] = useState(false);
   const [cancellationType, setCancellationType] = useState<'all' | 'flight' | 'hotel'>('all');
   const [cancellationReason, setCancellationReason] = useState('');
   const [isSubmittingCancellation, setIsSubmittingCancellation] = useState(false);
   const { notify } = useNotification();
   const { user: currentUser } = useAuth();
+
+  const handleDownloadFlightTicket = async () => {
+    if (!flightConfirmation?.booking_id) return;
+    setDownloadingDoc('flight_ticket');
+    try {
+      await bookingService.downloadTicketPdf(flightConfirmation.booking_id, flightConfirmation.booking_reference);
+      notify('Flight ticket downloaded successfully.', 'success', 'Ticket Ready');
+    } catch {
+      notify('Unable to download flight ticket. Please retry.', 'error');
+    } finally {
+      setDownloadingDoc(null);
+    }
+  };
+
+  const handleDownloadFlightReceipt = async () => {
+    if (!flightConfirmation?.booking_id) return;
+    setDownloadingDoc('flight_receipt');
+    try {
+      if (bookingService.downloadPaymentReceiptPdf) {
+        await bookingService.downloadPaymentReceiptPdf(flightConfirmation.booking_id, flightConfirmation.booking_reference);
+        notify('Flight payment receipt downloaded.', 'success', 'Receipt Ready');
+      }
+    } catch {
+      notify('Unable to download flight payment receipt.', 'error');
+    } finally {
+      setDownloadingDoc(null);
+    }
+  };
+
+  const handleDownloadHotelVoucher = async () => {
+    if (!hotelConfirmation?.transaction_id) return;
+    setDownloadingDoc('hotel_voucher');
+    try {
+      await bookingService.downloadHotelVoucherPdf(hotelConfirmation.transaction_id, hotelConfirmation.confirmation_code);
+      notify('Hotel voucher downloaded successfully.', 'success', 'Voucher Ready');
+    } catch {
+      notify('Unable to download hotel voucher. Please retry.', 'error');
+    } finally {
+      setDownloadingDoc(null);
+    }
+  };
+
+  const handleDownloadHotelReceipt = async () => {
+    if (!hotelConfirmation?.transaction_id) return;
+    setDownloadingDoc('hotel_receipt');
+    try {
+      if (bookingService.downloadPaymentReceiptPdf) {
+        await bookingService.downloadPaymentReceiptPdf(hotelConfirmation.transaction_id, hotelConfirmation.confirmation_code);
+        notify('Hotel payment receipt downloaded.', 'success', 'Receipt Ready');
+      }
+    } catch {
+      notify('Unable to download hotel payment receipt.', 'error');
+    } finally {
+      setDownloadingDoc(null);
+    }
+  };
 
   const effectiveContactEmail = (contactEmail && contactEmail.trim()) || currentUser?.email || '';
 
@@ -203,6 +261,31 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
               <span className="text-[var(--text-primary)]">Open at carrier check-in</span>
             </div>
           </div>
+
+          {flightConfirmation?.booking_id && (
+            <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-[var(--border)]">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownloadFlightTicket}
+                isLoading={downloadingDoc === 'flight_ticket'}
+                leftIcon={<Download className="w-3.5 h-3.5" />}
+                className="text-xs"
+              >
+                Download E-Ticket
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownloadFlightReceipt}
+                isLoading={downloadingDoc === 'flight_receipt'}
+                leftIcon={<Download className="w-3.5 h-3.5" />}
+                className="text-xs text-[var(--text-secondary)]"
+              >
+                Payment Receipt
+              </Button>
+            </div>
+          )}
         </div>
 
         {/* STAY VOUCHER */}
@@ -251,6 +334,31 @@ export const TripConfirmationView: React.FC<TripConfirmationViewProps> = ({
               </span>
             </div>
           </div>
+
+          {hotelConfirmation?.transaction_id && (
+            <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-[var(--border)]">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownloadHotelVoucher}
+                isLoading={downloadingDoc === 'hotel_voucher'}
+                leftIcon={<Download className="w-3.5 h-3.5" />}
+                className="text-xs"
+              >
+                Download Hotel Voucher
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownloadHotelReceipt}
+                isLoading={downloadingDoc === 'hotel_receipt'}
+                leftIcon={<Download className="w-3.5 h-3.5" />}
+                className="text-xs text-[var(--text-secondary)]"
+              >
+                Payment Receipt
+              </Button>
+            </div>
+          )}
         </div>
       </div>
 

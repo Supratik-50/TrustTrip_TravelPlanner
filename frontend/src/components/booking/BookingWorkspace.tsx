@@ -32,6 +32,7 @@ import {
   saveStoredBookingState,
   clearStoredBookingState,
 } from '../../mock/bookingMockData';
+import { clearMockSelections } from '../../lib/mockTravelData';
 import { useNotification } from '../../context/NotificationContext';
 import { useAuth } from '../../context/AuthContext';
 import { FlightPassenger } from '../../types/flight';
@@ -175,10 +176,10 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   const [isTravelerModalOpen, setIsTravelerModalOpen] = useState(false);
   const [isCompletingPayment, setIsCompletingPayment] = useState(false);
 
-  // Traveler validation helper
-  const isTravelerValid = (p?: FlightPassenger): boolean => {
+  // Traveler validation helper: enforces lead contact details on traveler 0 while keeping companion contact optional
+  const isTravelerValid = (p?: FlightPassenger, isLead = false): boolean => {
     if (!p) return false;
-    return Boolean(
+    const basicValid = Boolean(
       p.given_name?.trim() &&
       p.family_name?.trim() &&
       p.born_on?.trim() &&
@@ -186,11 +187,20 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
       p.gender &&
       p.title
     );
+    if (!basicValid) return false;
+    if (isLead) {
+      const email = p.email?.trim() || currentUser?.email?.trim();
+      const hasValidEmail = Boolean(email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+      const phoneDigits = (p.phone_number || '').trim().replace(/[\s\-()]/g, '');
+      const hasValidPhone = phoneDigits.length >= 8 && phoneDigits.length <= 15;
+      return hasValidEmail && hasValidPhone;
+    }
+    return true;
   };
 
   const isAllTravelersComplete = (list: FlightPassenger[], count: number): boolean => {
     if (!list || list.length !== count) return false;
-    return list.every(isTravelerValid);
+    return list.every((p, idx) => isTravelerValid(p, idx === 0));
   };
 
   // Derive lead contact info from traveler 0 (precedence: explicit traveler email > currentUser email)
@@ -578,7 +588,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     if (!isAllTravelersComplete(travelers, travelersCount)) {
       setIsTravelerModalOpen(true);
       notify(
-        `Please complete passenger details for all ${travelersCount} traveler(s) before verifying flight.`,
+        `Please complete passenger details including lead contact for all ${travelersCount} traveler(s) before verifying flight.`,
         'warning',
         'Passenger Details Required'
       );
@@ -728,7 +738,7 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
     if (!isAllTravelersComplete(travelers, travelersCount)) {
       setIsTravelerModalOpen(true);
       notify(
-        `Please complete passenger details for all ${travelersCount} traveler(s) before approving flight.`,
+        `Please complete passenger details including lead contact for all ${travelersCount} traveler(s) before approving flight.`,
         'warning',
         'Passenger Details Required'
       );
@@ -1051,6 +1061,13 @@ export const BookingWorkspace: React.FC<BookingWorkspaceProps> = ({
   // Reset Booking Simulation
   const handleResetSimulation = () => {
     clearStoredBookingState(trip.trip_id);
+    clearMockSelections(trip.trip_id);
+    bookingService.setActiveBookingId(trip.trip_id, '');
+    bookingService.clearPrebookData?.(trip.trip_id);
+    setBookingId(undefined);
+    setOrderId(undefined);
+    setPnr(undefined);
+    setBookingReference(undefined);
     setIsPlanApproved(false);
     setActiveAuthorization(undefined);
     setIsFlightApproved(false);
