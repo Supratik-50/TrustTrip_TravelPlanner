@@ -49,20 +49,41 @@ def build_travel_plan_pdf(plan: dict[str, Any]) -> bytes:
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
     story = []
-    route = esc(plan.get("route") or "Travel Plan")
+    route = esc(plan.get("route") or plan.get("title") or "Travel Plan")
     story += [Paragraph("TRUST TRIP MAS", styles["Brand"]), Paragraph(route, styles["TitleTT"])]
+    dates_str = plan.get("travel_dates")
+    if not dates_str or dates_str == "Flexible dates":
+        dep = plan.get("departure_date") or plan.get("start_date")
+        ret = plan.get("return_date") or plan.get("end_date")
+        if dep and ret:
+            dates_str = f"{dep} to {ret}"
+        elif dep:
+            dates_str = f"From {dep}"
+        else:
+            dates_str = "Flexible dates"
+    duration = plan.get("duration_days") or 1
+    style = plan.get("travel_style") or "Balanced"
     story.append(Paragraph(
-        f"{esc(plan.get('travel_dates') or 'Flexible dates')} · {esc(plan.get('duration_days') or 1)} days · {esc(plan.get('travel_style') or 'Balanced')}",
+        f"{esc(dates_str)} · {esc(duration)} days · {esc(style)}",
         styles["SubTT"],
     ))
     story.append(Paragraph(esc(plan.get("trip_summary") or "Evidence-grounded travel plan."), styles["BodyTT"]))
 
     # Recommendations in a compact, readable 3-column table.
-    story.append(Paragraph("Key Recommendations", styles["H2TT"]))
+    story.append(Paragraph("Key Recommendations & Confirmed Stays", styles["H2TT"]))
+    flight_label = "✈ Confirmed Flight" if plan.get("confirmed_flight") else "✈ Flight Recommendation"
+    flight_val = plan.get("confirmed_flight") or plan.get("flight_suggestion") or "No live flight recommendation."
+
+    hotel_label = "🏨 Confirmed Hotel" if plan.get("confirmed_hotel") else "🏨 Accommodation"
+    hotel_val = plan.get("confirmed_hotel") or plan.get("accommodation_plan") or "No live accommodation recommendation."
+
+    weather_label = "🌦 Weather Guidance"
+    weather_val = plan.get("weather_guidance") or "Weather guidance unavailable."
+
     cards = [
-        ("✈ Flight", plan.get("flight_suggestion") or "No live flight recommendation."),
-        ("🏨 Accommodation", plan.get("accommodation_plan") or "No live accommodation recommendation."),
-        ("🌦 Weather", plan.get("weather_guidance") or "Weather guidance unavailable."),
+        (flight_label, flight_val),
+        (hotel_label, hotel_val),
+        (weather_label, weather_val),
     ]
     data = [[Paragraph(f"<b>{esc(h)}</b>", styles["H3TT"]) for h, _ in cards], [Paragraph(esc(v).replace("**", ""), styles["FactTT"]) for _, v in cards]]
     table = Table(data, colWidths=[(A4[0]-26*mm)/3]*3, hAlign="LEFT")
@@ -76,43 +97,88 @@ def build_travel_plan_pdf(plan: dict[str, Any]) -> bytes:
     ]))
     story += [table, Spacer(1, 4)]
 
-    b = plan.get("budget") or {}
+    # Budget section: truthfully reflect authoritative saved data only; no misleading zeros
     story.append(Paragraph("Budget", styles["H2TT"]))
-    budget_rows = [
-        ["Flights", f"₹{float(b.get('flight_estimate_inr', 0)):,.0f}"],
-        ["Hotels", f"₹{float(b.get('hotel_estimate_inr', 0)):,.0f}"],
-        ["Local transport", f"₹{float(b.get('local_transport_estimate_inr', 0)):,.0f}"],
-        ["Activities", f"₹{float(b.get('activities_estimate_inr', 0)):,.0f}"],
-        ["Contingency", f"₹{float(b.get('contingency_inr', 0)):,.0f}"],
-        ["Estimated total", f"₹{float(b.get('estimated_total_inr', 0)):,.0f}"],
-    ]
-    bt = Table([[Paragraph(f"<b>{esc(a)}</b>", styles["SmallTT"]), Paragraph(f"<b>{esc(c)}</b>", styles["FactTT"])] for a,c in budget_rows], colWidths=[55*mm, 45*mm], hAlign="LEFT")
-    bt.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-2), colors.white),
-        ("BACKGROUND", (0,-1), (-1,-1), colors.HexColor("#eff6ff")),
-        ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#dbe4f0")),
-        ("INNERGRID", (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ("TOPPADDING", (0,0), (-1,-1), 3), ("BOTTOMPADDING", (0,0), (-1,-1), 3),
-    ]))
-    story.append(bt)
-    if b.get("target_budget_inr") is not None:
+    b = plan.get("budget") if isinstance(plan.get("budget"), dict) else {}
+    budget_rows: list[list[str]] = []
+
+    if plan.get("confirmed_flight_cost") is not None:
+        budget_rows.append(["Confirmed flight", f"₹{float(plan['confirmed_flight_cost']):,.0f}"])
+    elif b.get("flight_estimate_inr") is not None and float(b.get("flight_estimate_inr", 0)) > 0:
+        budget_rows.append(["Flight estimate", f"₹{float(b['flight_estimate_inr']):,.0f}"])
+
+    if plan.get("confirmed_hotel_cost") is not None:
+        budget_rows.append(["Confirmed hotel", f"₹{float(plan['confirmed_hotel_cost']):,.0f}"])
+    elif b.get("hotel_estimate_inr") is not None and float(b.get("hotel_estimate_inr", 0)) > 0:
+        budget_rows.append(["Hotel estimate", f"₹{float(b['hotel_estimate_inr']):,.0f}"])
+
+    if b.get("local_transport_estimate_inr") is not None and float(b.get("local_transport_estimate_inr", 0)) > 0:
+        budget_rows.append(["Local transport", f"₹{float(b['local_transport_estimate_inr']):,.0f}"])
+
+    if b.get("activities_estimate_inr") is not None and float(b.get("activities_estimate_inr", 0)) > 0:
+        budget_rows.append(["Activities", f"₹{float(b['activities_estimate_inr']):,.0f}"])
+
+    if b.get("contingency_inr") is not None and float(b.get("contingency_inr", 0)) > 0:
+        budget_rows.append(["Contingency", f"₹{float(b['contingency_inr']):,.0f}"])
+
+    if b.get("estimated_total_inr") is not None and float(b.get("estimated_total_inr", 0)) > 0:
+        budget_rows.append(["Estimated total", f"₹{float(b['estimated_total_inr']):,.0f}"])
+    elif len(budget_rows) > 1:
+        sum_tracked = sum([
+            float(plan.get("confirmed_flight_cost") or b.get("flight_estimate_inr") or 0),
+            float(plan.get("confirmed_hotel_cost") or b.get("hotel_estimate_inr") or 0),
+            float(b.get("local_transport_estimate_inr") or 0),
+            float(b.get("activities_estimate_inr") or 0),
+            float(b.get("contingency_inr") or 0),
+        ])
+        if sum_tracked > 0:
+            budget_rows.append(["Tracked subtotal", f"₹{sum_tracked:,.0f}"])
+
+    if budget_rows:
+        bt = Table([[Paragraph(f"<b>{esc(a)}</b>", styles["SmallTT"]), Paragraph(f"<b>{esc(c)}</b>", styles["FactTT"])] for a,c in budget_rows], colWidths=[55*mm, 45*mm], hAlign="LEFT")
+        bt.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-2), colors.white),
+            ("BACKGROUND", (0,-1), (-1,-1), colors.HexColor("#eff6ff")),
+            ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#dbe4f0")),
+            ("INNERGRID", (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
+            ("TOPPADDING", (0,0), (-1,-1), 3), ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+        ]))
+        story.append(bt)
+    elif b.get("target_budget_inr") is not None and float(b["target_budget_inr"]) > 0:
+        story.append(Paragraph(
+            f"Budget target: <b>₹{float(b['target_budget_inr']):,.0f}</b> · Itemized breakdown not recorded.",
+            styles["FactTT"],
+        ))
+    else:
+        story.append(Paragraph("No itemized budget estimates or targets recorded for this travel plan.", styles["BodyTT"]))
+
+    if b.get("target_budget_inr") is not None and budget_rows:
         story.append(Paragraph(
             f"Budget target: <b>₹{float(b['target_budget_inr']):,.0f}</b> · Status: <b>{'Within target' if b.get('within_budget') else 'Above target'}</b> · {esc(b.get('pricing_note') or '')}",
             styles["SmallTT"],
         ))
 
     story.append(Paragraph("Day-by-Day Itinerary", styles["H2TT"]))
-    for day in (plan.get("daily_plan") or []):
-        title = f"Day {esc(day.get('day'))}: {esc(day.get('title') or '')}"
-        body = [Paragraph(title, styles["H3TT"])]
-        for label, key in (("Morning", "morning"), ("Afternoon", "afternoon"), ("Evening", "evening")):
-            body.append(Paragraph(f"<b>{label}:</b> {esc(day.get(key) or '')}", styles["BodyTT"]))
-        body.append(Paragraph(f"Estimated day cost: <b>₹{float(day.get('estimated_daily_cost_inr', 0)):,.0f}</b>", styles["SmallTT"]))
-        for note in day.get("notes") or []:
-            body.append(Paragraph(f"• {esc(note)}", styles["SmallTT"]))
-        story.append(KeepTogether(body))
+    daily_items = plan.get("daily_plan") or plan.get("itinerary") or []
+    if daily_items and isinstance(daily_items, list):
+        for idx, day in enumerate(daily_items, start=1):
+            if not isinstance(day, dict):
+                continue
+            day_num = day.get("day") or idx
+            title = f"Day {esc(day_num)}: {esc(day.get('title') or '')}"
+            body = [Paragraph(title, styles["H3TT"])]
+            for label, key in (("Morning", "morning"), ("Afternoon", "afternoon"), ("Evening", "evening")):
+                if day.get(key):
+                    body.append(Paragraph(f"<b>{label}:</b> {esc(day.get(key))}", styles["BodyTT"]))
+            if day.get("estimated_daily_cost_inr") is not None and float(day.get("estimated_daily_cost_inr", 0)) > 0:
+                body.append(Paragraph(f"Estimated day cost: <b>₹{float(day['estimated_daily_cost_inr']):,.0f}</b>", styles["SmallTT"]))
+            for note in day.get("notes") or []:
+                body.append(Paragraph(f"• {esc(note)}", styles["SmallTT"]))
+            story.append(KeepTogether(body))
+    else:
+        story.append(Paragraph("No day-by-day itinerary activities recorded for this travel plan revision.", styles["BodyTT"]))
 
     for heading, key in (("Changes From Feedback", "changes_from_feedback"), ("Assumptions", "assumptions"), ("Important Notes", "warnings")):
         values = plan.get(key) or []

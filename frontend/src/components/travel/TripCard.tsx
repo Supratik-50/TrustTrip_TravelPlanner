@@ -51,6 +51,21 @@ export const TripCard: React.FC<TripCardProps> = ({
     }
   };
 
+  const handleDownloadReceipt = async (e: React.MouseEvent, transactionId: string, bookingRef?: string) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setDownloadingId(transactionId);
+    try {
+      if (bookingService.downloadPaymentReceiptPdf) {
+        await bookingService.downloadPaymentReceiptPdf(transactionId, bookingRef);
+      }
+    } catch (err) {
+      console.error('Failed to download payment receipt PDF:', err);
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
   const formatDateRange = (start?: string, end?: string) => {
     if (!start) return '';
     try {
@@ -225,26 +240,39 @@ export const TripCard: React.FC<TripCardProps> = ({
           {/* Canonical Wave 3B/3D Booking Badges */}
           {((trip.flights && trip.flights.length > 0) || (trip.hotels && trip.hotels.length > 0)) && (
             <div className="pt-2 space-y-1 border-t border-[var(--border-subtle)]" onClick={(e) => e.stopPropagation()}>
-              {trip.flights?.filter((f: any) => f && f.booking_status !== 'failed' && f.booking_status !== 'abandoned').map((f: any) => {
-                const isConfirmed = f.booking_status === 'booked' || f.booking_status === 'completed';
+              {trip.flights?.filter((f: any) => f && (f.booking_status === 'booked' || f.booking_status === 'completed')).map((f: any) => {
+                const isConfirmed = true;
                 return (
                   <div key={f.id} className="flex items-center justify-between text-[11px] bg-[var(--surface-subtle)] px-2 py-1 rounded">
                     <span className="flex items-center gap-1 font-mono text-[var(--status-success)]">
                       <CheckCircle2 className="w-3 h-3" />
-                      <span>Flight: {f.booking_reference || (isConfirmed ? 'Confirmed' : 'Pending')}</span>
+                      <span>Flight: {f.booking_reference || 'Confirmed'}</span>
                     </span>
                     {isConfirmed && f.id && (
-                      <button
-                        type="button"
-                        onClick={(e) => handleDownloadTicket(e, f.id, f.booking_reference)}
-                        disabled={downloadingId === f.id}
-                        data-href={`/api/trips/${encodeURIComponent(f.id)}/ticket.pdf`}
-                        className="text-[10px] text-[var(--primary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
-                        title="Download flight ticket PDF (/ticket.pdf)"
-                      >
-                        <Download className="w-3 h-3" />
-                        {downloadingId === f.id ? 'Downloading...' : 'Ticket'}
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={(e) => handleDownloadTicket(e, f.id, f.booking_reference)}
+                          disabled={downloadingId === f.id}
+                          data-href={`/api/trips/${encodeURIComponent(f.id)}/ticket.pdf`}
+                          className="text-[10px] text-[var(--primary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
+                          title="Download flight ticket PDF (/ticket.pdf)"
+                        >
+                          <Download className="w-3 h-3" />
+                          {downloadingId === f.id ? 'Downloading...' : 'Ticket'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => handleDownloadReceipt(e, f.id, f.booking_reference)}
+                          disabled={downloadingId === f.id}
+                          data-href={`/api/trips/${encodeURIComponent(f.id)}/receipt.pdf`}
+                          className="text-[10px] text-[var(--text-secondary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
+                          title="Download payment receipt PDF (/receipt.pdf)"
+                        >
+                          <Download className="w-3 h-3" />
+                          Receipt
+                        </button>
+                      </div>
                     )}
                   </div>
                 );
@@ -255,17 +283,30 @@ export const TripCard: React.FC<TripCardProps> = ({
                     <CheckCircle2 className="w-3 h-3" />
                     <span>Hotel: {h.booking_reference || 'Booked'}</span>
                   </span>
-                  <button
-                    type="button"
-                    onClick={(e) => handleDownloadVoucher(e, h.id, h.booking_reference)}
-                    disabled={downloadingId === h.id}
-                    data-href={`/api/trips/${encodeURIComponent(h.id)}/hotel.pdf`}
-                    className="text-[10px] text-[var(--primary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
-                    title="Download hotel voucher PDF (/hotel.pdf)"
-                  >
-                    <Download className="w-3 h-3" />
-                    {downloadingId === h.id ? 'Downloading...' : 'Voucher'}
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={(e) => handleDownloadVoucher(e, h.id, h.booking_reference)}
+                      disabled={downloadingId === h.id}
+                      data-href={`/api/trips/${encodeURIComponent(h.id)}/hotel.pdf`}
+                      className="text-[10px] text-[var(--primary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
+                      title="Download hotel voucher PDF (/hotel.pdf)"
+                    >
+                      <Download className="w-3 h-3" />
+                      {downloadingId === h.id ? 'Downloading...' : 'Voucher'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => handleDownloadReceipt(e, h.id, h.booking_reference)}
+                      disabled={downloadingId === h.id}
+                      data-href={`/api/trips/${encodeURIComponent(h.id)}/receipt.pdf`}
+                      className="text-[10px] text-[var(--text-secondary)] hover:underline inline-flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
+                      title="Download payment receipt PDF (/receipt.pdf)"
+                    >
+                      <Download className="w-3 h-3" />
+                      Receipt
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>

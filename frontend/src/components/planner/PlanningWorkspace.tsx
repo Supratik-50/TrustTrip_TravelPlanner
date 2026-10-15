@@ -6,10 +6,78 @@ import { useNotification } from '../../context/NotificationContext';
 import { PlannerInput } from './PlannerInput';
 import { ItineraryTimeline } from '../travel/ItineraryTimeline';
 import { Button } from '../common/Button';
+import { getDestinationImage } from '../../lib/destinationImages';
 
 interface PlanningWorkspaceProps {
   trip: TripDetail;
   onUpdateTrip: (updated: TripDetail) => void;
+}
+
+/**
+ * Validate destination consistency between generated plan and canonical trip.
+ *
+ * Hierarchy of validation:
+ * 1. Direct lexical matching: planDest contains keywords from canonicalDest or vice-versa.
+ * 2. Authoritative backend canonical resolution matching:
+ *    When the backend resolves a region/state to a canonical gateway city/airport
+ *    (e.g., "Kerala, India" -> destination_city: "Kochi", destination_airport: "COK"),
+ *    the generated plan destination matching the backend-resolved city/airport is accepted.
+ * 3. Geographic catalog hierarchy matching (secondary support):
+ *    Using DESTINATION_CATALOG metadata (e.g., Kochi, Munnar, Alleppey -> region: Kerala, country: India).
+ *
+ * Preserves strict anti-hallucination bounds:
+ * Cross-border or cross-region mismatches (e.g. Kerala -> Paris, Kerala -> Tokyo, Paris -> London)
+ * are always rejected.
+ */
+export function validateDestinationConsistency(
+  planDestRaw: string,
+  canonicalDestRaw: string,
+  response?: any
+): boolean {
+  const planDest = (planDestRaw || '').toLowerCase().trim();
+  const canonicalDest = (canonicalDestRaw || '').toLowerCase().trim();
+  if (!planDest || !canonicalDest) return true;
+
+  // 1. Direct lexical matching (existing check)
+  const destWords = canonicalDest.replace(/[,\-.]/g, ' ').split(/\s+/).filter(w => w.length >= 3);
+  const directMatch = destWords.some(w => planDest.includes(w)) || planDest.includes(canonicalDest) || canonicalDest.includes(planDest);
+  if (directMatch) return true;
+
+  // 2. Authoritative backend canonical resolution matching
+  if (response?.trip_constraints) {
+    const backendQuery = (response.trip_constraints.destination_query || '').toLowerCase().trim();
+    const backendCity = (response.trip_constraints.destination_city || '').toLowerCase().trim();
+    const backendAirport = (response.trip_constraints.destination_airport || response.destination_airport || '').toLowerCase().trim();
+    const planAirport = (response.plan_json?.destination_airport || '').toLowerCase().trim();
+
+    if (backendQuery && (backendQuery === canonicalDest || canonicalDest.includes(backendQuery) || backendQuery.includes(canonicalDest))) {
+      if (
+        (backendCity && (planDest === backendCity || planDest.includes(backendCity) || backendCity.includes(planDest))) ||
+        (backendAirport && (planDest === backendAirport || planAirport === backendAirport))
+      ) {
+        return true;
+      }
+    }
+  }
+
+  // 3. Geographic catalog hierarchy matching (Secondary support)
+  const planMeta = getDestinationImage(planDest);
+  const canonMeta = getDestinationImage(canonicalDest);
+  const isGeneric = (m: any) => !m || m.country === 'Journey Discovery' || m.region === 'World';
+
+  if (!isGeneric(planMeta) && !isGeneric(canonMeta)) {
+    const sameCountry = planMeta.country && canonMeta.country && planMeta.country.toLowerCase() === canonMeta.country.toLowerCase();
+    if (sameCountry) {
+      const sameRegion = Boolean(planMeta.region && canonMeta.region && planMeta.region.toLowerCase() === canonMeta.region.toLowerCase());
+      const regionInCanon = Boolean(planMeta.region && canonicalDest.includes(planMeta.region.toLowerCase()));
+      const canonInRegion = Boolean(canonMeta.region && planDest.includes(canonMeta.region.toLowerCase()));
+      if (sameRegion || regionInCanon || canonInRegion) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 export const PlanningWorkspace: React.FC<PlanningWorkspaceProps> = ({ trip, onUpdateTrip }) => {
@@ -24,19 +92,27 @@ export const PlanningWorkspace: React.FC<PlanningWorkspaceProps> = ({ trip, onUp
     setLastQuery(query);
 
     try {
-      const response = await api.planTravel({
-        trip_id: trip.trip_id,
-        thread_id: trip.thread_id,
-        message: query,
-        query,
-      });
+      const isRevisingProposal = Boolean(
+        trip.status === 'awaiting_approval' && trip.active_revision_id
+      );
+
+      const response = isRevisingProposal
+        ? await api.generateRevisionPlan(trip.trip_id, trip.active_revision_id!, {
+            message: query,
+            query,
+          })
+        : await api.planTravel({
+            trip_id: trip.trip_id,
+            thread_id: trip.thread_id,
+            message: query,
+            query,
+          });
 
       // Verify response consistency against canonical trip
       const planDest = (response.plan_json?.destination || response.accommodation?.area || '').toLowerCase();
       const canonicalDest = (trip.destination || '').toLowerCase();
       if (planDest && canonicalDest) {
-        const destWords = canonicalDest.replace(/[,\-.]/g, ' ').split(/\s+/).filter(w => w.length >= 3);
-        const matches = destWords.some(w => planDest.includes(w)) || planDest.includes(canonicalDest);
+        const matches = validateDestinationConsistency(planDest, canonicalDest, response);
         if (!matches) {
           throw new Error(`Consistency error: Generated plan for "${response.plan_json?.destination || planDest}" does not match your trip destination "${trip.destination}".`);
         }
@@ -59,7 +135,7 @@ export const PlanningWorkspace: React.FC<PlanningWorkspaceProps> = ({ trip, onUp
 
       const updatedTrip: TripDetail = {
         ...trip,
-        status: 'planning',
+        status: isRevisingProposal ? 'awaiting_approval' : 'planning',
         thread_id: response.thread_id || trip.thread_id,
         plan: response,
       };

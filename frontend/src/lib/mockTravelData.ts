@@ -130,6 +130,16 @@ export const saveMockHotelSelection = (
   } catch {}
 };
 
+export const clearMockSelections = (tripId: string): void => {
+  try {
+    const raw = localStorage.getItem(MOCK_STORAGE_SELECTIONS_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    delete parsed[tripId];
+    localStorage.setItem(MOCK_STORAGE_SELECTIONS_KEY, JSON.stringify(parsed));
+  } catch {}
+};
+
 export const clearMockTripSelection = (tripId: string, type: 'flight' | 'hotel'): void => {
   try {
     const raw = localStorage.getItem(MOCK_STORAGE_SELECTIONS_KEY);

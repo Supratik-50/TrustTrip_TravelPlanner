@@ -27,6 +27,7 @@ from services.flight_provider import FlightProviderError, FlightProviderTimeout
 from services.razorpay_service import RazorpayService, RazorpayError
 from services.ticket_service import build_booking_pdf
 from services.hotel_booking_pdf import build_hotel_booking_pdf
+from services.payment_receipt_pdf import build_payment_receipt_pdf
 from services.hotel_transaction_store import HotelTransactionStore
 from services.booking_read_service import BookingReadService
 from services.flight_booking_service import FlightBookingService, BookingNotFoundError, BookingPermissionError
@@ -82,6 +83,7 @@ def _trip_store() -> TripStore:
     summary="List all trips and booking transactions owned by the authenticated user",
 )
 async def list_trips(
+    record_type: str | None = Query(default=None, description="Optional filter by record_type: 'trip', 'flight', 'hotel', 'all'"),
     current_user: UserResponse = Depends(get_current_user),
     trip_store: TripStore = Depends(_trip_store),
 ):
@@ -109,6 +111,8 @@ async def list_trips(
     # Build lookup of flight and hotel bookings by trip_id to attach to canonical trips
     flights_by_trip: dict[str, list[dict[str, Any]]] = {}
     for f in flights:
+        if str(f.get("booking_status") or "").lower() != "booked":
+            continue
         tid = str(f.get("trip_id") or "")
         if tid:
             flights_by_trip.setdefault(tid, []).append(f)
@@ -122,53 +126,58 @@ async def list_trips(
             hotels_by_trip.setdefault(tid, []).append(h)
 
     normalized = []
-    for t in canonical_trips:
-        item = dict(t)
-        item["record_type"] = "trip"
-        trip_id = str(item.get("id") or item.get("trip_id") or "")
-        trip_flights = flights_by_trip.get(trip_id, [])
-        trip_hotels = hotels_by_trip.get(trip_id, [])
-        item["flight_count"] = len(trip_flights)
-        item["hotel_count"] = len(trip_hotels)
-        item["flights"] = trip_flights
-        item["hotels"] = [
-            {
-                "id": str(h.get("id")),
-                "booking_reference": (
-                    (h.get("booking_json") or {}).get("confirmation_code")
-                    or (h.get("booking_json") or {}).get("booking_id")
-                    or str(h.get("id"))
-                ),
-                "confirmation_code": (
-                    (h.get("booking_json") or {}).get("confirmation_code")
-                    or (h.get("booking_json") or {}).get("booking_id")
-                    or str(h.get("id"))
-                ),
-                "booking_status": str(h.get("booking_status")),
-                "hotel_name": h.get("hotel_name"),
-                "amount": float(h.get("amount_inr") or 0.0),
-                "currency": str(h.get("currency") or "INR"),
-            }
-            for h in trip_hotels
-        ]
-        normalized.append(item)
-    for tx in flights:
-        item = dict(tx)
-        item["record_type"] = "flight"
-        normalized.append(item)
-    for tx in hotels:
-        item = dict(tx)
-        item["record_type"] = "hotel"
-        item["booking_reference"] = (
-            (item.get("booking_json") or {}).get("confirmation_code")
-            or (item.get("booking_json") or {}).get("booking_id")
-        )
-        item["amount"] = item.get("amount_inr")
-        item["currency"] = "INR"
-        normalized.append(item)
+    if record_type in (None, "trip", "all"):
+        for t in canonical_trips:
+            item = dict(t)
+            item["record_type"] = "trip"
+            trip_id = str(item.get("id") or item.get("trip_id") or "")
+            trip_flights = flights_by_trip.get(trip_id, [])
+            trip_hotels = hotels_by_trip.get(trip_id, [])
+            item["flight_count"] = len(trip_flights)
+            item["hotel_count"] = len(trip_hotels)
+            item["flights"] = trip_flights
+            item["hotels"] = [
+                {
+                    "id": str(h.get("id")),
+                    "booking_reference": (
+                        (h.get("booking_json") or {}).get("confirmation_code")
+                        or (h.get("booking_json") or {}).get("booking_id")
+                        or str(h.get("id"))
+                    ),
+                    "confirmation_code": (
+                        (h.get("booking_json") or {}).get("confirmation_code")
+                        or (h.get("booking_json") or {}).get("booking_id")
+                        or str(h.get("id"))
+                    ),
+                    "booking_status": str(h.get("booking_status")),
+                    "hotel_name": h.get("hotel_name"),
+                    "amount": float(h.get("amount_inr") or 0.0),
+                    "currency": str(h.get("currency") or "INR"),
+                }
+                for h in trip_hotels
+            ]
+            normalized.append(item)
+
+    if record_type in ("flight", "all"):
+        for tx in flights:
+            item = dict(tx)
+            item["record_type"] = "flight"
+            normalized.append(item)
+
+    if record_type in ("hotel", "all"):
+        for tx in hotels:
+            item = dict(tx)
+            item["record_type"] = "hotel"
+            item["booking_reference"] = (
+                (item.get("booking_json") or {}).get("confirmation_code")
+                or (item.get("booking_json") or {}).get("booking_id")
+            )
+            item["amount"] = item.get("amount_inr")
+            item["currency"] = "INR"
+            normalized.append(item)
 
     normalized.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
-    return {"success": True, "trips": normalized[:100]}
+    return {"success": True, "trips": normalized[:100], "flights": flights, "hotels": hotels}
 
 
 @router.post(
@@ -374,6 +383,161 @@ async def hotel_booking_pdf(
             detail=f"Could not generate hotel booking PDF: {exc}",
         )
     filename = "trust-trip-hotel-booking.pdf"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/{transaction_id}/receipt.pdf",
+    summary="Download payment receipt PDF for an owned transaction",
+)
+async def payment_receipt_pdf(
+    transaction_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    user_id_str = str(current_user.id)
+    receipt_data: dict[str, Any] = {}
+
+    # 1. Attempt lookup in HotelTransactionStore
+    hotel_record = HotelTransactionStore().get(transaction_id)
+    if hotel_record:
+        if hotel_record.get("customer_ref") and hotel_record.get("customer_ref") != user_id_str:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied to this payment receipt.",
+            )
+        offer = hotel_record.get("offer_json") or {}
+        if isinstance(offer, str):
+            try:
+                offer = json.loads(offer)
+            except Exception:
+                offer = {}
+        booking = hotel_record.get("booking_json") or {}
+        if isinstance(booking, str):
+            try:
+                booking = json.loads(booking)
+            except Exception:
+                booking = {}
+        holder = hotel_record.get("holder_json") or {}
+        if isinstance(holder, str):
+            try:
+                holder = json.loads(holder)
+            except Exception:
+                holder = {}
+
+        lead_name = " ".join(x for x in [holder.get("firstName"), holder.get("lastName")] if x) or holder.get("name") or "—"
+        conf_code = booking.get("confirmation_code") or booking.get("booking_id")
+
+        receipt_data = {
+            "id": transaction_id,
+            "merchant": "TrustTrip Travel Planner",
+            "service_type": "Hotel Reservation",
+            "service_name": hotel_record.get("hotel_name") or offer.get("hotel_name") or "Hotel Stay",
+            "payment_status": hotel_record.get("payment_status") or "pending",
+            "booking_status": hotel_record.get("booking_status") or "pending",
+            "amount_inr": float(hotel_record.get("amount_inr") or 0.0),
+            "currency": str(hotel_record.get("currency") or "INR"),
+            "razorpay_order_id": hotel_record.get("razorpay_order_id"),
+            "razorpay_payment_id": hotel_record.get("razorpay_payment_id"),
+            "confirmation_code": conf_code,
+            "customer_name": lead_name,
+            "customer_email": holder.get("email"),
+            "created_at": hotel_record.get("created_at"),
+        }
+
+    # 2. Attempt lookup in FlightBookingService booking_intents
+    if not receipt_data:
+        flight_booking_service = FlightBookingService()
+        intent = None
+        try:
+            intent = flight_booking_service._get_intent(transaction_id, current_user.id)
+        except BookingPermissionError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this payment receipt.",
+            )
+        except BookingNotFoundError:
+            intent = None
+        except Exception as exc:
+            logger.warning("Could not query booking_intents for receipt %s: %s", transaction_id, exc)
+            intent = None
+
+        if intent:
+            meta = intent.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            passengers = meta.get("passengers", [])
+            lead_name = "—"
+            if passengers:
+                lead = passengers[0]
+                lead_name = " ".join(x for x in [lead.get("given_name"), lead.get("family_name")] if x) or lead.get("name") or "—"
+
+            pnr = intent.get("provider_reference") or meta.get("booking_reference") or meta.get("pnr")
+            status_str = str(intent.get("status") or "").upper()
+            pay_status = "captured" if status_str == "COMPLETED" else "pending"
+
+            receipt_data = {
+                "id": str(intent["id"]),
+                "merchant": "TrustTrip Travel Planner",
+                "service_type": "Flight Reservation",
+                "service_name": f"Flight Booking ({intent.get('provider') or 'Duffel'})",
+                "payment_status": pay_status,
+                "booking_status": status_str,
+                "amount_inr": float(intent.get("expected_amount") or 0.0),
+                "currency": str(intent.get("currency") or "INR"),
+                "razorpay_order_id": meta.get("razorpay_order_id") or "—",
+                "razorpay_payment_id": meta.get("razorpay_payment_id") or "—",
+                "confirmation_code": str(pnr) if pnr else None,
+                "customer_name": lead_name,
+                "customer_email": meta.get("contact_email") or current_user.email,
+                "created_at": intent.get("created_at"),
+            }
+
+    # 3. Attempt lookup in legacy flight_transactions
+    if not receipt_data:
+        tx_rec = _store().get(transaction_id)
+        if tx_rec:
+            if tx_rec.get("customer_ref") and tx_rec.get("customer_ref") != user_id_str:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied to this payment receipt.",
+                )
+            receipt_data = {
+                "id": str(tx_rec["id"]),
+                "merchant": "TrustTrip Travel Planner",
+                "service_type": "Flight Reservation",
+                "service_name": "Flight Booking",
+                "payment_status": tx_rec.get("payment_status") or "captured",
+                "booking_status": tx_rec.get("booking_status") or "booked",
+                "amount_inr": float(tx_rec.get("amount") or 0.0),
+                "currency": str(tx_rec.get("currency") or "INR"),
+                "razorpay_order_id": tx_rec.get("razorpay_order_id"),
+                "razorpay_payment_id": tx_rec.get("razorpay_payment_id"),
+                "confirmation_code": tx_rec.get("booking_reference") or tx_rec.get("duffel_order_id"),
+                "customer_name": "—",
+                "customer_email": current_user.email,
+                "created_at": tx_rec.get("created_at"),
+            }
+
+    if not receipt_data:
+        raise HTTPException(
+            status_code=404,
+            detail="Payment transaction record not found.",
+        )
+
+    try:
+        pdf = await asyncio.to_thread(build_payment_receipt_pdf, receipt_data)
+    except Exception as exc:
+        logger.error("Failed to generate payment receipt PDF: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not generate payment receipt PDF.")
+
+    filename = f"trust-trip-receipt-{transaction_id[:8]}.pdf"
     return Response(
         content=pdf,
         media_type="application/pdf",

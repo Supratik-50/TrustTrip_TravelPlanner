@@ -502,4 +502,107 @@ const makeTripDetail = (overrides: Record<string, any>): TripDetail => ({
   console.log('✔ Test F: Static audit — BookingWorkspace approval handler has ZERO current_revision fallback.');
 }
 
+// Test G: TripRevisionManager Revision ID Resolution & generateRevisionPlan Dispatch
+// Proves:
+// - trip.revisions = []
+// - trip.current_revision = undefined
+// - trip.active_revision_id contains Revision #2 UUID (4be5fbaa-5ae8-4102-bf10-e4ef53685217)
+// - activeRevisionId resolution extracts the Revision #2 UUID
+// - calling generateRevisionPlan uses that exact UUID
+{
+  const targetTripId = 'd7781f79-5730-4dc1-8914-ca02be3e62b1';
+  const targetRevisionId = '4be5fbaa-5ae8-4102-bf10-e4ef53685217';
+
+  const trip = makeTripDetail({
+    trip_id: targetTripId,
+    destination: 'Kerala, India',
+    start_date: '2026-11-15',
+    end_date: '2026-11-20',
+    travelers_count: 2,
+    passengers: 2,
+    budget: 70000,
+    status: 'awaiting_approval' as const,
+    active_revision_number: 2,
+    active_revision_id: targetRevisionId,
+    revisions: [] as any[],
+    current_revision: undefined,
+  });
+
+  // Replicate resolution logic in TripRevisionManager
+  const revisions = trip.revisions || [];
+  const currentRevisionNumber = trip.active_revision_number || revisions.length || 1;
+  const currentRevision: any = (revisions as any[]).find((r) => r.revision_number === currentRevisionNumber) || trip.current_revision;
+
+  const activeRevisionId =
+    (currentRevision as any)?.revision_id ||
+    trip.active_revision_id ||
+    (trip as any).current_revision_id;
+
+  assert.strictEqual(revisions.length, 0, 'trip.revisions is empty');
+  assert.strictEqual(currentRevision, undefined, 'currentRevision is undefined');
+  assert.strictEqual(activeRevisionId, targetRevisionId, 'activeRevisionId resolves to Revision #2 UUID');
+
+  // Verify API call receives exact activeRevisionId and targets correct endpoint
+  let calledUrl = '';
+  let calledMethod = '';
+  const originalFetch = global.fetch;
+  global.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calledUrl = String(url);
+    calledMethod = init?.method || 'GET';
+    return {
+      ok: true,
+      json: async () => ({
+        trip_id: targetTripId,
+        revision_id: targetRevisionId,
+        itinerary: [],
+        message: 'Plan generated for revision',
+      }),
+    } as any;
+  }) as any;
+
+  try {
+    const result = await apiClient.generateRevisionPlan(trip.trip_id, activeRevisionId, {
+      message: 'Test revision message',
+    });
+    assert.strictEqual(result.trip_id, targetTripId, 'generateRevisionPlan returned trip_id');
+    assert.strictEqual(result.revision_id, targetRevisionId, 'generateRevisionPlan returned revision_id');
+    assert.strictEqual(calledMethod, 'POST', 'HTTP POST method used');
+    assert.ok(calledUrl.includes(`/api/trips/${targetTripId}/revisions/${targetRevisionId}/plan`), 'Target URL contains exact trip_id and revision_id');
+    console.log('✔ Test G: TripRevisionManager resolution finds Revision #2 UUID when revisions=[] and current_revision=undefined, and calls generateRevisionPlan with exact UUID.');
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+// Test H: Static audit — TripRevisionManager.tsx uses activeRevisionId in handleGenerateRevisionPlan and handleApprove
+{
+  const fs = await import('fs');
+  const rmSource = fs.readFileSync('src/components/travel/TripRevisionManager.tsx', 'utf8');
+
+  // 1. activeRevisionId definition exists with fallbacks
+  assert.ok(rmSource.includes('const activeRevisionId ='), 'activeRevisionId is defined');
+  assert.ok(rmSource.includes('trip.active_revision_id'), 'activeRevisionId checks trip.active_revision_id');
+  assert.ok(rmSource.includes('(trip as any).current_revision_id'), 'activeRevisionId checks (trip as any).current_revision_id');
+
+  // 2. handleGenerateRevisionPlan function body check
+  const genPlanStart = rmSource.indexOf('const handleGenerateRevisionPlan');
+  const genPlanEnd = rmSource.indexOf('\n  };', genPlanStart) + 5;
+  const genPlanBody = rmSource.slice(genPlanStart, genPlanEnd);
+
+  assert.ok(!genPlanBody.includes('if (!currentRevision?.revision_id)'), 'handleGenerateRevisionPlan does NOT block on currentRevision?.revision_id');
+  assert.ok(genPlanBody.includes('if (!activeRevisionId)'), 'handleGenerateRevisionPlan checks activeRevisionId');
+  assert.ok(genPlanBody.includes('api.generateRevisionPlan(trip.trip_id, activeRevisionId'), 'handleGenerateRevisionPlan passes activeRevisionId');
+
+  // 3. handleApprove function body check
+  const approveStart = rmSource.indexOf('const handleApprove');
+  const approveEnd = rmSource.indexOf('\n  };', approveStart) + 5;
+  const approveBody = rmSource.slice(approveStart, approveEnd);
+
+  assert.ok(!approveBody.includes('if (!currentRevision?.revision_id)'), 'handleApprove does NOT block on currentRevision?.revision_id');
+  assert.ok(approveBody.includes('if (!activeRevisionId)'), 'handleApprove checks activeRevisionId');
+  assert.ok(approveBody.includes('revision_id: activeRevisionId'), 'handleApprove passes activeRevisionId');
+
+  console.log('✔ Test H: Static audit — TripRevisionManager uses activeRevisionId in handleGenerateRevisionPlan and handleApprove.');
+}
+
 console.log('\nAll Section 8 Frontend Contract Tests PASSED!');

@@ -501,6 +501,7 @@ async def download_travel_plan_pdf(
                 )
             from services.trip_store import TripStore
             from services.evidence_store import EvidenceRevisionStore
+            from services.booking_read_service import BookingReadService
 
             ts = TripStore()
             trip = ts.get_trip(request_data.trip_id, current_user.id)
@@ -512,31 +513,144 @@ async def download_travel_plan_pdf(
 
             ev_store = EvidenceRevisionStore()
             current_rev_id = trip.get("current_revision_id")
+            rev = None
             if current_rev_id:
                 rev = ev_store.get_revision(str(current_rev_id), current_user.id)
-                if rev and rev.plan_snapshot:
-                    plan = rev.plan_snapshot
 
-            if not plan:
-                meta = trip.get("metadata") or {}
-                if isinstance(meta, str):
+            meta = trip.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+
+            ps = rev.plan_snapshot if (rev and isinstance(rev.plan_snapshot, dict)) else {}
+            ps_meta = ps.get("metadata") if isinstance(ps.get("metadata"), dict) else {}
+            ps_constraints = ps.get("constraints") if isinstance(ps.get("constraints"), dict) else {}
+            t_constraints = meta.get("constraints") if isinstance(meta.get("constraints"), dict) else {}
+
+            candidate_plan = (
+                ps_meta.get("plan")
+                or ps_meta.get("plan_json")
+                or ps.get("plan")
+                or ps.get("plan_json")
+                or meta.get("plan")
+                or meta.get("plan_json")
+                or meta.get("generated_plan")
+                or (ps if ps.get("daily_plan") or ps.get("route") else None)
+                or {}
+            )
+            if isinstance(candidate_plan, str):
+                try:
+                    candidate_plan = json.loads(candidate_plan)
+                except Exception:
+                    candidate_plan = {}
+            if not isinstance(candidate_plan, dict):
+                candidate_plan = {}
+
+            plan = dict(candidate_plan)
+
+            # Ensure authoritative destination, origin, route, dates, duration, style, and itinerary are populated
+            dest = plan.get("destination") or trip.get("destination") or ps.get("destination") or t_constraints.get("destination") or ""
+            orig = plan.get("origin") or trip.get("origin") or ps.get("origin") or t_constraints.get("origin") or ""
+            plan["destination"] = dest
+            plan["origin"] = orig
+            if not plan.get("route"):
+                if orig and dest:
+                    plan["route"] = f"{orig} to {dest}"
+                elif trip.get("title"):
+                    plan["route"] = trip.get("title")
+
+            start_d = (
+                plan.get("departure_date")
+                or plan.get("start_date")
+                or t_constraints.get("start_date")
+                or t_constraints.get("departure_date")
+                or ps_constraints.get("start_date")
+                or ps_constraints.get("departure_date")
+                or meta.get("start_date")
+                or trip.get("start_date")
+            )
+            end_d = (
+                plan.get("return_date")
+                or plan.get("end_date")
+                or t_constraints.get("end_date")
+                or t_constraints.get("return_date")
+                or ps_constraints.get("end_date")
+                or ps_constraints.get("return_date")
+                or meta.get("end_date")
+                or trip.get("end_date")
+            )
+            if start_d:
+                plan["departure_date"] = str(start_d)[:10]
+            if end_d:
+                plan["return_date"] = str(end_d)[:10]
+            if not plan.get("travel_dates") or plan.get("travel_dates") == "Flexible dates":
+                if start_d and end_d:
+                    plan["travel_dates"] = f"{str(start_d)[:10]} to {str(end_d)[:10]}"
+
+            if not plan.get("duration_days") or plan.get("duration_days") <= 0:
+                if start_d and end_d:
                     try:
-                        meta = json.loads(meta)
+                        from datetime import date as _dt_date
+                        d1 = _dt_date.fromisoformat(str(start_d)[:10])
+                        d2 = _dt_date.fromisoformat(str(end_d)[:10])
+                        plan["duration_days"] = max(1, (d2 - d1).days)
                     except Exception:
-                        meta = {}
-                plan = (
-                    meta.get("generated_plan")
-                    or meta.get("plan")
-                    or meta.get("plan_json")
-                    or {
-                        "title": trip.get("title") or "Travel Plan",
-                        "destination": trip.get("destination") or "Destination",
-                        "origin": trip.get("origin") or "Origin",
-                        "itinerary": meta.get("itinerary") or [],
-                        "hotels": meta.get("hotels") or ([meta.get("selected_hotel")] if meta.get("selected_hotel") else []),
-                        "flights": meta.get("flights") or ([meta.get("selected_flight")] if meta.get("selected_flight") else []),
-                    }
-                )
+                        pass
+                if not plan.get("duration_days"):
+                    itin_len = len(plan.get("daily_plan") or plan.get("itinerary") or meta.get("itinerary") or [])
+                    plan["duration_days"] = max(1, itin_len)
+
+            if not plan.get("daily_plan"):
+                itin = plan.get("itinerary") or meta.get("itinerary") or []
+                if isinstance(itin, list) and itin:
+                    plan["daily_plan"] = itin
+
+            if not plan.get("trip_summary"):
+                plan["trip_summary"] = meta.get("trip_summary") or meta.get("raw_plan") or (f"Custom itinerary for {dest}." if dest else "")
+
+            # Query authoritative bookings for confirmed flight and hotel
+            try:
+                booking_read = BookingReadService()
+                trip_bookings = booking_read.get_trip_bookings(request_data.trip_id, current_user.id)
+                flight_info = trip_bookings.get("flight")
+                hotel_info = trip_bookings.get("hotel")
+
+                if flight_info and flight_info.get("is_booked"):
+                    carrier = ""
+                    slices = flight_info.get("slices") or []
+                    if slices and isinstance(slices, list) and len(slices) > 0:
+                        first_sl = slices[0]
+                        carrier = first_sl.get("carrier_name") or first_sl.get("carrier_code") or ""
+                        segs = first_sl.get("segments") or []
+                        if segs and isinstance(segs, list) and len(segs) > 0:
+                            f_num = segs[0].get("flight_number") or ""
+                            if f_num:
+                                carrier = f"{carrier} {f_num}".strip()
+                    pnr = flight_info.get("pnr") or ""
+                    ref = flight_info.get("booking_reference") or ""
+                    pnr_ref = f" (PNR: {pnr}, Ref: {ref})" if pnr or ref else ""
+                    route_info = f" ({orig}–{dest})" if orig and dest else ""
+                    plan["confirmed_flight"] = f"Confirmed Booking: {carrier or 'Flight'}{route_info}{pnr_ref}"
+                    if flight_info.get("amount"):
+                        plan["confirmed_flight_cost"] = flight_info["amount"]
+
+                if hotel_info and hotel_info.get("is_booked"):
+                    h_name = hotel_info.get("hotel_name") or "Hotel"
+                    r_name = hotel_info.get("room_name") or "Room"
+                    cin = hotel_info.get("check_in") or ""
+                    cout = hotel_info.get("check_out") or ""
+                    code = hotel_info.get("confirmation_code") or ""
+                    dates_str = f" ({cin} to {cout})" if cin and cout else ""
+                    code_str = f" [Confirmation: {code}]" if code else ""
+                    plan["confirmed_hotel"] = f"Confirmed Booking: {h_name} - {r_name}{dates_str}{code_str}"
+                    if hotel_info.get("amount_inr"):
+                        plan["confirmed_hotel_cost"] = hotel_info["amount_inr"]
+            except Exception as b_err:
+                logger.warning("Could not attach confirmed booking details to plan PDF for trip %s: %s", request_data.trip_id, b_err)
         else:
             raise HTTPException(
                 status_code=400,

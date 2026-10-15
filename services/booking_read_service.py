@@ -91,16 +91,70 @@ class BookingReadService:
         if not intents:
             return None
 
-        completed_intents = [
-            i for i in intents
-            if str(i.get("status") or "").upper() == "COMPLETED"
-            and not (
-                (i.get("metadata") or {}).get("status") == "CANCELLED"
-                or (i.get("metadata") or {}).get("cancellation")
-                or (i.get("metadata") or {}).get("cancelled_at")
-            )
-        ]
-        target = completed_intents[0] if completed_intents else intents[0]
+        # Check if the trip has an authoritative selected flight snapshot
+        selected_snapshot_id = None
+        try:
+            if self.use_in_memory:
+                from services.trip_store import TripStore
+                trip_rec = TripStore().get_trip(trip_id, user_id)
+                if trip_rec:
+                    meta_trip = trip_rec.get("metadata") or {}
+                    if isinstance(meta_trip, str):
+                        try:
+                            meta_trip = json.loads(meta_trip)
+                        except Exception:
+                            meta_trip = {}
+                    selected_snapshot_id = meta_trip.get("selected_flight_snapshot_id")
+            else:
+                with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+                    row = conn.execute(
+                        "SELECT metadata FROM trips WHERE id = %s AND user_id = %s",
+                        (trip_id, user_id),
+                    ).fetchone()
+                    if row:
+                        meta_trip = row.get("metadata") or {}
+                        if isinstance(meta_trip, str):
+                            try:
+                                meta_trip = json.loads(meta_trip)
+                            except Exception:
+                                meta_trip = {}
+                        selected_snapshot_id = meta_trip.get("selected_flight_snapshot_id")
+        except Exception as exc:
+            logger.warning("Could not query trip metadata for selected flight snapshot: %s", exc)
+
+        # If a specific flight snapshot is selected on the trip:
+        if selected_snapshot_id:
+            snap_str = str(selected_snapshot_id)
+            matching_intents = [
+                i for i in intents
+                if str(i.get("selected_offer_snapshot_id") or "") == snap_str
+            ]
+            if matching_intents:
+                comp_match = [
+                    i for i in matching_intents
+                    if str(i.get("status") or "").upper() == "COMPLETED"
+                    and not (
+                        (i.get("metadata") or {}).get("status") == "CANCELLED"
+                        or (i.get("metadata") or {}).get("cancellation")
+                        or (i.get("metadata") or {}).get("cancelled_at")
+                    )
+                ]
+                target = comp_match[0] if comp_match else matching_intents[0]
+            else:
+                # A new flight snapshot was selected for which no booking intent exists yet.
+                # Must NOT fall back to historical completed intents from previous offers!
+                return None
+        else:
+            completed_intents = [
+                i for i in intents
+                if str(i.get("status") or "").upper() == "COMPLETED"
+                and not (
+                    (i.get("metadata") or {}).get("status") == "CANCELLED"
+                    or (i.get("metadata") or {}).get("cancellation")
+                    or (i.get("metadata") or {}).get("cancelled_at")
+                )
+            ]
+            target = completed_intents[0] if completed_intents else intents[0]
 
         meta = target.get("metadata") or {}
         if (

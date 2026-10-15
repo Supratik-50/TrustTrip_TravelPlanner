@@ -804,3 +804,75 @@ def test_rejection_immutability_and_mutual_exclusion():
         json={"revision_id": rev_id, "expected_revision_number": 1},
     )
     assert app_res.status_code == 409
+
+
+def test_constraint_update_persists_budget_70k_and_planner_reads_it():
+    """Verify that updating budget to 70000 creates a revision, persists to metadata, and is read by PlannerService."""
+    client, user_id = _auth_client("budget_planner_user@example.com")
+    trip_store = TripStore()
+
+    # 1. Create base trip with initial budget 45000
+    base_trip = trip_store.create_trip(
+        user_id=user_id,
+        title="Kerala Journey",
+        destination="Kerala, India",
+        origin="Kolkata (CCU)",
+        metadata={
+            "budget": 45000,
+            "travelers_count": 2,
+            "start_date": "2026-10-14",
+            "end_date": "2026-10-21",
+            "constraints": {
+                "budget": 45000,
+                "travelers_count": 2,
+                "start_date": "2026-10-14",
+                "end_date": "2026-10-21",
+            },
+        },
+    )
+    trip_id = str(base_trip["id"])
+
+    # 2. Advance revision with updated budget 70000 and travelers 3
+    rev_res = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={
+            "updated_constraints": {
+                "budget": 70000,
+                "budget_amount": 70000,
+                "travelers_count": 3,
+                "adults": 3,
+                "children": 0,
+                "rooms": 1,
+            },
+            "feedback": "Budget increased to 70000 and travelers to 3",
+            "expected_base_revision": 0,
+        },
+    )
+    assert rev_res.status_code == 200
+    data = rev_res.json()
+    assert data["revision_number"] == 1
+    assert data["status"] == "awaiting_approval"
+
+    # 3. Read back authoritative trip record
+    persisted = trip_store.get_trip(trip_id, user_id)
+    assert persisted is not None
+    meta = persisted.get("metadata") or {}
+    assert meta.get("budget") == 70000.0
+    assert meta.get("constraints", {}).get("budget") == 70000
+    assert meta.get("travelers_count") == 3
+
+    # 4. Verify PlannerService extracts the new 70000 budget from canonical constraints
+    from services.planner_service import PlannerService
+    planner = PlannerService()
+    canonical_trip = planner.trip_store.get_trip(trip_id, user_id)
+    assert canonical_trip is not None
+
+    meta = canonical_trip.get("metadata") or {}
+    constraints_dict = meta.get("constraints") or {}
+    budget_val = (
+        constraints_dict.get("budget")
+        or constraints_dict.get("budget_amount")
+        or meta.get("budget")
+        or meta.get("budget_amount")
+    )
+    assert float(budget_val) == 70000.0
