@@ -391,6 +391,23 @@ class DuffelProvider(FlightProvider):
                 f"but {len(passengers)} passenger(s) were supplied."
             )
 
+        # Resolve and validate lead passenger contact details before making supplier calls
+        lead_passenger = passengers[0] if passengers else {}
+        raw_lead_email = str(lead_passenger.get("email") or "").strip()
+        if not raw_lead_email:
+            raise FlightProviderError("Lead passenger contact email is required.")
+        import re
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", raw_lead_email):
+            raise FlightProviderError("Lead passenger contact email must be a valid email address.")
+        lead_email = raw_lead_email
+
+        raw_lead_phone = lead_passenger.get("phone_number")
+        if not raw_lead_phone or not str(raw_lead_phone).strip():
+            raise FlightProviderError("Lead passenger contact phone number is required.")
+        lead_phone = _normalize_phone(raw_lead_phone)
+        if not lead_phone:
+            raise FlightProviderError("Lead passenger contact phone number must be a valid international phone number.")
+
         normalized_passengers: list[dict[str, Any]] = []
         departure_date = _departure_date_from_offer(latest)
         for supplied, offer_passenger in zip(passengers, offer_passengers):
@@ -408,13 +425,24 @@ class DuffelProvider(FlightProvider):
                     passenger["type"] = _passenger_type_for_dob(passenger["born_on"], departure_date)
                 except (TypeError, ValueError):
                     raise FlightProviderError("Passenger date of birth must be a valid YYYY-MM-DD date.")
-            phone = _normalize_phone(passenger.get("phone_number"))
-            if phone:
-                passenger["phone_number"] = phone
-            else:
-                passenger.pop("phone_number", None)
-            if not str(passenger.get("email") or "").strip():
-                passenger.pop("email", None)
+
+            # Contact details: companion without phone inherits validated lead contact phone
+            raw_phone = passenger.get("phone_number")
+            phone = _normalize_phone(raw_phone) if (raw_phone and str(raw_phone).strip()) else None
+            effective_phone = phone or lead_phone
+            if not effective_phone:
+                raise FlightProviderError("Passenger phone number is required.")
+            passenger["phone_number"] = effective_phone
+
+            # Contact details: companion without email inherits validated lead contact email
+            raw_email = str(passenger.get("email") or "").strip()
+            if raw_email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", raw_email):
+                raise FlightProviderError("Passenger email must be a valid email address.")
+            effective_email = raw_email or lead_email
+            if not effective_email:
+                raise FlightProviderError("Passenger email is required.")
+            passenger["email"] = effective_email
+
             normalized_passengers.append(passenger)
 
         payment_requirements = latest.get("payment_requirements") or {}
