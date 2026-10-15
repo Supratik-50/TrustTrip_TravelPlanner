@@ -5,6 +5,7 @@ Validates size, format, and generates immutable RagDocument and RagChunk entitie
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -25,10 +26,25 @@ class IngestionError(Exception):
     pass
 
 
+def clean_pdf_string(s: str) -> str:
+    r"""Unescape PDF octal character escapes (\ddd in cp1252/WinAnsi) and standard escape sequences."""
+    def _octal_replace(m: re.Match) -> str:
+        try:
+            val = int(m.group(1), 8)
+            return bytes([val]).decode("cp1252", errors="replace")
+        except Exception:
+            return m.group(0)
+
+    s = re.sub(r"\\([0-7]{1,3})", _octal_replace, s)
+    s = s.replace(r"\n", "\n").replace(r"\r", "\r").replace(r"\t", "\t")
+    s = s.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    return s.strip()
+
+
 def extract_pdf_text_pure_python(data: bytes) -> str:
     """Extract readable text streams from PDF bytes without requiring native C dependencies.
 
-    Parses PDF objects, decompresses FlateDecode streams with zlib, and extracts text operators.
+    Parses PDF objects, decompresses FlateDecode/ASCII85Decode streams, and extracts text operators.
     Enforces decompression ratio and stream limits to prevent decompression bomb attacks.
     """
     if not data.startswith(b"%PDF-"):
@@ -38,23 +54,36 @@ def extract_pdf_text_pure_python(data: bytes) -> str:
     total_decompressed = 0
     stream_count = 0
 
-    # Find stream ... endstream blocks
-    stream_pattern = re.compile(b"stream[\r\n]+(.*?)[\r\n]+endstream", re.DOTALL)
+    # Find stream ... endstream blocks (supporting both \r\n and immediate ~>endstream)
+    stream_pattern = re.compile(rb"stream[\r\n]+(.*?)[\r\n]*endstream", re.DOTALL)
     for match in stream_pattern.finditer(data):
         stream_count += 1
         if stream_count > MAX_PDF_STREAMS:
             raise IngestionError(f"PDF stream count exceeds maximum safe limit of {MAX_PDF_STREAMS}.")
 
         stream_bytes = match.group(1)
+        cur_bytes = stream_bytes.strip()
+
+        # Check for ASCII85Decode filter in preceding object dictionary or ~> trailer
+        prefix = data[max(0, match.start() - 300) : match.start()]
+        if b"ASCII85Decode" in prefix or cur_bytes.endswith(b"~>"):
+            try:
+                a85_data = cur_bytes
+                if b"~>" in a85_data and not a85_data.endswith(b"~>"):
+                    a85_data = a85_data[: a85_data.find(b"~>") + 2]
+                cur_bytes = base64.a85decode(a85_data, adobe=True)
+            except Exception:
+                pass
+
         decompressed: bytes | None = None
         # Try direct decompression
         try:
-            decompressed = zlib.decompress(stream_bytes)
+            decompressed = zlib.decompress(cur_bytes)
         except Exception:
             try:
-                decompressed = zlib.decompress(stream_bytes, -zlib.MAX_WBITS)
+                decompressed = zlib.decompress(cur_bytes, -zlib.MAX_WBITS)
             except Exception:
-                decompressed = stream_bytes
+                decompressed = cur_bytes
 
         if decompressed:
             total_decompressed += len(decompressed)
@@ -69,7 +98,7 @@ def extract_pdf_text_pure_python(data: bytes) -> str:
                 # Match (text) Tj
                 tj_matches = re.findall(r"\((.*?)\)\s*Tj", stream_str)
                 for t in tj_matches:
-                    clean = re.sub(r"\\([\\()])", r"\1", t).strip()
+                    clean = clean_pdf_string(t)
                     if clean:
                         text_fragments.append(clean)
 
@@ -77,16 +106,24 @@ def extract_pdf_text_pure_python(data: bytes) -> str:
                 array_matches = re.findall(r"\[(.*?)\]\s*TJ", stream_str)
                 for arr in array_matches:
                     sub_texts = re.findall(r"\((.*?)\)", arr)
-                    combined = " ".join(re.sub(r"\\([\\()])", r"\1", st).strip() for st in sub_texts if st.strip())
+                    combined = " ".join(clean_pdf_string(st) for st in sub_texts if clean_pdf_string(st))
                     if combined:
                         text_fragments.append(combined)
             except Exception:
                 continue
 
     if not text_fragments:
-        # Fallback to ASCII text string extraction
-        ascii_matches = re.findall(rb"[\x20-\x7E\s]{4,}", data)
-        return "\n".join(m.decode("ascii", errors="ignore").strip() for m in ascii_matches if len(m.strip()) > 10)
+        # Fallback to readable text strings, strictly excluding raw PDF object definitions and PostScript operators
+        ascii_matches = re.findall(rb"[\x20-\x7E\s]{12,}", data)
+        filtered: list[str] = []
+        for m in ascii_matches:
+            decoded = m.decode("ascii", errors="ignore").strip()
+            # Exclude PDF object dictionaries, cross-references, and stream tags
+            if any(token in decoded for token in ["obj", "endobj", "stream", "endstream", "xref", "trailer", "/Type", "/Catalog", "/Pages", "/Font", "/MediaBox", "/ProcSet"]):
+                continue
+            if len(decoded) > 20:
+                filtered.append(decoded)
+        return "\n".join(filtered)
 
     return "\n".join(text_fragments)
 
