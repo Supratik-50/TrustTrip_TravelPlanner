@@ -80,7 +80,7 @@ def test_flight_payment_order_same_key_is_single_under_concurrency_and_rejects_c
     client, uid, trip, rev, rev2, token = _authorized_trip()
     key = f"flight-race-{uuid4().hex}"
     payload = {
-        "offer_id": "offer-race-flight", "expected_amount": 100, "currency": "USD",
+        "offer_id": "off_race_flight", "expected_amount": 100, "currency": "USD",
         "passengers": [{"given_name": "A", "family_name": "B", "born_on": "1990-01-01", "title": "ms", "gender": "f"}],
         "final_confirmation": True, "trip_id": trip, "revision_id": rev,
         "expected_revision_number": 1, "payment_idempotency_key": key,

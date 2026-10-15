@@ -43,6 +43,8 @@ async def create_order_from_snapshot(
             guests=req.guests,
             customer_ref=req.customer_ref,
             final_confirmation=req.final_confirmation,
+            prebook=req.prebook,
+            prebook_id=req.prebook_id,
         )
         return res
     except PermissionError as exc:
@@ -157,6 +159,7 @@ async def create_order(
         if not snapshot:
             raise HTTPException(status_code=404, detail=f"Hotel offer snapshot '{snap_id}' not found or access denied.")
 
+    amount_inr: float | None = None
     if snapshot:
         # Enforce server-authoritative snapshot price breakdown
         auth_offer = snapshot.normalized_offer
@@ -175,6 +178,10 @@ async def create_order(
         offer["price"] = float(auth_offer.price.total_amount)
         offer["currency"] = str(auth_offer.price.currency)
         offer["snapshot_id"] = str(snapshot.snapshot_id)
+        if getattr(auth_offer, "checkin", None):
+            offer["checkin"] = auth_offer.checkin
+        if getattr(auth_offer, "checkout", None):
+            offer["checkout"] = auth_offer.checkout
     else:
         amount_inr = offer.get("price_inr")
         if amount_inr is None:
@@ -184,6 +191,16 @@ async def create_order(
                 raise HTTPException(status_code=422, detail=f"Unable to determine INR payment amount: {exc}")
         if float(amount_inr) <= 0:
             raise HTTPException(status_code=422, detail="Hotel payment amount must be strictly positive.")
+
+    t_const = t_meta.get("constraints") or {} if isinstance(t_meta, dict) else {}
+    if not offer.get("checkin"):
+        c_in = t_const.get("checkin") or t_const.get("check_in") or t_const.get("start_date") or t_const.get("departure_date") or (t_meta.get("checkin") if isinstance(t_meta, dict) else None) or (trip_rec.get("start_date") if trip_rec else None)
+        if c_in:
+            offer["checkin"] = str(c_in)[:10]
+    if not offer.get("checkout"):
+        c_out = t_const.get("checkout") or t_const.get("check_out") or t_const.get("end_date") or t_const.get("return_date") or (t_meta.get("checkout") if isinstance(t_meta, dict) else None) or (trip_rec.get("end_date") if trip_rec else None)
+        if c_out:
+            offer["checkout"] = str(c_out)[:10]
 
     from services.authorization_store import AuthorizationStore
     try:
@@ -418,12 +435,15 @@ async def verify_and_book(
             }
         raise
 
+    effective_prebook = req.prebook if (req.prebook and req.prebook.get("prebook_id")) else (pending.get("prebook_json") or {})
+    effective_offer = pending.get("offer_json") or req.offer
+
     try:
-        booking = HotelService().book(req.offer, req.prebook, req.holder, req.guests, req.transaction_id)
+        booking = HotelService().book(effective_offer, effective_prebook, req.holder, req.guests, req.transaction_id)
         store.update(req.transaction_id, payment_status="captured", booking_status="booked", razorpay_payment_id=req.razorpay_payment_id, booking_json=booking, error=None)
     except Exception as exc:
         # HRP-04: Reconcile before failing or refunding
-        rec_status, rec_booking = HotelService().reconcile(req.offer, req.transaction_id)
+        rec_status, rec_booking = HotelService().reconcile(effective_offer, req.transaction_id)
         if rec_status == "CONFIRMED" and rec_booking:
             booking = rec_booking
             store.update(req.transaction_id, payment_status="captured", booking_status="booked",
