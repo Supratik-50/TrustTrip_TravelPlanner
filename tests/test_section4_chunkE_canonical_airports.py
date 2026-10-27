@@ -1,9 +1,11 @@
+from datetime import date, timedelta
 import pytest
 from services.chat_planner import (
     enforce_complete_canonical_invariants,
     CanonicalInvariantViolation,
     TravelPlan,
     BudgetPlan,
+    DayPlan,
 )
 
 
@@ -20,13 +22,27 @@ def _make_plan(**overrides):
         within_budget=True,
         pricing_note="Within budget",
     )
+    dep = date.today() + timedelta(days=14)
+    ret = dep + timedelta(days=4)
+    daily_plan = [
+        DayPlan(
+            day=i,
+            title=f"Day {i}",
+            morning=f"Morning activity {i}",
+            afternoon=f"Afternoon activity {i}",
+            evening=f"Evening activity {i}",
+            estimated_daily_cost_inr=1000.0,
+            date=(dep + timedelta(days=i - 1)).isoformat(),
+        )
+        for i in range(1, 6)
+    ]
     data = {
         "trip_summary": "Test trip summary",
         "route": "Test route",
         "duration_days": 5,
-        "travel_dates": "2026-10-14 to 2026-10-24",
+        "travel_dates": f"{dep.isoformat()} to {ret.isoformat()}",
         "travel_style": "Balanced",
-        "daily_plan": [],
+        "daily_plan": daily_plan,
         "budget": b,
         "flight_suggestion": "Test flight suggestion",
         "accommodation_plan": "Test hotel suggestion",

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   History,
   GitCommit,
@@ -54,6 +54,8 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   const [showRejectModal, setShowRejectModal] = useState(false);
   const [rejectionReason, setRejectionReason] = useState('');
+  const [showOverBudgetModal, setShowOverBudgetModal] = useState(false);
+  const [confirmedBudgetOverride, setConfirmedBudgetOverride] = useState(false);
 
   const [conflictError, setConflictError] = useState<{
     message: string;
@@ -69,6 +71,23 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
     currentRevision?.revision_id ||
     trip.active_revision_id ||
     (trip as any).current_revision_id;
+
+  // Hydrate full revision history if trip.revisions is not yet loaded
+  useEffect(() => {
+    let isMounted = true;
+    if (trip?.trip_id && (!trip.revisions || trip.revisions.length === 0)) {
+      api.getTripRevisions(trip.trip_id)
+        .then((revs) => {
+          if (isMounted && Array.isArray(revs) && revs.length > 0) {
+            onTripUpdated({ ...trip, revisions: revs });
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [trip?.trip_id]);
 
   // Canonical dates on the active trip
   const tripStartDate = (trip.start_date || '').slice(0, 10);
@@ -98,6 +117,14 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
       return 0;
     }
   }, [tripStartDate, tripEndDate]);
+
+  // Derive budget status for over-budget approval confirmation
+  const planBudget = (trip.plan as any)?.budget || trip.plan?.plan_json?.budget || (trip as any).metadata?.plan?.budget;
+  const canonicalTargetBudget = trip.budget || (trip as any).metadata?.budget || planBudget?.target_budget_inr || planBudget?.target_budget;
+  const planEstimatedTotal = planBudget?.estimated_total_inr || planBudget?.estimated_total;
+  const isExplicitlyOverBudget = planBudget?.within_budget === false;
+  const isNumericallyOverBudget = Boolean(canonicalTargetBudget && planEstimatedTotal && Number(planEstimatedTotal) > Number(canonicalTargetBudget));
+  const isOverBudget = isExplicitlyOverBudget || isNumericallyOverBudget;
 
   // A plan is missing or stale if no plan exists or its dates do not match the trip's active constraints
   const hasValidPlan = Boolean(
@@ -217,9 +244,16 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
     }
   };
 
-  const handleApprove = async () => {
+  const handleApprove = async (confirmOverride: boolean = false) => {
+    const isExplicitlyOverridden = confirmOverride === true;
+
     if (!activeRevisionId) {
       notify('No active revision found to approve.', 'error');
+      return;
+    }
+
+    if (isOverBudget && !isExplicitlyOverridden) {
+      setShowOverBudgetModal(true);
       return;
     }
 
@@ -230,10 +264,14 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
       await api.approveTrip(trip.trip_id, {
         revision_id: activeRevisionId,
         expected_revision_number: currentRevisionNumber,
+        confirm_budget_override: isExplicitlyOverridden,
       });
 
+      setShowOverBudgetModal(false);
+      setConfirmedBudgetOverride(false);
+
       notify(
-        `Revision #${currentRevisionNumber} approved successfully. This plan revision is accepted.`,
+        `Revision #${currentRevisionNumber} approved successfully.${confirmOverride ? ' (Budget override confirmed)' : ''}`,
         'success',
         'Revision Approved'
       );
@@ -247,6 +285,9 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
           serverRevision: currentRevisionNumber,
         });
         notify('Revision conflict detected (HTTP 409). Please refresh.', 'error', 'Approval Conflict');
+      } else if (err.message?.includes('exceeds target budget') || err.message?.includes('budget override')) {
+        setShowOverBudgetModal(true);
+        notify(err.message, 'warning', 'Budget Override Required');
       } else {
         notify(err.message || 'Unable to approve revision.', 'error');
       }
@@ -256,7 +297,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
   };
 
   const handleReject = async () => {
-    if (!currentRevision?.revision_id) {
+    if (!activeRevisionId) {
       notify('No active revision found to reject.', 'error');
       return;
     }
@@ -265,7 +306,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
     setConflictError(null);
 
     try {
-      await api.rejectTripRevision(trip.trip_id, currentRevision.revision_id, {
+      await api.rejectTripRevision(trip.trip_id, activeRevisionId, {
         expected_revision_number: currentRevisionNumber,
         reason: rejectionReason.trim() || undefined,
       });
@@ -280,7 +321,16 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
       setRejectionReason('');
 
       const freshTrip = await api.getTrip(trip.trip_id);
-      onTripUpdated(freshTrip);
+      let freshRevs: TripRevision[] = [];
+      try {
+        freshRevs = await api.getTripRevisions(trip.trip_id);
+      } catch {
+        // preserve fallback
+      }
+      onTripUpdated({
+        ...freshTrip,
+        revisions: freshRevs.length > 0 ? freshRevs : (freshTrip.revisions || []),
+      });
     } catch (err: any) {
       if (err.statusCode === 409 || err.status === 409 || err.message?.includes('conflict') || err.message?.includes('409')) {
         setConflictError({
@@ -363,7 +413,21 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
   };
 
   // Derived current review status
-  const currentStatus = currentRevision?.status || (trip.is_approved ? 'APPROVED' : 'PROPOSED');
+  const revStatusStr = String(currentRevision?.status || '');
+  const tripStatusStr = String(trip.status || '');
+  const isTripRejected =
+    revStatusStr.toUpperCase() === 'REJECTED' ||
+    Boolean(currentRevision?.is_rejected) ||
+    tripStatusStr.toLowerCase() === 'rejected';
+
+  const isTripApproved =
+    revStatusStr.toUpperCase() === 'APPROVED' ||
+    Boolean(currentRevision?.is_approved) ||
+    Boolean(trip.is_approved) ||
+    tripStatusStr.toLowerCase() === 'approved';
+
+  const currentStatus: 'APPROVED' | 'REJECTED' | 'PROPOSED' =
+    isTripApproved ? 'APPROVED' : isTripRejected ? 'REJECTED' : 'PROPOSED';
 
   return (
     <div className="space-y-8">
@@ -561,7 +625,7 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
                 <Button
                   variant="primary"
                   size="sm"
-                  onClick={handleApprove}
+                  onClick={() => handleApprove(false)}
                   disabled={isPlanMissingOrStale || isDeciding || isGeneratingPlan}
                   isLoading={isDeciding}
                   leftIcon={<ShieldCheck className="w-4 h-4" />}
@@ -629,7 +693,11 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setShowRejectModal(false)}
+              onClick={() => {
+                setShowRejectModal(false);
+                setRejectionReason('');
+              }}
+              disabled={isDeciding}
             >
               Cancel
             </Button>
@@ -637,10 +705,70 @@ export const TripRevisionManager: React.FC<TripRevisionManagerProps> = ({
               variant="primary"
               size="sm"
               onClick={handleReject}
+              disabled={isDeciding}
               isLoading={isDeciding}
               className="bg-[var(--status-danger)] hover:bg-[var(--status-danger)]/90 text-white"
             >
               Confirm Rejection
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Over-Budget Confirmation Modal */}
+      {showOverBudgetModal && (
+        <div className="p-6 rounded-3xl bg-[var(--surface)] border border-[var(--status-warning,#f59e0b)]/40 shadow-md space-y-4">
+          <div className="flex items-center gap-2 text-sm font-bold text-[var(--status-warning,#f59e0b)] font-mono uppercase tracking-wider">
+            <AlertTriangle className="w-4 h-4" /> Over-Budget Approval Confirmation
+          </div>
+          <p className="text-xs sm:text-sm text-[var(--text-secondary)]">
+            This itinerary exceeds your declared budget constraint. In accordance with safety invariants, explicit human confirmation is required to accept an over-budget plan.
+          </p>
+          <div className="p-3.5 rounded-xl bg-[var(--surface-muted)] border border-[var(--border)] text-xs font-mono space-y-1">
+            <div className="flex justify-between">
+              <span className="text-[var(--text-secondary)]">Target Budget:</span>
+              <span className="font-semibold">{formatCurrency(canonicalTargetBudget || 0, trip.currency || 'INR')}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-[var(--text-secondary)]">Estimated Cost:</span>
+              <span className="font-semibold text-[var(--status-warning,#f59e0b)]">{formatCurrency(planEstimatedTotal || 0, trip.currency || 'INR')}</span>
+            </div>
+            {canonicalTargetBudget && planEstimatedTotal && Number(planEstimatedTotal) > Number(canonicalTargetBudget) && (
+              <div className="flex justify-between border-t border-[var(--border)] pt-1 text-[var(--status-danger)]">
+                <span>Budget Overrun:</span>
+                <span className="font-bold">+{formatCurrency(Number(planEstimatedTotal) - Number(canonicalTargetBudget), trip.currency || 'INR')}</span>
+              </div>
+            )}
+          </div>
+          <label className="flex items-start gap-2.5 text-xs text-[var(--text-primary)] cursor-pointer select-none pt-1">
+            <input
+              type="checkbox"
+              checked={confirmedBudgetOverride}
+              onChange={(e) => setConfirmedBudgetOverride(e.target.checked)}
+              className="mt-0.5 rounded border-[var(--border)] text-[var(--primary)] focus:ring-[var(--primary)]"
+            />
+            <span>I understand and explicitly confirm accepting this itinerary exceeding my target budget.</span>
+          </label>
+          <div className="flex items-center justify-end gap-3 pt-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setShowOverBudgetModal(false);
+                setConfirmedBudgetOverride(false);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => handleApprove(true)}
+              disabled={!confirmedBudgetOverride || isDeciding}
+              isLoading={isDeciding}
+              className="bg-[var(--status-warning,#f59e0b)] hover:bg-[var(--status-warning,#f59e0b)]/90 text-black font-semibold"
+            >
+              Authorize & Accept Revision
             </Button>
           </div>
         </div>

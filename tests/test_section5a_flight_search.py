@@ -41,6 +41,9 @@ from services.trip_store import TripStore
 
 client = TestClient(app)
 
+DEFAULT_DEP_DATE = (date.today() + timedelta(days=14)).isoformat()
+DEFAULT_RET_DATE = (date.today() + timedelta(days=24)).isoformat()
+
 
 def _auth_user(email: str = "testuser@trusttrip.com") -> tuple[dict[str, str], dict[str, Any]]:
     """Helper to register/fetch a test user and generate an auth Bearer header."""
@@ -59,8 +62,8 @@ def _sample_raw_duffel_offer(
     currency: str = "INR",
     origin: str = "CCU",
     dest: str = "GOI",
-    dep_date: str = "2026-10-14",
-    ret_date: str | None = "2026-10-24",
+    dep_date: str = DEFAULT_DEP_DATE,
+    ret_date: str | None = DEFAULT_RET_DATE,
 ) -> dict[str, Any]:
     """Helper returning a mock Duffel normalized offer dictionary."""
     outbound_seg = {
@@ -141,8 +144,8 @@ def test_successful_normalized_flight_search_canonical_trip():
                 "origin_airport": "CCU",
                 "destination": "GOI",
                 "destination_airport": "GOI",
-                "departure_date": "2026-10-14",
-                "return_date": "2026-10-24",
+                "departure_date": DEFAULT_DEP_DATE,
+                "return_date": DEFAULT_RET_DATE,
                 "travelers_count": 2,
                 "currency": "INR",
             }
@@ -155,8 +158,8 @@ def test_successful_normalized_flight_search_canonical_trip():
         currency="INR",
         origin="CCU",
         dest="GOI",
-        dep_date="2026-10-14",
-        ret_date="2026-10-24",
+        dep_date=DEFAULT_DEP_DATE,
+        ret_date=DEFAULT_RET_DATE,
     )
 
     with patch.object(
@@ -181,10 +184,10 @@ def test_successful_normalized_flight_search_canonical_trip():
         called_ctx = mock_search.call_args[0][0]
         assert called_ctx["slices"][0]["origin"] == "CCU"
         assert called_ctx["slices"][0]["destination"] == "GOI"
-        assert called_ctx["slices"][0]["departure_date"] == "2026-10-14"
+        assert called_ctx["slices"][0]["departure_date"] == DEFAULT_DEP_DATE
         assert called_ctx["slices"][1]["origin"] == "GOI"
         assert called_ctx["slices"][1]["destination"] == "CCU"
-        assert called_ctx["slices"][1]["departure_date"] == "2026-10-24"
+        assert called_ctx["slices"][1]["departure_date"] == DEFAULT_RET_DATE
         assert len(called_ctx["passengers"]) == 2
 
         # Verify metadata in response
@@ -192,8 +195,8 @@ def test_successful_normalized_flight_search_canonical_trip():
         assert meta["trip_id"] == str(trip["id"])
         assert meta["origin"] == "CCU"
         assert meta["destination"] == "GOI"
-        assert meta["departure_date"] == "2026-10-14"
-        assert meta["return_date"] == "2026-10-24"
+        assert meta["departure_date"] == DEFAULT_DEP_DATE
+        assert meta["return_date"] == DEFAULT_RET_DATE
         assert meta["traveler_count"] == 2
         assert meta["currency"] == "INR"
         assert meta["count"] == 1
@@ -222,7 +225,7 @@ def test_unauthorized_trip_rejected():
         title="User A Trip",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     # User B attempts to search User A's trip -> Must be rejected with 403
@@ -260,7 +263,7 @@ def test_missing_airport_rejected():
         title="Trip to Nowhere",
         origin="AtlantisImaginaryLocation",
         destination="ElDoradoImaginaryCity",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     resp = client.post(
@@ -317,8 +320,8 @@ def test_invalid_dates_rejected():
         destination="GOI",
         metadata={
             "constraints": {
-                "departure_date": "2026-10-20",
-                "return_date": "2026-10-15",
+                "departure_date": (date.today() + timedelta(days=20)).isoformat(),
+                "return_date": (date.today() + timedelta(days=15)).isoformat(),
             }
         },
     )
@@ -342,7 +345,7 @@ def test_invalid_traveler_count_rejected():
         title="Zero Travelers",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14", "adults": 0}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE, "adults": 0}},
     )
     resp1 = client.post(
         "/api/flights/search",
@@ -358,7 +361,7 @@ def test_invalid_traveler_count_rejected():
         title="Ten Travelers",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14", "adults": 10}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE, "adults": 10}},
     )
     resp2 = client.post(
         "/api/flights/search",
@@ -379,7 +382,7 @@ def test_provider_unavailable_handled_cleanly():
         title="Trip Provider Down",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     with patch.object(FlightService, "search", side_effect=FlightProviderError("Duffel API connection error")):
@@ -402,7 +405,7 @@ def test_provider_timeout_handled_cleanly():
         title="Trip Timeout",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     with patch.object(FlightService, "search", side_effect=FlightProviderTimeout("Duffel timed out after 30s")):
@@ -425,7 +428,7 @@ def test_empty_provider_result_handled_cleanly():
         title="Trip Empty Results",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     with patch.object(FlightService, "search", return_value={"provider": "duffel", "count": 0, "offers": []}):
@@ -454,8 +457,8 @@ def test_normalized_response_stable_fields():
         destination="GOI",
         metadata={
             "constraints": {
-                "departure_date": "2026-10-14",
-                "return_date": "2026-10-24",
+                "departure_date": DEFAULT_DEP_DATE,
+                "return_date": DEFAULT_RET_DATE,
                 "travelers_count": 2,
             }
         },
@@ -467,8 +470,8 @@ def test_normalized_response_stable_fields():
         currency="INR",
         origin="CCU",
         dest="GOI",
-        dep_date="2026-10-14",
-        ret_date="2026-10-24",
+        dep_date=DEFAULT_DEP_DATE,
+        ret_date=DEFAULT_RET_DATE,
     )
 
     with patch.object(FlightService, "search", return_value={"provider": "duffel", "count": 1, "offers": [sample_offer]}):
@@ -485,10 +488,10 @@ def test_normalized_response_stable_fields():
         assert offer["provider"] == "duffel"
         assert offer["origin"] == "CCU"
         assert offer["destination"] == "GOI"
-        assert "2026-10-14" in offer["departure_time"]
-        assert "2026-10-14" in offer["arrival_time"]
-        assert "2026-10-24" in offer["return_departure_time"]
-        assert "2026-10-24" in offer["return_arrival_time"]
+        assert DEFAULT_DEP_DATE in offer["departure_time"]
+        assert DEFAULT_DEP_DATE in offer["arrival_time"]
+        assert DEFAULT_RET_DATE in offer["return_departure_time"]
+        assert DEFAULT_RET_DATE in offer["return_arrival_time"]
         assert offer["stops"] == 0
         assert offer["carrier"] == "IndiGo"
         assert offer["carrier_code"] == "6E"
@@ -519,7 +522,7 @@ def test_provider_internal_ids_shielded_and_no_raw_payload_exposed():
         title="Shielding Trip",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     sample_offer = _sample_raw_duffel_offer(offer_id=raw_provider_id)
@@ -555,7 +558,7 @@ def test_currency_preserved_correctly():
         title="USD International Trip",
         origin="CCU",
         destination="GOI",
-        metadata={"constraints": {"departure_date": "2026-10-14"}},
+        metadata={"constraints": {"departure_date": DEFAULT_DEP_DATE}},
     )
 
     # Provider returns 200.0 USD with 16600.0 INR reference
@@ -585,7 +588,7 @@ def test_frontend_cannot_override_canonical_trip_values():
     headers, user = _auth_user("tamper_test@trusttrip.com")
     trip_store = TripStore()
 
-    # Canonical trip: CCU -> GOI, 2026-10-14 -> 2026-10-24, 2 travelers
+    # Canonical trip: CCU -> GOI, 2 travelers
     trip = trip_store.create_trip(
         user_id=user["id"],
         title="Tamper Resistant Trip",
@@ -593,8 +596,8 @@ def test_frontend_cannot_override_canonical_trip_values():
         destination="GOI",
         metadata={
             "constraints": {
-                "departure_date": "2026-10-14",
-                "return_date": "2026-10-24",
+                "departure_date": DEFAULT_DEP_DATE,
+                "return_date": DEFAULT_RET_DATE,
                 "travelers_count": 2,
             }
         },
@@ -625,5 +628,5 @@ def test_frontend_cannot_override_canonical_trip_values():
         called_ctx = mock_search.call_args[0][0]
         assert called_ctx["slices"][0]["origin"] == "CCU"
         assert called_ctx["slices"][0]["destination"] == "GOI"
-        assert called_ctx["slices"][0]["departure_date"] == "2026-10-14"
+        assert called_ctx["slices"][0]["departure_date"] == DEFAULT_DEP_DATE
         assert len(called_ctx["passengers"]) == 2  # Not 8!

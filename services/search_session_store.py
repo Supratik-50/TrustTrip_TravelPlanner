@@ -126,6 +126,9 @@ REQUIRED_SCHEMA_TABLES_BY_MIGRATION: dict[str, tuple[str, ...]] = {
         "booking_attempts",
         "booking_transitions",
     ),
+    "migrations/016_jwt_revocation.sql": (
+        "revoked_tokens",
+    ),
 }
 
 
@@ -164,7 +167,7 @@ def validate_travel_intelligence_schema() -> None:
 
 
 def validate_database_schema(migrations: tuple[str, ...] | None = None) -> None:
-    """Validate that required database tables exist in PostgreSQL across migrations 004-007.
+    """Validate that required database tables exist in PostgreSQL across registered migrations.
 
     Fails closed with RuntimeError if any tables are missing (unmigrated database).
     Executes ZERO DDL statements. Schema creation/modification must be performed

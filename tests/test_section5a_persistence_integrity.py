@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import os
 import secrets
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -52,6 +53,7 @@ def _auth_user(email: str) -> tuple[dict[str, str], dict[str, Any]]:
 
 def _canonical_trip(user_id: str, origin: str = "CCU", dest: str = "GOI") -> dict[str, Any]:
     store = TripStore()
+    dep_date = (date.today() + timedelta(days=14)).isoformat()
     return store.create_trip(
         user_id=user_id,
         title=f"{origin} to {dest} persistence test",
@@ -63,7 +65,7 @@ def _canonical_trip(user_id: str, origin: str = "CCU", dest: str = "GOI") -> dic
                 "origin_airport": origin,
                 "destination": dest,
                 "destination_airport": dest,
-                "departure_date": "2026-10-14",
+                "departure_date": dep_date,
                 "adults": 2,
                 "currency": "INR",
             }
@@ -78,13 +80,14 @@ def _sample_provider_offer(
     origin: str = "CCU",
     dest: str = "GOI",
 ) -> dict[str, Any]:
+    dep_date = (date.today() + timedelta(days=14)).isoformat()
     seg = {
         "origin": origin,
         "origin_name": f"{origin} Airport",
         "destination": dest,
         "destination_name": f"{dest} Airport",
-        "departure": "2026-10-14T06:00:00",
-        "arrival": "2026-10-14T08:30:00",
+        "departure": f"{dep_date}T06:00:00",
+        "arrival": f"{dep_date}T08:30:00",
         "duration": "PT2H30M",
         "marketing_carrier": "IndiGo",
         "marketing_carrier_iata": "6E",
@@ -95,7 +98,7 @@ def _sample_provider_offer(
         "provider": "duffel",
         "price": price,
         "currency": currency,
-        "expires_at": "2026-10-10T12:00:00",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
         "owner": "IndiGo",
         "owner_iata": "6E",
         "stops": 0,
@@ -106,8 +109,8 @@ def _sample_provider_offer(
         "payment_requirements": {},
         "passengers": [{"type": "adult"}, {"type": "adult"}],
         "raw": {"slices": [{"segments": [{
-            "departing_at": "2026-10-14T06:00:00",
-            "arriving_at": "2026-10-14T08:30:00",
+            "departing_at": f"{dep_date}T06:00:00",
+            "arriving_at": f"{dep_date}T08:30:00",
             "origin": {"iata_code": origin},
             "destination": {"iata_code": dest},
             "marketing_carrier": {"name": "IndiGo", "iata_code": "6E"},
@@ -117,12 +120,16 @@ def _sample_provider_offer(
     }
 
 
-_GOOD_PROVIDER_RESULT = {
-    "provider": "duffel",
-    "count": 1,
-    "offers": [_sample_provider_offer()],
-    "bookable": True,
-}
+def _get_good_provider_result():
+    return {
+        "provider": "duffel",
+        "count": 1,
+        "offers": [_sample_provider_offer()],
+        "bookable": True,
+    }
+
+
+_GOOD_PROVIDER_RESULT = _get_good_provider_result()
 
 
 # ---------------------------------------------------------------------------

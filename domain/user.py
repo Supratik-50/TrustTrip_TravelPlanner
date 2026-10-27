@@ -43,6 +43,6 @@ class UserLoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+    access_token: str | None = None
+    token_type: str | None = "bearer"
     user: UserResponse

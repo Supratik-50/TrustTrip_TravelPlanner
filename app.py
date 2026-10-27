@@ -66,6 +66,10 @@ async def lifespan(app: FastAPI):
 
     init_auth_tables()
     init_trip_tables()
+    from services.transaction_store import TransactionStore
+    from services.hotel_transaction_store import HotelTransactionStore
+    TransactionStore()
+    HotelTransactionStore()
     from services.migration_runner import run_migrations
     run_migrations()
     validate_database_schema()

@@ -253,8 +253,8 @@ export const ResearchDiscoveryCard: React.FC<ResearchDiscoveryCardProps> = ({
             const isDoc =
               cit.source_type === 'document' ||
               cit.source_type === 'rag' ||
-              cit.domain === 'local.document' ||
-              (Boolean(cit.canonical_url) && cit.canonical_url.startsWith('document://'));
+              Boolean(cit.canonical_url?.startsWith('document://'));
+
             const displayTitle = cit.title || cit.domain || 'Verified Knowledge Source';
             return (
               <div

@@ -221,3 +221,26 @@ __marimo__/
 .vscode
 .idea
 scratch/
+
+# Local environment backups (explicitly preserve .env.example)
+.env.*
+!.env.example
+
+# Local PostgreSQL backups and custom format dumps
+backups/
+*.dump
+*.sql.gz
+
+# Local SQLite databases
+travel_planner.db
+travel_planner.db-journal
+
+# Temporary test scratch scripts and execution logs
+scratch_*.py
+scratch_*.json
+scratch_*.txt
+all_pytest_out.txt
+pytest_out.txt
+groq_debug.json
+matrix_results.json
+q3_results.json

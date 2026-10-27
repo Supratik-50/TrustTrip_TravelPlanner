@@ -4,21 +4,14 @@ const API_URL_KEY = 'trusttrip_custom_api_url';
 
 export const storage = {
   getToken: (): string | null => {
-    try {
-      if (typeof window === 'undefined') return null;
-      return localStorage.getItem(TOKEN_KEY);
-    } catch {
-      return null;
-    }
+    // Deprecated for TT-SEC-002: Authentication tokens are stored in HttpOnly cookies
+    // and must not be read from or stored in browser localStorage.
+    return null;
   },
 
-  setToken: (token: string): void => {
-    try {
-      if (typeof window === 'undefined') return;
-      localStorage.setItem(TOKEN_KEY, token);
-    } catch {
-      // ignore storage errors
-    }
+  setToken: (_token: string): void => {
+    // Deprecated for TT-SEC-002: Authentication tokens are stored in HttpOnly cookies.
+    // Writes to localStorage are disabled to prevent credential leakage.
   },
 
   clearToken: (): void => {

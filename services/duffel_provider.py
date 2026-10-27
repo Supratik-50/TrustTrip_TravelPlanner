@@ -91,7 +91,12 @@ class DuffelProvider(FlightProvider):
         )
         # Backward-compatible fallback for older local .env files. New
         # deployments should use the explicit test/live variables above.
-        self.token = token or configured_token or os.getenv("DUFFEL_ACCESS_TOKEN")
+        self.token = (
+            token
+            or configured_token
+            or os.getenv("DUFFEL_ACCESS_TOKEN")
+            or os.getenv("DUFFEL_API_TOKEN")
+        )
         self.timeout = timeout or int(os.getenv("DUFFEL_API_TIMEOUT_SECONDS", "30"))
         # Duffel documents that flight order creation can take up to 120s and
         # recommends an HTTP client timeout of at least 130s.  Keep ordinary

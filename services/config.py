@@ -15,7 +15,7 @@ PRODUCTION_SECURITY_VARS = ["JWT_SECRET", "PAYLOAD_ENCRYPTION_KEY"]
 
 # Optional external integration credential groups (service degrades gracefully)
 OPTIONAL_INTEGRATION_VARS: list[tuple[str, list[str]]] = [
-    ("Duffel Flight API", ["DUFFEL_TEST_API_TOKEN", "DUFFEL_LIVE_API_TOKEN", "DUFFEL_API_TOKEN"]),
+    ("Duffel Flight API", ["DUFFEL_TEST_API_TOKEN", "DUFFEL_LIVE_API_TOKEN", "DUFFEL_API_TOKEN", "DUFFEL_ACCESS_TOKEN"]),
     ("Razorpay Payments", ["RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET"]),
     ("LLM Intelligence", ["GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"]),
     ("Search / Weather", ["TAVILY_API_KEY", "OPENWEATHER_API_KEY"]),
@@ -36,6 +36,37 @@ def is_production() -> bool:
 def get_jwt_secret() -> str | None:
     """Return configured JWT secret or None if unset."""
     return os.getenv("JWT_SECRET") or os.getenv("AUTH_SECRET") or os.getenv("AUTH_SECRET_KEY")
+
+
+COOKIE_NAME = "trusttrip_access_token"
+DEFAULT_COOKIE_MAX_AGE = 86400  # 24 hours in seconds
+DEFAULT_COOKIE_PATH = "/api"
+DEFAULT_COOKIE_SAMESITE = "lax"
+
+
+def get_allowed_origins() -> list[str]:
+    """Return configured list of trusted origins for CORS and CSRF validation."""
+    raw_origins = os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost,http://127.0.0.1,http://localhost:3000,http://localhost:8000",
+    )
+    origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    frontend_env = os.getenv("FRONTEND_API_URL") or os.getenv("FRONTEND_URL")
+    if frontend_env and frontend_env.strip() and frontend_env.strip() not in origins:
+        origins.append(frontend_env.strip())
+    return origins
+
+
+def get_secure_cookie_setting() -> bool:
+    """Return True if cookies should be sent with Secure attribute.
+
+    In production (APP_ENV=production), always True.
+    In development/testing, configurable via SECURE_COOKIES env var (defaults to False).
+    """
+    if is_production():
+        return True
+    val = os.getenv("SECURE_COOKIES", "").lower()
+    return val in {"1", "true", "yes"}
 
 
 def validate_config() -> None:
@@ -75,11 +106,20 @@ def validate_config() -> None:
             raise RuntimeError(
                 "PAYLOAD_ENCRYPTION_KEY is required in production environment (APP_ENV=production)."
             )
+        if len(jwt_secret.encode("utf-8")) < 32:
+            raise RuntimeError(
+                "JWT_SECRET must be at least 32 bytes long in production environment (APP_ENV=production)."
+            )
     else:
         if not jwt_secret:
             logger.warning(
                 "JWT_SECRET is not set; an ephemeral secret will be used for this process. "
                 "Set JWT_SECRET to keep user sessions across restarts."
+            )
+        elif len(jwt_secret.encode("utf-8")) < 32:
+            logger.warning(
+                "JWT_SECRET is shorter than 32 bytes (256 bits). "
+                "A secret of at least 32 bytes is strongly recommended for HS256."
             )
         if not payload_key and not is_in_memory_auth():
             logger.warning(
@@ -95,3 +135,13 @@ def validate_config() -> None:
                 group_name,
                 ", ".join(env_names),
             )
+
+    # 4. CORS and credentialed origins validation
+    allowed_origins = get_allowed_origins()
+    if is_production():
+        if "*" in allowed_origins:
+            raise RuntimeError(
+                "Wildcard '*' in ALLOWED_ORIGINS is prohibited in production when credentialed "
+                "authentication is enabled."
+            )
+

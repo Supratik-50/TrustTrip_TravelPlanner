@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any
 import jwt
@@ -18,16 +19,32 @@ JWT_ALGORITHM = "HS256"
 DEFAULT_TOKEN_EXPIRE_HOURS = 24
 
 
+MIN_JWT_SECRET_BYTES = 32
+
+
 def get_auth_secret() -> str:
-    """Load the server-side authentication secret from environment."""
+    """Load the server-side authentication secret from environment.
+
+    Enforces a dedicated JWT secret with at least 32 bytes (256 bits) for HS256.
+    Never falls back to payment gateway credentials (e.g. RAZORPAY_KEY_SECRET).
+    In production (APP_ENV=production), fails fast if missing or weak.
+    In development/testing, generates a 32-byte process-stable secret if unset.
+    """
     secret = os.getenv("JWT_SECRET") or os.getenv("AUTH_SECRET") or os.getenv("AUTH_SECRET_KEY")
     if not secret:
-        # Fallback to RAZORPAY_KEY_SECRET or a generated stable secret if not set
-        secret = os.getenv("RAZORPAY_KEY_SECRET")
-        if not secret:
-            # Generate a process-stable secret for local development/testing
-            secret = os.environ.setdefault("_DEV_AUTH_SECRET", secrets.token_hex(32))
+        if os.getenv("APP_ENV", "development").lower() == "production":
+            raise RuntimeError(
+                "JWT_SECRET is required in production environment (APP_ENV=production)."
+            )
+        # Generate a process-stable secret for local development/testing (32 bytes = 64 hex chars)
+        secret = os.environ.setdefault("_DEV_AUTH_SECRET", secrets.token_hex(32))
+
+    if len(secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES:
+        raise ValueError(
+            f"JWT secret must be at least {MIN_JWT_SECRET_BYTES} bytes long for {JWT_ALGORITHM}."
+        )
     return secret
+
 
 
 def hash_password(password: str) -> str:
@@ -82,14 +99,17 @@ def create_access_token(
     user_id: str,
     email: str,
     expires_delta: timedelta | None = None,
+    jti: str | None = None,
 ) -> str:
     """Create a signed JWT access token for the authenticated user."""
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(hours=DEFAULT_TOKEN_EXPIRE_HOURS)
     )
+    token_jti = jti or str(uuid.uuid4())
     payload: dict[str, Any] = {
         "sub": str(user_id),
         "email": email.strip().lower(),
+        "jti": token_jti,
         "exp": int(expire.timestamp()),
         "iat": int(datetime.now(timezone.utc).timestamp()),
     }

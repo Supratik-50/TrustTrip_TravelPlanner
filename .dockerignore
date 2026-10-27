@@ -1,7 +1,60 @@
-# Environments
+# Environments and virtual environments
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Environment files and credentials
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Version control
+.git
+**/.git
+.gitignore
+
+# Local databases and persistence
+*.db
+*.sqlite
+*.sqlite3
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# Local server and application logs
+*.log
+**/*.log
+
+# Scratch, test caches, and temporary audit artifacts
+scratch/
+scratch_*
+groq_debug.json
+matrix_results.json
+q3_results.json
+pytest_out.txt
+all_pytest_out.txt
+.pytest_cache
+**/.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Agent and IDE artifacts
+.agents/
+.vscode/
+
+# Frontend dependencies and source (built separately in frontend/Dockerfile)
+node_modules/
+**/node_modules/
+frontend/

@@ -1177,19 +1177,21 @@ def test_orchestrator_fallback_provenance():
         )
 
         mock_web = MagicMock()
+        snippet_a = "Fushimi Inari Taisha is famed for its thousands of vermilion torii gates straddling Mount Inari trails, attracting travelers worldwide for scenic cultural walks."
+        snippet_b = "Kinkaku-ji, the famous Golden Pavilion in northern Kyoto, is a Zen Buddhist temple whose top two floors are completely covered in pure gold leaf overlooking a mirror pond."
         src_a = ResearchSource(
             source_id=uuid4(),
             url="https://kyoto.travel/a",
             canonical_url="https://kyoto.travel/a",
             title="Kyoto A",
-            metadata={"snippet": "Snippet A"},
+            metadata={"snippet": snippet_a},
         )
         src_b = ResearchSource(
             source_id=uuid4(),
             url="https://kyoto.travel/b",
             canonical_url="https://kyoto.travel/b",
             title="Kyoto B",
-            metadata={"snippet": "Snippet B"},
+            metadata={"snippet": snippet_b},
         )
         mock_web.search = AsyncMock(return_value=[src_a, src_b])
 

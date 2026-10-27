@@ -127,6 +127,9 @@ def init_trip_tables() -> None:
     if "sslmode=" not in dsn:
         dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
 
+    from services.auth_store import init_auth_tables
+    init_auth_tables()
+
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS trips (

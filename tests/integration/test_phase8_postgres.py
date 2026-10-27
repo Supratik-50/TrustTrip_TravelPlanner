@@ -30,10 +30,12 @@ def pg_schema():
     if not DB_URL:
         pytest.skip("DATABASE_URL not set; skipping live PostgreSQL integration tests")
 
+    orig_in_memory = os.environ.pop("USE_IN_MEMORY_AUTH", None)
     schema_name = f"p8_integ_{uuid4().hex[:8]}"
-    conn = psycopg.connect(DB_URL, autocommit=True)
+    conn = None
 
     try:
+        conn = psycopg.connect(DB_URL, autocommit=True)
         with conn.cursor() as cur:
             cur.execute(f"CREATE SCHEMA {schema_name};")
             cur.execute(f"SET search_path TO {schema_name}, public;")
@@ -99,12 +101,15 @@ def pg_schema():
         yield schema_name
 
     finally:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE;")
-        except Exception:
-            pass
-        conn.close()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE;")
+            except Exception:
+                pass
+            conn.close()
+        if orig_in_memory is not None:
+            os.environ["USE_IN_MEMORY_AUTH"] = orig_in_memory
 
 
 def test_postgres_migration_006_schema_objects(pg_schema):

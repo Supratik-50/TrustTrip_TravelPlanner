@@ -121,9 +121,25 @@ def _auth_user(email: str = "phase7@trusttrip.com"):
     return client, user["id"]
 
 
+# Fixed reference dates in the future for deterministic candidate-window tests
+REF_BASE_DATE = date.today() + timedelta(days=30)
+DEP_DATE_STR = REF_BASE_DATE.isoformat()
+DEP_DATE_OBJ = REF_BASE_DATE
+
+D_MINUS_3 = (REF_BASE_DATE - timedelta(days=3)).isoformat()
+D_MINUS_2 = (REF_BASE_DATE - timedelta(days=2)).isoformat()
+D_MINUS_1 = (REF_BASE_DATE - timedelta(days=1)).isoformat()
+D_PLUS_1 = (REF_BASE_DATE + timedelta(days=1)).isoformat()
+D_PLUS_2 = (REF_BASE_DATE + timedelta(days=2)).isoformat()
+D_PLUS_3 = (REF_BASE_DATE + timedelta(days=3)).isoformat()
+D_PLUS_4 = (REF_BASE_DATE + timedelta(days=4)).isoformat()
+D_RET_7 = (REF_BASE_DATE + timedelta(days=7)).isoformat()
+D_RET_10 = (REF_BASE_DATE + timedelta(days=10)).isoformat()
+
+
 def _make_dummy_flight_offer(
-    dep_date: str = "2026-10-15",
-    ret_date: str | None = "2026-10-22",
+    dep_date: str = DEP_DATE_STR,
+    ret_date: str | None = D_RET_7,
     price: float = 450.0,
     flight_num: str = "101",
     airline: str = "BA",
@@ -193,48 +209,50 @@ def _make_dummy_flight_offer(
 
 def test_candidate_dates_exact_mode():
     """Exact mode produces exactly 1 candidate date pair."""
-    c = {"departure_date": "2026-10-15", "duration_days": 5, "flexibility_mode": "exact"}
+    c = {"departure_date": DEP_DATE_STR, "duration_days": 5, "flexibility_mode": "exact"}
     res = candidate_dates(c, limit=7)
     assert len(res) == 1
-    assert res[0] == ("2026-10-15", "2026-10-19")
+    assert res[0] == (DEP_DATE_STR, D_PLUS_4)
 
 
 def test_candidate_dates_plus_minus_1():
     """+/- 1 day mode produces 3 candidate date pairs."""
-    c = {"departure_date": "2026-10-15", "duration_days": 5, "flexibility_mode": "plus_minus_days", "flexibility_days": 1}
+    c = {"departure_date": DEP_DATE_STR, "duration_days": 5, "flexibility_mode": "plus_minus_days", "flexibility_days": 1}
     res = candidate_dates(c, limit=7)
     assert len(res) == 3
-    assert [d[0] for d in res] == ["2026-10-14", "2026-10-15", "2026-10-16"]
+    assert [d[0] for d in res] == [D_MINUS_1, DEP_DATE_STR, D_PLUS_1]
 
 
 def test_candidate_dates_plus_minus_2():
     """+/- 2 days mode produces 5 candidate date pairs."""
-    c = {"departure_date": "2026-10-15", "duration_days": 5, "flexibility_mode": "plus_minus_days", "flexibility_days": 2}
+    c = {"departure_date": DEP_DATE_STR, "duration_days": 5, "flexibility_mode": "plus_minus_days", "flexibility_days": 2}
     res = candidate_dates(c, limit=7)
     assert len(res) == 5
-    assert [d[0] for d in res] == ["2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16", "2026-10-17"]
+    assert [d[0] for d in res] == [D_MINUS_2, D_MINUS_1, DEP_DATE_STR, D_PLUS_1, D_PLUS_2]
 
 
 def test_candidate_dates_plus_minus_3():
     """+/- 3 days mode produces 7 candidate date pairs."""
-    c = {"departure_date": "2026-10-15", "duration_days": 5, "flexibility_mode": "plus_minus_days", "flexibility_days": 3}
+    c = {"departure_date": DEP_DATE_STR, "duration_days": 5, "flexibility_mode": "plus_minus_days", "flexibility_days": 3}
     res = candidate_dates(c, limit=7)
     assert len(res) == 7
-    assert res[0][0] == "2026-10-12"
-    assert res[-1][0] == "2026-10-18"
+    assert res[0][0] == D_MINUS_3
+    assert res[-1][0] == D_PLUS_3
 
 
 def test_candidate_dates_date_range_generation():
     """Date-range mode generates candidate pairs across the specified interval."""
+    d_start = REF_BASE_DATE - timedelta(days=5)
+    d_end = REF_BASE_DATE - timedelta(days=1)
     c = {
-        "earliest_departure": "2026-10-10",
-        "latest_departure": "2026-10-14",
+        "earliest_departure": d_start.isoformat(),
+        "latest_departure": d_end.isoformat(),
         "flexibility_mode": "date_range",
         "duration_days": 5,
     }
     res = candidate_dates(c, limit=7)
     assert len(res) == 5
-    assert [d[0] for d in res] == ["2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13", "2026-10-14"]
+    assert [d[0] for d in res] == [(d_start + timedelta(days=i)).isoformat() for i in range(5)]
 
 
 def test_candidate_dates_near_term_fallback():
@@ -264,15 +282,15 @@ def test_candidate_dates_past_date_pruning():
 def test_candidate_dates_return_date_synchronization():
     """Return dates shift synchronously when an explicit return date is given."""
     c = {
-        "departure_date": "2026-10-15",
-        "return_date": "2026-10-25",
+        "departure_date": DEP_DATE_STR,
+        "return_date": D_RET_10,
         "flexibility_mode": "plus_minus_days",
         "flexibility_days": 1,
     }
     res = candidate_dates(c, limit=7)
-    assert res[0] == ("2026-10-14", "2026-10-24")
-    assert res[1] == ("2026-10-15", "2026-10-25")
-    assert res[2] == ("2026-10-16", "2026-10-26")
+    assert res[0] == (D_MINUS_1, (REF_BASE_DATE + timedelta(days=9)).isoformat())
+    assert res[1] == (DEP_DATE_STR, D_RET_10)
+    assert res[2] == (D_PLUS_1, (REF_BASE_DATE + timedelta(days=11)).isoformat())
 
 
 def test_invalid_flexibility_options():
@@ -286,16 +304,18 @@ def test_invalid_flexibility_options():
     with pytest.raises(ValueError):
         FlexibleDateOptions(
             mode=DateFlexibilityMode.DATE_RANGE,
-            earliest_departure=date(2026, 10, 20),
-            latest_departure=date(2026, 10, 10),
+            earliest_departure=REF_BASE_DATE + timedelta(days=20),
+            latest_departure=REF_BASE_DATE + timedelta(days=10),
         )
 
 
 def test_max_candidate_date_protection():
     """Candidate generator strictly caps at maximum 7 dates even if limit is larger."""
+    d_start = REF_BASE_DATE - timedelta(days=14)
+    d_end = REF_BASE_DATE + timedelta(days=5)
     c = {
-        "earliest_departure": "2026-10-01",
-        "latest_departure": "2026-10-20",
+        "earliest_departure": d_start.isoformat(),
+        "latest_departure": d_end.isoformat(),
         "flexibility_mode": "date_range",
         "duration_days": 5,
     }
@@ -305,7 +325,7 @@ def test_max_candidate_date_protection():
 
 def test_duplicate_candidate_prevention():
     """Duplicate candidate pairs are eliminated deterministically."""
-    c = {"departure_date": "2026-10-15", "duration_days": 5}
+    c = {"departure_date": DEP_DATE_STR, "duration_days": 5}
     res = candidate_dates(c, limit=7)
     assert len(res) == 1
     assert len(set(res)) == len(res)
@@ -343,7 +363,7 @@ def test_bounded_concurrency_max_3():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=3),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit)
@@ -374,7 +394,7 @@ def test_global_timeout_enforcement():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=1),
         )
         # Global timeout of 0.3s will be exceeded
@@ -407,7 +427,7 @@ def test_cancellation_cleanup():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=1),
         )
         search_task = asyncio.create_task(orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit, global_timeout=10.0))
@@ -443,7 +463,7 @@ def test_429_rate_limit_retry():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit, global_timeout=10.0)
@@ -476,7 +496,7 @@ def test_5xx_timeout_retry():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit, global_timeout=10.0)
@@ -494,7 +514,7 @@ def test_partial_candidate_failure():
 
         def _sync_search(self, criteria):
             dep = criteria.slices[0].departure_date.isoformat()
-            if dep == "2026-10-15":
+            if dep == DEP_DATE_STR:
                 raise FlightProviderError("Route not operated on Thursdays")
             return [_make_dummy_flight_offer(dep_date=dep, price=500.0)]
 
@@ -505,20 +525,20 @@ def test_partial_candidate_failure():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=1),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit)
         assert resp.success is True
         # 3 candidate dates searched: 2 succeeded, 1 failed
         assert len(resp.candidate_dates) == 3
-        date_15 = next(cd for cd in resp.candidate_dates if cd.departure_date.isoformat() == "2026-10-15")
-        assert date_15.status == "provider_error"
-        assert "Flight provider encountered an error" in (date_15.error_message or "")
+        date_dep = next(cd for cd in resp.candidate_dates if cd.departure_date.isoformat() == DEP_DATE_STR)
+        assert date_dep.status == "provider_error"
+        assert "Flight provider encountered an error" in (date_dep.error_message or "")
         # Check that successful dates have offers
-        date_14 = next(cd for cd in resp.candidate_dates if cd.departure_date.isoformat() == "2026-10-14")
-        assert date_14.status == "ok"
-        assert date_14.offer_count == 1
+        date_minus = next(cd for cd in resp.candidate_dates if cd.departure_date.isoformat() == D_MINUS_1)
+        assert date_minus.status == "ok"
+        assert date_minus.offer_count == 1
 
     asyncio.run(_run())
 
@@ -539,7 +559,7 @@ def test_all_candidate_failure():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=1),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit)
@@ -568,12 +588,12 @@ def test_offer_deduplication():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit)
         assert resp.success is True
-        offers = resp.offers_by_date.get("2026-10-15", [])
+        offers = resp.offers_by_date.get(DEP_DATE_STR, [])
         assert len(offers) == 1
         assert offers[0].price.total_amount == Decimal("450.0")
 
@@ -599,11 +619,11 @@ def test_ranking_determinism():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit)
-        offers = resp.offers_by_date["2026-10-15"]
+        offers = resp.offers_by_date[DEP_DATE_STR]
         assert offers[0].recommendation_rank == 1
         assert offers[0].price.total_amount == Decimal("350.0")
         assert offers[0].is_recommended is True
@@ -632,7 +652,7 @@ def test_provider_id_shielding():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         resp = await orch.search_flexible_flights(user_id=uuid4(), trip_id=trip_id, criteria=crit)
@@ -685,7 +705,7 @@ def test_concurrent_identical_search_cache_race():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
 
@@ -722,7 +742,7 @@ def test_immutable_offer_snapshot_and_evidence():
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         resp = await orch.search_flexible_flights(user_id=user_id, trip_id=trip_id, criteria=crit)
@@ -733,9 +753,9 @@ def test_immutable_offer_snapshot_and_evidence():
             {
                 "origin": "LHR",
                 "destination": "JFK",
-                "departure_date": "2026-10-15",
+                "departure_date": DEP_DATE_STR,
                 "return_date": "",
-                "candidate_dates": ["2026-10-15"],
+                "candidate_dates": [DEP_DATE_STR],
             },
         )
 
@@ -914,8 +934,8 @@ def test_flexible_flight_search_api_validation_error():
             "trip_id": str(uuid4()),
             "origin_iata": "LHR",
             "destination_iata": "JFK",
-            "departure_date": "2026-10-15",
-            "return_date": "2026-10-10",  # Invalid: return < departure
+            "departure_date": DEP_DATE_STR,
+            "return_date": D_MINUS_1,  # Invalid: return < departure
         },
     )
     assert resp.status_code == 422
@@ -944,7 +964,7 @@ def test_flexible_flight_search_api_endpoint_success():
             "trip_id": str(trip["id"]),
             "origin_iata": "LHR",
             "destination_iata": "JFK",
-            "departure_date": "2026-10-15",
+            "departure_date": DEP_DATE_STR,
             "flexibility": {
                 "mode": "plus_minus_days",
                 "flexibility_days": 1,
@@ -970,7 +990,7 @@ def test_cache_reuse_rejects_expired_snapshot():
     orch = TravelIntelligenceOrchestrator(session_store=session_store)
 
     session = session_store.create_session(user_id=user_id, trip_id=trip_id, thread_id=None, search_type="flights", criteria_hash="hash_b1_exp", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     offer_expired = offer.model_copy(update={"expires_at": datetime.now(timezone.utc) - timedelta(minutes=5)})
     snap = session_store.save_snapshot(session.session_id, offer_expired, raw)
 
@@ -978,7 +998,7 @@ def test_cache_reuse_rejects_expired_snapshot():
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
     )
     validated = orch._validate_reusable_cached_snapshots(
@@ -988,7 +1008,7 @@ def test_cache_reuse_rejects_expired_snapshot():
         trip_id=trip_id,
         trip_revision=1,
         criteria=crit,
-        candidate_window_list=[("2026-10-15", None)],
+        candidate_window_list=[(DEP_DATE_STR, None)],
     )
     assert validated is None
 
@@ -1001,7 +1021,7 @@ def test_cache_reuse_rejects_stale_snapshot():
     orch = TravelIntelligenceOrchestrator(session_store=session_store)
 
     session = session_store.create_session(user_id=user_id, trip_id=trip_id, thread_id=None, search_type="flights", criteria_hash="hash_b1_stale", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap = session_store.save_snapshot(session.session_id, offer, raw)
     snap_stale = snap.model_copy(update={"freshness": FreshnessStatus.STALE})
 
@@ -1009,7 +1029,7 @@ def test_cache_reuse_rejects_stale_snapshot():
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
     )
     validated = orch._validate_reusable_cached_snapshots(
@@ -1019,7 +1039,7 @@ def test_cache_reuse_rejects_stale_snapshot():
         trip_id=trip_id,
         trip_revision=1,
         criteria=crit,
-        candidate_window_list=[("2026-10-15", None)],
+        candidate_window_list=[(DEP_DATE_STR, None)],
     )
     assert validated is None
 
@@ -1032,7 +1052,7 @@ def test_cache_reuse_rejects_unavailable_snapshot():
     orch = TravelIntelligenceOrchestrator(session_store=session_store)
 
     session = session_store.create_session(user_id=user_id, trip_id=trip_id, thread_id=None, search_type="flights", criteria_hash="hash_b1_unavail", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap = session_store.save_snapshot(session.session_id, offer, raw)
     snap_unavail = snap.model_copy(update={"availability": AvailabilityStatus.UNAVAILABLE})
 
@@ -1040,7 +1060,7 @@ def test_cache_reuse_rejects_unavailable_snapshot():
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
     )
     validated = orch._validate_reusable_cached_snapshots(
@@ -1050,7 +1070,7 @@ def test_cache_reuse_rejects_unavailable_snapshot():
         trip_id=trip_id,
         trip_revision=1,
         criteria=crit,
-        candidate_window_list=[("2026-10-15", None)],
+        candidate_window_list=[(DEP_DATE_STR, None)],
     )
     assert validated is None
 
@@ -1064,14 +1084,14 @@ def test_cache_reuse_rejects_expired_session():
 
     session = session_store.create_session(user_id=user_id, trip_id=trip_id, thread_id=None, search_type="flights", criteria_hash="hash_b1_sess_exp", trip_revision=1)
     session_expired = session.model_copy(update={"created_at": datetime.now(timezone.utc) - timedelta(minutes=20)})
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap = session_store.save_snapshot(session.session_id, offer, raw)
 
     crit = FlexibleFlightSearchCriteria(
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
     )
     validated = orch._validate_reusable_cached_snapshots(
@@ -1081,7 +1101,7 @@ def test_cache_reuse_rejects_expired_session():
         trip_id=trip_id,
         trip_revision=1,
         criteria=crit,
-        candidate_window_list=[("2026-10-15", None)],
+        candidate_window_list=[(DEP_DATE_STR, None)],
     )
     assert validated is None
 
@@ -1095,14 +1115,14 @@ def test_cache_reuse_rejects_invalidated_evidence():
     orch = TravelIntelligenceOrchestrator(session_store=session_store)
 
     session = session_store.create_session(user_id=user_id, trip_id=trip_id, thread_id=None, search_type="flights", criteria_hash="hash_b1_inv", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap = session_store.save_snapshot(session.session_id, offer, raw)
 
     crit = FlexibleFlightSearchCriteria(
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
     )
     app_key = build_applicability_key(
@@ -1123,7 +1143,7 @@ def test_cache_reuse_rejects_invalidated_evidence():
             "duration_days": crit.duration_days,
             "earliest_departure": "",
             "latest_departure": "",
-            "candidate_dates": ["2026-10-15"],
+            "candidate_dates": [DEP_DATE_STR],
         },
     )
     rec = EvidenceRecord(
@@ -1153,7 +1173,7 @@ def test_cache_reuse_rejects_invalidated_evidence():
         trip_id=trip_id,
         trip_revision=1,
         criteria=crit,
-        candidate_window_list=[("2026-10-15", None)],
+        candidate_window_list=[(DEP_DATE_STR, None)],
     )
     assert validated is None
 
@@ -1167,14 +1187,14 @@ def test_cache_reuse_accepts_usable_snapshot():
     orch = TravelIntelligenceOrchestrator(session_store=session_store)
 
     session = session_store.create_session(user_id=user_id, trip_id=trip_id, thread_id=None, search_type="flights", criteria_hash="hash_b1_usable", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap = session_store.save_snapshot(session.session_id, offer, raw)
 
     crit = FlexibleFlightSearchCriteria(
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
     )
     app_key = build_applicability_key(
@@ -1195,7 +1215,7 @@ def test_cache_reuse_accepts_usable_snapshot():
             "duration_days": crit.duration_days,
             "earliest_departure": "",
             "latest_departure": "",
-            "candidate_dates": ["2026-10-15"],
+            "candidate_dates": [DEP_DATE_STR],
         },
     )
     rec = EvidenceRecord(
@@ -1224,7 +1244,7 @@ def test_cache_reuse_accepts_usable_snapshot():
         trip_id=trip_id,
         trip_revision=1,
         criteria=crit,
-        candidate_window_list=[("2026-10-15", None)],
+        candidate_window_list=[(DEP_DATE_STR, None)],
     )
     assert validated is not None
     assert len(validated) == 1
@@ -1245,7 +1265,7 @@ def test_select_offer_cross_trip_rejection():
     trip_b = trip_store.create_trip(user_id=user_id, title="Trip B", destination="Rome")
 
     session_a = session_store.create_session(user_id=user_id, trip_id=trip_a["id"], thread_id=None, search_type="flights", criteria_hash="hash_a", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap_a = session_store.save_snapshot(session_a.session_id, offer, raw)
 
     resp = client.post(
@@ -1266,7 +1286,7 @@ def test_select_offer_outdated_revision_rejection():
     trip_store.update_trip(trip["id"], user_id, metadata={"trip_revision": 2})
 
     session_old = session_store.create_session(user_id=user_id, trip_id=trip["id"], thread_id=None, search_type="flights", criteria_hash="hash_old", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     snap = session_store.save_snapshot(session_old.session_id, offer, raw)
 
     resp = client.post(
@@ -1285,7 +1305,7 @@ def test_select_offer_stale_or_expired_rejection():
 
     trip = trip_store.create_trip(user_id=user_id, title="Trip Exp", destination="Paris", metadata={"trip_revision": 1})
     session = session_store.create_session(user_id=user_id, trip_id=trip["id"], thread_id=None, search_type="flights", criteria_hash="hash_exp", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     offer_exp = offer.model_copy(update={"expires_at": datetime.now(timezone.utc) - timedelta(minutes=10)})
     snap = session_store.save_snapshot(session.session_id, offer_exp, raw)
 
@@ -1319,7 +1339,7 @@ def test_bounded_provider_timeout_and_no_orphan_tasks():
             trip_id=uuid4(),
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEP_DATE_OBJ,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=1),
         )
         t0 = asyncio.get_running_loop().time()
@@ -1524,7 +1544,7 @@ def test_api_exception_redaction_and_safety():
                 "trip_id": str(trip["id"]),
                 "origin_iata": "LHR",
                 "destination_iata": "JFK",
-                "departure_date": "2026-10-15",
+                "departure_date": DEP_DATE_STR,
                 "flexibility": {"mode": "exact"},
             },
         )
@@ -1549,7 +1569,7 @@ def test_api_exception_redaction_and_safety():
                 "trip_id": str(trip["id"]),
                 "origin_iata": "LHR",
                 "destination_iata": "JFK",
-                "departure_date": "2026-10-15",
+                "departure_date": DEP_DATE_STR,
                 "flexibility": {"mode": "exact"},
             },
         )
@@ -1579,25 +1599,25 @@ def test_cache_reuse_rejects_partial_candidate_coverage():
         criteria_hash="hash_partial_cov",
         trip_revision=1,
     )
-    # Cache only has offers for 2026-10-14 and 2026-10-16 (missing 2026-10-15)
-    offer_14, raw_14 = _make_dummy_flight_offer(dep_date="2026-10-14")
-    offer_16, raw_16 = _make_dummy_flight_offer(dep_date="2026-10-16")
-    snap_14 = session_store.save_snapshot(session.session_id, offer_14, raw_14)
-    snap_16 = session_store.save_snapshot(session.session_id, offer_16, raw_16)
+    # Cache only has offers for D_MINUS_1 and D_PLUS_1 (missing DEP_DATE_STR)
+    offer_minus, raw_minus = _make_dummy_flight_offer(dep_date=D_MINUS_1)
+    offer_plus, raw_plus = _make_dummy_flight_offer(dep_date=D_PLUS_1)
+    snap_minus = session_store.save_snapshot(session.session_id, offer_minus, raw_minus)
+    snap_plus = session_store.save_snapshot(session.session_id, offer_plus, raw_plus)
 
     crit = FlexibleFlightSearchCriteria(
         trip_id=trip_id,
         origin_iata="LHR",
         destination_iata="JFK",
-        departure_date=date(2026, 10, 15),
+        departure_date=DEP_DATE_OBJ,
         flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.PLUS_MINUS_DAYS, flexibility_days=1),
     )
-    # Requested dates: 14, 15, 16
-    candidate_window_list = [("2026-10-14", None), ("2026-10-15", None), ("2026-10-16", None)]
+    # Requested dates: D_MINUS_1, DEP_DATE_STR, D_PLUS_1
+    candidate_window_list = [(D_MINUS_1, None), (DEP_DATE_STR, None), (D_PLUS_1, None)]
 
     validated = orch._validate_reusable_cached_snapshots(
         session=session,
-        snapshots=[snap_14, snap_16],
+        snapshots=[snap_minus, snap_plus],
         user_id=user_id,
         trip_id=trip_id,
         trip_revision=1,
@@ -1615,7 +1635,7 @@ def test_select_offer_strict_expiration_boundary():
 
     trip = trip_store.create_trip(user_id=user_id, title="Trip Expiry Boundary", destination="Paris", metadata={"trip_revision": 1})
     session = session_store.create_session(user_id=user_id, trip_id=trip["id"], thread_id=None, search_type="flights", criteria_hash="hash_exp_boundary", trip_revision=1)
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
 
     now = datetime.now(timezone.utc)
 
@@ -1658,7 +1678,7 @@ def test_select_offer_strict_revision_matching():
     trip_store = TripStore()
     session_store = SearchSessionStore()
 
-    offer, raw = _make_dummy_flight_offer(dep_date="2026-10-15")
+    offer, raw = _make_dummy_flight_offer(dep_date=DEP_DATE_STR)
     offer_valid = offer.model_copy(update={"expires_at": datetime.now(timezone.utc) + timedelta(hours=1)})
 
     # Scenario A: Trip at rev 0, Session at rev 1 -> 400
@@ -1716,7 +1736,7 @@ def test_search_flexible_trip_validation():
     payload_base = {
         "origin_iata": "LHR",
         "destination_iata": "JFK",
-        "departure_date": "2026-10-15",
+        "departure_date": DEP_DATE_STR,
         "flexibility": {"mode": "exact"},
     }
 
@@ -1767,7 +1787,7 @@ def test_async_http_cancellation_and_socket_cleanup():
             FlightSliceCriteria(
                 origin_iata="LHR",
                 destination_iata="JFK",
-                departure_date=date(2026, 10, 15),
+                departure_date=DEP_DATE_OBJ,
             )
         ]
     )

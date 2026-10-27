@@ -27,6 +27,7 @@ if not os.environ.get("PAYLOAD_ENCRYPTION_KEY"):
     os.environ["PAYLOAD_ENCRYPTION_KEY"] = base64.b64encode(secrets.token_bytes(32)).decode("utf-8")
 
 DB_URL = os.environ.get("DATABASE_URL")
+DEFAULT_DEP_DATE = date.today() + timedelta(days=30)
 
 
 @pytest.fixture(scope="module")
@@ -246,7 +247,9 @@ def test_real_postgres_5_concurrent_searches_deduplication(pg_schema, monkeypatc
 
     provider_call_count = 0
 
-    def _make_dummy_offer(dep_date="2026-10-15", price=350.0):
+    def _make_dummy_offer(dep_date=None, price=350.0):
+        if dep_date is None:
+            dep_date = DEFAULT_DEP_DATE.isoformat()
         dep_dt = datetime.fromisoformat(f"{dep_date}T10:00:00+00:00")
         arr_dt = datetime.fromisoformat(f"{dep_date}T18:00:00+00:00")
         seg = FlightSegmentModel(
@@ -282,7 +285,7 @@ def test_real_postgres_5_concurrent_searches_deduplication(pg_schema, monkeypatc
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEFAULT_DEP_DATE,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
 
@@ -346,7 +349,7 @@ def test_real_postgres_advisory_lock_release_after_exception(pg_schema, monkeypa
             trip_id=trip_id,
             origin_iata="LHR",
             destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEFAULT_DEP_DATE,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         res = await orch.search_flexible_flights(user_id=user_id, trip_id=trip_id, criteria=crit)
@@ -390,8 +393,8 @@ def test_real_postgres_concurrent_different_criteria_parallel(pg_schema, monkeyp
         conn.close()
 
     def _make_dummy_offer(orig, dest, price=300.0):
-        dep_dt = datetime.fromisoformat("2026-10-15T10:00:00+00:00")
-        arr_dt = datetime.fromisoformat("2026-10-15T18:00:00+00:00")
+        dep_dt = datetime.combine(DEFAULT_DEP_DATE, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=10)
+        arr_dt = dep_dt + timedelta(hours=8)
         seg = FlightSegmentModel(
             origin_iata=orig, destination_iata=dest,
             departure_time=dep_dt, arrival_time=arr_dt,
@@ -423,13 +426,13 @@ def test_real_postgres_concurrent_different_criteria_parallel(pg_schema, monkeyp
         crit_a = FlexibleFlightSearchCriteria(
             trip_id=trip_id,
             origin_iata="LHR", destination_iata="JFK",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEFAULT_DEP_DATE,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
         crit_b = FlexibleFlightSearchCriteria(
             trip_id=trip_id,
             origin_iata="DEL", destination_iata="DXB",
-            departure_date=date(2026, 10, 15),
+            departure_date=DEFAULT_DEP_DATE,
             flexibility=FlexibleDateOptions(mode=DateFlexibilityMode.EXACT),
         )
 

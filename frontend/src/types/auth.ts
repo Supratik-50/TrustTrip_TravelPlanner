@@ -16,8 +16,8 @@ export interface SignupCredentials {
 }
 
 export interface AuthResponse {
-  access_token: string;
-  token_type?: string;
+  access_token?: string | null;
+  token_type?: string | null;
   user: User;
   message?: string;
 }

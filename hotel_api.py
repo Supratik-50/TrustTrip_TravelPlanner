@@ -297,6 +297,8 @@ async def search_hotels(
             detail="checkin date must be strictly before checkout date.",
         )
 
+
+
     search_params: dict[str, Any] = {
         "destination": destination,
         "checkin": d_in.isoformat(),
@@ -808,6 +810,53 @@ async def prebook_hotel(
             meta = json.loads(meta)
         except Exception:
             meta = {}
+
+    # Live hotel booking date validation: past check-in dates must never be accepted for live booking
+    checkin_cand = (
+        req.check_in_date
+        or (meta.get("constraints") or {}).get("checkin_date")
+        or (meta.get("constraints") or {}).get("departure_date")
+        or trip.get("start_date")
+    )
+    checkout_cand = (
+        req.check_out_date
+        or (meta.get("constraints") or {}).get("checkout_date")
+        or (meta.get("constraints") or {}).get("return_date")
+        or trip.get("end_date")
+    )
+    d_checkin = None
+    d_checkout = None
+    if checkin_cand:
+        try:
+            d_checkin = date.fromisoformat(str(checkin_cand).split("T")[0])
+        except Exception as exc:
+            if req.check_in_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Dates must be in valid YYYY-MM-DD format.",
+                ) from exc
+        if d_checkin and d_checkin < date.today():
+            raise HTTPException(
+                status_code=400,
+                detail="Hotel check-in date cannot be in the past for live booking.",
+            )
+
+    if checkout_cand:
+        try:
+            d_checkout = date.fromisoformat(str(checkout_cand).split("T")[0])
+        except Exception as exc:
+            if req.check_out_date:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Dates must be in valid YYYY-MM-DD format.",
+                ) from exc
+
+    if d_checkin and d_checkout and d_checkin >= d_checkout:
+        raise HTTPException(
+            status_code=400,
+            detail="Hotel check-in date must be strictly before check-out date for live booking.",
+        )
+
     if not snap_id:
         snap_id = meta.get("selected_hotel_snapshot_id") or (meta.get("selected_hotel") or {}).get("snapshot_id")
     if not snap_id and req.hotel_id:

@@ -989,7 +989,7 @@ class Phase8ResearchTestSuite(unittest.TestCase):
         self.assertTrue(plan.research_advisory.get("is_untrusted", False))
 
     def test_complete_canonical_invariants_reject_and_normalize(self):
-        from services.chat_planner import enforce_complete_canonical_invariants, CanonicalInvariantViolation, TravelPlan, BudgetPlan
+        from services.chat_planner import enforce_complete_canonical_invariants, CanonicalInvariantViolation, TravelPlan, BudgetPlan, DayPlan
 
         base_constraints = {
             "origin": "London",
@@ -1033,7 +1033,10 @@ class Phase8ResearchTestSuite(unittest.TestCase):
                 "duration_days": 5,
                 "travel_dates": "2026-10-01 to 2026-10-05",
                 "travel_style": "Balanced",
-                "daily_plan": [],
+                "daily_plan": [
+                    DayPlan(day=i, title=f"Day {i}", morning="M", afternoon="A", evening="E", estimated_daily_cost_inr=1000, date=f"2026-10-0{i}")
+                    for i in range(1, 6)
+                ],
                 "budget": default_b,
                 "flight_suggestion": "Recommended: off_flight_123 BA",
                 "accommodation_plan": "Recommended: hot_hotel_456 Hilton",
@@ -1132,7 +1135,8 @@ class Phase8ResearchTestSuite(unittest.TestCase):
         one_way_constraints = dict(base_constraints)
         one_way_constraints["is_one_way"] = True
         one_way_constraints["return_date"] = None
-        one_way_plan = enforce_complete_canonical_invariants(make_valid_plan(), one_way_constraints)
+        one_way_days = [DayPlan(day=1, title="D1", morning="M", afternoon="A", evening="E", estimated_daily_cost_inr=1000, date="2026-10-01")]
+        one_way_plan = enforce_complete_canonical_invariants(make_valid_plan(duration_days=1, daily_plan=one_way_days), one_way_constraints)
         self.assertEqual(one_way_plan.travel_dates, "2026-10-01 (one-way)")
         self.assertEqual(one_way_plan.duration_days, 1)
 
@@ -2080,13 +2084,15 @@ class TestPhase8LLMOutagePolicy(unittest.TestCase):
             travel_style="Balanced",
             daily_plan=[
                 DayPlan(
-                    day=1,
-                    title="Arrival & Beach Sunset",
-                    morning="Flight to Goa and check-in",
-                    afternoon="Relax at Taj Exotica private beach",
-                    evening="Dinner at Fisherman's Wharf",
+                    day=i,
+                    title="Arrival & Beach Sunset" if i == 1 else f"Goa Exploration Day {i}",
+                    morning="Flight to Goa and check-in" if i == 1 else f"Morning activity {i}",
+                    afternoon="Relax at Taj Exotica private beach" if i == 1 else f"Afternoon activity {i}",
+                    evening="Dinner at Fisherman's Wharf" if i == 1 else f"Evening dining {i}",
                     estimated_daily_cost_inr=3000.0,
+                    date=f"2026-11-0{i}",
                 )
+                for i in range(1, 6)
             ],
             budget=BudgetPlan(
                 currency="INR",
@@ -2133,7 +2139,7 @@ class TestPhase8LLMOutagePolicy(unittest.TestCase):
         self.assertEqual(provider, "groq")
         self.assertFalse(plan.planning_unavailable)
         self.assertEqual(plan.status, "success")
-        self.assertEqual(len(plan.daily_plan), 1)
+        self.assertEqual(len(plan.daily_plan), 5)
         self.assertEqual(plan.daily_plan[0].title, "Arrival & Beach Sunset")
 
 

@@ -121,10 +121,48 @@ def build_payment_receipt_pdf(record: dict[str, Any]) -> bytes:
     else:
         booking_display = booking_status
 
+    has_rzp_payment = bool(
+        razorpay_payment_id
+        and str(razorpay_payment_id).strip() not in {"—", "-", "none", "null", "", "None"}
+    )
+    has_rzp_order = bool(
+        razorpay_order_id
+        and str(razorpay_order_id).strip() not in {"—", "-", "none", "null", "", "None"}
+    )
+
+    if has_rzp_payment:
+        subtitle_text = "Official payment voucher verifying financial settlement via Razorpay."
+        gateway_display = str(record.get("payment_gateway") or "Razorpay Payment Gateway (Secured)")
+        payment_status_display = payment_status
+        disclaimer_text = (
+            "This receipt verifies financial settlement processed through Razorpay. "
+            "A payment receipt does NOT constitute an airline boarding pass, flight e-ticket, or hotel check-in voucher. "
+            "Supplier confirmation is issued separately upon confirmed reservation by the respective airline or hotel provider. "
+            "If a supplier booking fails after payment capture, the amount is refunded or reconciled in accordance with TrustTrip policy."
+        )
+    elif has_rzp_order:
+        subtitle_text = "Official payment order voucher (Payment Pending Capture)."
+        gateway_display = str(record.get("payment_gateway") or "Razorpay Payment Gateway (Pending Capture)")
+        payment_status_display = "ORDER CREATED (UNCAPTURED)" if payment_status in {"CAPTURED", "PENDING"} else payment_status
+        disclaimer_text = (
+            "This receipt documents an authorized payment order awaiting completion or capture. "
+            "A payment receipt does NOT constitute an airline boarding pass, flight e-ticket, or hotel check-in voucher. "
+            "Supplier confirmation is issued separately upon confirmed reservation by the respective airline or hotel provider."
+        )
+    else:
+        subtitle_text = "Official booking receipt and supplier settlement statement."
+        gateway_display = str(record.get("payment_gateway") or "Direct Provider Settlement")
+        payment_status_display = "SETTLED DIRECT VIA SUPPLIER" if payment_status in {"CAPTURED", "SETTLED_DIRECT", "BOOKED", "COMPLETED"} else payment_status
+        disclaimer_text = (
+            "This receipt confirms supplier reservation and direct provider settlement without external payment gateway capture. "
+            "A payment receipt does NOT constitute an airline boarding pass, flight e-ticket, or hotel check-in voucher. "
+            "Supplier confirmation is issued separately upon confirmed reservation by the respective airline or hotel provider."
+        )
+
     story = [
         Paragraph("TrustTrip Official Payment Receipt", title_style),
         Paragraph(f"Merchant: {escape(merchant_name)}", subtitle_style),
-        Paragraph("Official payment voucher verifying financial settlement via Razorpay.", subtitle_style),
+        Paragraph(subtitle_text, subtitle_style),
         Spacer(1, 4 * mm),
     ]
 
@@ -132,12 +170,29 @@ def build_payment_receipt_pdf(record: dict[str, Any]) -> bytes:
     tx_rows = [
         [Paragraph("Transaction ID", bold_label), Paragraph(escape(tx_id), code_style)],
         [Paragraph("Transaction Date", bold_label), Paragraph(escape(created_at), body_style)],
-        [Paragraph("Payment Status", bold_label), Paragraph(f"<b>{escape(payment_status)}</b>", body_style)],
-        [Paragraph("Payment Gateway", bold_label), Paragraph("Razorpay Payment Gateway (Secured)", body_style)],
-        [Paragraph("Razorpay Order ID", bold_label), Paragraph(escape(razorpay_order_id), code_style)],
-        [Paragraph("Razorpay Payment ID", bold_label), Paragraph(escape(razorpay_payment_id), code_style)],
-        [Paragraph("Total Amount Settled", bold_label), Paragraph(f"<b>{_fmt_money(amount, currency)}</b>", body_style)],
+        [Paragraph("Payment Status", bold_label), Paragraph(f"<b>{escape(payment_status_display)}</b>", body_style)],
     ]
+    if has_rzp_payment:
+        tx_rows.extend([
+            [Paragraph("Payment Gateway", bold_label), Paragraph(escape(gateway_display), body_style)],
+            [Paragraph("Razorpay Order ID", bold_label), Paragraph(escape(razorpay_order_id), code_style)],
+            [Paragraph("Razorpay Payment ID", bold_label), Paragraph(escape(razorpay_payment_id), code_style)],
+        ])
+    elif has_rzp_order:
+        tx_rows.extend([
+            [Paragraph("Payment Gateway", bold_label), Paragraph(escape(gateway_display), body_style)],
+            [Paragraph("Razorpay Order ID", bold_label), Paragraph(escape(razorpay_order_id), code_style)],
+            [Paragraph("Razorpay Payment ID", bold_label), Paragraph("NOT CAPTURED", code_style)],
+        ])
+    else:
+        tx_rows.extend([
+            [Paragraph("Settlement Method", bold_label), Paragraph(escape(gateway_display), body_style)],
+            [Paragraph("Booking Reference", bold_label), Paragraph(escape(str(confirmation_ref or tx_id)), code_style)],
+        ])
+    tx_rows.append(
+        [Paragraph("Total Amount Settled", bold_label), Paragraph(f"<b>{_fmt_money(amount, currency)}</b>", body_style)],
+    )
+
     story.append(Paragraph("Payment Summary", h2_style))
     t1 = Table(tx_rows, colWidths=[48 * mm, 130 * mm], hAlign="LEFT")
     t1.setStyle(TableStyle([
@@ -176,13 +231,7 @@ def build_payment_receipt_pdf(record: dict[str, Any]) -> bytes:
     story.append(Spacer(1, 4 * mm))
     disclaimer_block = [
         Paragraph("Important Financial Notice & Disclaimer", h2_style),
-        Paragraph(
-            "This receipt verifies financial settlement processed through Razorpay. "
-            "A payment receipt does NOT constitute an airline boarding pass, flight e-ticket, or hotel check-in voucher. "
-            "Supplier confirmation is issued separately upon confirmed reservation by the respective airline or hotel provider. "
-            "If a supplier booking fails after payment capture, the amount is refunded or reconciled in accordance with TrustTrip policy.",
-            small_style,
-        ),
+        Paragraph(disclaimer_text, small_style),
     ]
     story.append(KeepTogether(disclaimer_block))
 

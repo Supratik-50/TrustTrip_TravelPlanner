@@ -1,16 +1,21 @@
+from datetime import date, timedelta
 from services.travel_planner import parse_trip_request, candidate_dates
 from services.travel_plan_pdf import build_travel_plan_pdf
 from services.chat_planner import TravelPlan, BudgetPlan, DayPlan
 
 
 def test_world_route_and_explicit_dates_are_parsed_without_llm():
-    c = parse_trip_request("Plan a trip from Kolkata to Ahmedabad on 5 October 2026 to 10 October 2026 for 2 adults under ₹60000")
+    dep = date.today() + timedelta(days=30)
+    ret = dep + timedelta(days=5)
+    dep_s = dep.strftime("%d %B %Y")
+    ret_s = ret.strftime("%d %B %Y")
+    c = parse_trip_request(f"Plan a trip from Kolkata to Ahmedabad on {dep_s} to {ret_s} for 2 adults under ₹60000")
     assert c["origin"] == "CCU"
     assert c["destination"] == "AMD"
-    assert c["departure_date"] == "2026-10-05"
-    assert c["return_date"] == "2026-10-10"
+    assert c["departure_date"] == dep.isoformat()
+    assert c["return_date"] == ret.isoformat()
     assert c["duration_days"] == 6
-    assert candidate_dates(c, 1) == [("2026-10-05", "2026-10-10")]
+    assert candidate_dates(c, 1) == [(dep.isoformat(), ret.isoformat())]
 
 
 def test_surats_route_is_supported_without_llm():

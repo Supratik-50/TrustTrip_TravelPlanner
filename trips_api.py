@@ -511,17 +511,33 @@ async def payment_receipt_pdf(
         lead_name = " ".join(x for x in [holder.get("firstName"), holder.get("lastName")] if x) or holder.get("name") or "—"
         conf_code = booking.get("confirmation_code") or booking.get("booking_id")
 
+        rzp_order_id = hotel_record.get("razorpay_order_id")
+        rzp_payment_id = hotel_record.get("razorpay_payment_id")
+        has_rzp_payment = bool(rzp_payment_id and str(rzp_payment_id).strip() not in {"", "—", "-", "None", "none", "null"})
+        has_rzp_order = bool(rzp_order_id and str(rzp_order_id).strip() not in {"", "—", "-", "None", "none", "null"})
+
+        if has_rzp_payment:
+            gateway_name = "Razorpay Payment Gateway (Secured)"
+            pay_status = hotel_record.get("payment_status") or "captured"
+        elif has_rzp_order:
+            gateway_name = "Razorpay (Pending Capture)"
+            pay_status = "order_created"
+        else:
+            gateway_name = "Direct Provider Settlement"
+            pay_status = "settled_direct" if str(hotel_record.get("booking_status") or "").lower() in {"booked", "confirmed", "completed"} else (hotel_record.get("payment_status") or "pending")
+
         receipt_data = {
             "id": transaction_id,
             "merchant": "TrustTrip Travel Planner",
             "service_type": "Hotel Reservation",
             "service_name": hotel_record.get("hotel_name") or offer.get("hotel_name") or "Hotel Stay",
-            "payment_status": hotel_record.get("payment_status") or "pending",
+            "payment_status": pay_status,
             "booking_status": hotel_record.get("booking_status") or "pending",
+            "payment_gateway": gateway_name,
             "amount_inr": float(hotel_record.get("amount_inr") or 0.0),
             "currency": str(hotel_record.get("currency") or "INR"),
-            "razorpay_order_id": hotel_record.get("razorpay_order_id"),
-            "razorpay_payment_id": hotel_record.get("razorpay_payment_id"),
+            "razorpay_order_id": rzp_order_id if has_rzp_order else None,
+            "razorpay_payment_id": rzp_payment_id if has_rzp_payment else None,
             "confirmation_code": conf_code,
             "customer_name": lead_name,
             "customer_email": holder.get("email"),
@@ -560,7 +576,20 @@ async def payment_receipt_pdf(
 
             pnr = intent.get("provider_reference") or meta.get("booking_reference") or meta.get("pnr")
             status_str = str(intent.get("status") or "").upper()
-            pay_status = "captured" if status_str == "COMPLETED" else "pending"
+            rzp_order_id = meta.get("razorpay_order_id")
+            rzp_payment_id = meta.get("razorpay_payment_id")
+            has_rzp_payment = bool(rzp_payment_id and str(rzp_payment_id).strip() not in {"", "—", "-", "None", "none", "null"})
+            has_rzp_order = bool(rzp_order_id and str(rzp_order_id).strip() not in {"", "—", "-", "None", "none", "null"})
+
+            if has_rzp_payment:
+                pay_status = "captured"
+                gateway_name = "Razorpay Payment Gateway (Secured)"
+            elif has_rzp_order:
+                pay_status = "order_created"
+                gateway_name = "Razorpay (Pending Capture)"
+            else:
+                pay_status = "settled_direct" if status_str == "COMPLETED" else "pending"
+                gateway_name = f"Direct Provider Settlement ({intent.get('provider') or 'Duffel'})"
 
             receipt_data = {
                 "id": str(intent["id"]),
@@ -569,10 +598,11 @@ async def payment_receipt_pdf(
                 "service_name": f"Flight Booking ({intent.get('provider') or 'Duffel'})",
                 "payment_status": pay_status,
                 "booking_status": status_str,
+                "payment_gateway": gateway_name,
                 "amount_inr": float(intent.get("expected_amount") or 0.0),
                 "currency": str(intent.get("currency") or "INR"),
-                "razorpay_order_id": meta.get("razorpay_order_id") or "—",
-                "razorpay_payment_id": meta.get("razorpay_payment_id") or "—",
+                "razorpay_order_id": rzp_order_id if has_rzp_order else None,
+                "razorpay_payment_id": rzp_payment_id if has_rzp_payment else None,
                 "confirmation_code": str(pnr) if pnr else None,
                 "customer_name": lead_name,
                 "customer_email": meta.get("contact_email") or current_user.email,
@@ -588,17 +618,33 @@ async def payment_receipt_pdf(
                     status_code=403,
                     detail="Access denied to this payment receipt.",
                 )
+            rzp_order_id = tx_rec.get("razorpay_order_id")
+            rzp_payment_id = tx_rec.get("razorpay_payment_id")
+            has_rzp_payment = bool(rzp_payment_id and str(rzp_payment_id).strip() not in {"", "—", "-", "None", "none", "null"})
+            has_rzp_order = bool(rzp_order_id and str(rzp_order_id).strip() not in {"", "—", "-", "None", "none", "null"})
+
+            if has_rzp_payment:
+                pay_status = tx_rec.get("payment_status") or "captured"
+                gateway_name = "Razorpay Payment Gateway (Secured)"
+            elif has_rzp_order:
+                pay_status = "order_created"
+                gateway_name = "Razorpay (Pending Capture)"
+            else:
+                pay_status = "settled_direct" if str(tx_rec.get("booking_status") or "").lower() in {"booked", "confirmed", "completed"} else (tx_rec.get("payment_status") or "pending")
+                gateway_name = "Direct Provider Settlement"
+
             receipt_data = {
                 "id": str(tx_rec["id"]),
                 "merchant": "TrustTrip Travel Planner",
                 "service_type": "Flight Reservation",
                 "service_name": "Flight Booking",
-                "payment_status": tx_rec.get("payment_status") or "captured",
+                "payment_status": pay_status,
                 "booking_status": tx_rec.get("booking_status") or "booked",
+                "payment_gateway": gateway_name,
                 "amount_inr": float(tx_rec.get("amount") or 0.0),
                 "currency": str(tx_rec.get("currency") or "INR"),
-                "razorpay_order_id": tx_rec.get("razorpay_order_id"),
-                "razorpay_payment_id": tx_rec.get("razorpay_payment_id"),
+                "razorpay_order_id": rzp_order_id if has_rzp_order else None,
+                "razorpay_payment_id": rzp_payment_id if has_rzp_payment else None,
                 "confirmation_code": tx_rec.get("booking_reference") or tx_rec.get("duffel_order_id"),
                 "customer_name": "—",
                 "customer_email": current_user.email,
@@ -1337,6 +1383,10 @@ class TripApprovalRequest(BaseModel):
     revision_id: UUID = Field(..., description="Exact revision ID to approve")
     expected_revision_number: int = Field(..., ge=1, description="Expected monotonically increasing revision number")
     notes: str | None = None
+    confirm_budget_override: bool = Field(
+        default=False,
+        description="Explicit confirmation to approve an itinerary that exceeds the canonical target budget",
+    )
 
 
 class TripRejectionRequest(BaseModel):
@@ -1475,6 +1525,18 @@ async def generate_revision_plan(
         )
     except Exception as exc:
         err_msg = str(exc)
+        from services.chat_planner import CanonicalInvariantViolation
+        if isinstance(exc, (ValueError, CanonicalInvariantViolation)) or "canonical" in err_msg.lower() or "invariant" in err_msg.lower() or "date mismatch" in err_msg.lower():
+            logger.warning("PlannerService canonical date/constraint violation for revision %s: %s", revision_id, exc)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": f"Trip constraint validation failed: {err_msg}",
+                    "retryable": False,
+                    "status_code": 400,
+                },
+            )
         if "429" in err_msg or "rate limit" in err_msg.lower():
             return JSONResponse(
                 status_code=429,
@@ -1498,6 +1560,7 @@ async def generate_revision_plan(
             )
         logger.error("PlannerService invocation failed for revision %s: %s", revision_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to synthesize itinerary due to an internal error.")
+
 
     planner_success = result.get("success")
     if planner_success is None:
@@ -1695,8 +1758,105 @@ async def approve_trip(
             except Exception:
                 pass
 
+    # 3. Check Over-Budget Approval Invariant
+    # Resolve authoritative target budget from canonical trip constraints and metadata
+    target_budget: float | None = None
+    for val in (
+        constraints.get("budget"),
+        constraints.get("budget_amount"),
+        constraints.get("target_budget"),
+        constraints.get("target_budget_inr"),
+        meta.get("budget"),
+        meta.get("budget_amount"),
+        meta.get("target_budget"),
+        meta.get("target_budget_inr"),
+        trip.get("budget"),
+    ):
+        if val is not None:
+            try:
+                f_val = float(val)
+                if f_val > 0:
+                    target_budget = f_val
+                    break
+            except (ValueError, TypeError):
+                continue
+
+    # Resolve estimated total and budget flags from authoritative revision snapshot / plan
+    budget_dict: dict[str, Any] | None = None
+    for b_candidate in (
+        itinerary_plan.get("budget") if isinstance(itinerary_plan, dict) else None,
+        (itinerary_plan.get("plan_json") or {}).get("budget") if isinstance(itinerary_plan, dict) and isinstance(itinerary_plan.get("plan_json"), dict) else None,
+        ps.get("budget") if isinstance(ps, dict) else None,
+        (ps.get("plan_json") or {}).get("budget") if isinstance(ps, dict) and isinstance(ps.get("plan_json"), dict) else None,
+        (meta.get("plan") or {}).get("budget") if isinstance(meta.get("plan"), dict) else None,
+    ):
+        if isinstance(b_candidate, dict) and b_candidate:
+            budget_dict = b_candidate
+            break
+
+    estimated_total: float | None = None
+    within_budget_flag: bool | None = None
+    if isinstance(budget_dict, dict):
+        for total_key in ("estimated_total_inr", "estimated_total", "total", "estimated_total_cost"):
+            if budget_dict.get(total_key) is not None:
+                try:
+                    estimated_total = float(budget_dict[total_key])
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if target_budget is None:
+            for tb_key in ("target_budget_inr", "target_budget"):
+                if budget_dict.get(tb_key) is not None:
+                    try:
+                        target_budget = float(budget_dict[tb_key])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+        if isinstance(budget_dict.get("within_budget"), bool):
+            within_budget_flag = budget_dict["within_budget"]
+
+    is_over_budget = False
+    if within_budget_flag is False:
+        is_over_budget = True
+    elif target_budget is not None and estimated_total is not None and estimated_total > target_budget:
+        is_over_budget = True
+
+    if is_over_budget and not req.confirm_budget_override:
+        if estimated_total and target_budget:
+            detail_msg = (
+                f"Cannot approve revision: Estimated total cost (₹{estimated_total:,.0f}) exceeds target budget (₹{target_budget:,.0f}). "
+                "Explicit budget override confirmation is required."
+            )
+        else:
+            detail_msg = (
+                "Cannot approve revision: Itinerary exceeds the canonical target budget. "
+                "Explicit budget override confirmation is required."
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=detail_msg,
+        )
+
     now_iso = datetime.now(timezone.utc).isoformat()
     meta["approved_at"] = now_iso
+
+    approval_metadata: dict[str, Any] = {"approved_at": now_iso, "notes": req.notes}
+    if is_over_budget:
+        approval_metadata["budget_override"] = {
+            "confirmed": True,
+            "target_budget_inr": target_budget,
+            "estimated_total_inr": estimated_total,
+            "overrun_inr": (estimated_total - target_budget) if (estimated_total and target_budget) else None,
+            "confirmed_at": now_iso,
+        }
+        meta["budget_override"] = {
+            "confirmed": True,
+            "revision_id": str(req.revision_id),
+            "revision_number": req.expected_revision_number,
+            "target_budget_inr": target_budget,
+            "estimated_total_inr": estimated_total,
+            "confirmed_at": now_iso,
+        }
 
     # Execute approval transaction under parent trip lock
     try:
@@ -1705,7 +1865,7 @@ async def approve_trip(
             user_id=current_user.id,
             revision_id=str(req.revision_id),
             expected_revision=req.expected_revision_number,
-            metadata={"approved_at": now_iso, "notes": req.notes},
+            metadata=approval_metadata,
         )
     except HTTPException as exc:
         if exc.status_code == 400 and "not current revision" in str(exc.detail):
@@ -1728,6 +1888,7 @@ async def approve_trip(
         "status": "approved",
         "review_status": "APPROVED",
         "approval_id": str(approval.approval_id),
+        "budget_override_confirmed": is_over_budget,
         "trip": updated_trip,
     }
 

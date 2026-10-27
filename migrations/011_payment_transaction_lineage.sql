@@ -11,6 +11,30 @@ BEGIN;
 -- PART A: FLIGHT PAYMENT TRANSACTIONS — REVISION LINEAGE + IDEMPOTENCY
 -- ====================================================================
 
+CREATE TABLE IF NOT EXISTS trust_trip_transactions (
+    id UUID PRIMARY KEY,
+    customer_ref TEXT,
+    offer_id TEXT NOT NULL,
+    duffel_order_id TEXT,
+    booking_reference TEXT,
+    razorpay_order_id TEXT UNIQUE,
+    razorpay_payment_id TEXT UNIQUE,
+    amount NUMERIC NOT NULL,
+    currency TEXT DEFAULT 'INR',
+    provider_amount NUMERIC,
+    provider_currency TEXT,
+    fx_rate NUMERIC,
+    fx_rate_date TEXT,
+    fx_source TEXT,
+    payment_status TEXT DEFAULT 'pending',
+    booking_status TEXT DEFAULT 'pending',
+    refund_status TEXT DEFAULT 'none',
+    passenger_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE trust_trip_transactions
     ADD COLUMN IF NOT EXISTS trip_id      UUID,
     ADD COLUMN IF NOT EXISTS revision_id  UUID,
@@ -50,6 +74,28 @@ END $$;
 -- ====================================================================
 -- PART B: HOTEL PAYMENT TRANSACTIONS — REVISION LINEAGE + IDEMPOTENCY
 -- ====================================================================
+
+CREATE TABLE IF NOT EXISTS trust_trip_hotel_transactions (
+    id TEXT PRIMARY KEY,
+    customer_ref TEXT,
+    provider TEXT NOT NULL,
+    hotel_name TEXT,
+    offer_json JSONB NOT NULL,
+    prebook_json JSONB NOT NULL,
+    holder_json JSONB NOT NULL,
+    guests_json JSONB NOT NULL,
+    amount_inr NUMERIC(14,2) NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'INR',
+    razorpay_order_id TEXT,
+    razorpay_payment_id TEXT,
+    payment_status TEXT NOT NULL DEFAULT 'pending',
+    booking_status TEXT NOT NULL DEFAULT 'pending',
+    booking_json JSONB,
+    error TEXT,
+    pdf_generated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 ALTER TABLE trust_trip_hotel_transactions
     ADD COLUMN IF NOT EXISTS trip_id      UUID,

@@ -44,7 +44,7 @@ export interface TripSummary {
   destination: string;
   start_date: string;
   end_date: string;
-  status: 'draft' | 'planning' | 'awaiting_approval' | 'approved' | 'booked' | 'cancelled';
+  status: 'draft' | 'planning' | 'awaiting_approval' | 'approved' | 'booked' | 'cancelled' | 'rejected' | 'active';
   active_revision_number?: number;
   active_revision_id?: string;
   current_revision_number?: number;

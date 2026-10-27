@@ -148,6 +148,28 @@ class FlightSlice(BaseModel):
     destination: str = Field(min_length=3, max_length=3)
     departure_date: str
 
+    @field_validator("departure_date")
+    @classmethod
+    def validate_departure_date(cls, value: str) -> str:
+        from datetime import date
+        cleaned = value.strip()
+        try:
+            d = date.fromisoformat(cleaned[:10])
+        except Exception:
+            raise ValueError("departure_date must be in valid YYYY-MM-DD format.")
+        if d < date.today():
+            raise ValueError("Flight departure date cannot be in the past for live search.")
+        return cleaned[:10]
+
+    @field_validator("origin", "destination")
+    @classmethod
+    def validate_airport_code(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if len(cleaned) != 3 or not cleaned.isalpha():
+            raise ValueError("Airport code must be a 3-letter IATA code.")
+        return cleaned
+
+
 
 class FlightSearchRequest(BaseModel):
     trip_id: str | None = None

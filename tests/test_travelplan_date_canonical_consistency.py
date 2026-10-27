@@ -24,6 +24,16 @@ from services.chat_planner import (
     _deterministic_fallback,
 )
 from services.planner_service import PlannerService
+from services.auth_store import UserStore
+from services.trip_store import TripStore
+
+
+@pytest.fixture(autouse=True)
+def setup_test_env(monkeypatch):
+    monkeypatch.setenv("USE_IN_MEMORY_AUTH", "1")
+    UserStore._IN_MEMORY_USERS.clear()
+    TripStore._IN_MEMORY_TRIPS.clear()
+    TripStore._IN_MEMORY_THREADS.clear()
 
 
 def _dummy_budget():
@@ -41,22 +51,23 @@ def _dummy_budget():
     )
 
 
-def _base_plan():
+def _base_plan(duration_days: int = 8):
     return TravelPlan(
         trip_summary="A trip from Kolkata to Goa",
         route="Kolkata → Goa",
-        duration_days=8,
+        duration_days=duration_days,
         travel_dates="Flexible dates",
         travel_style="Balanced",
         daily_plan=[
             DayPlan(
-                day=1,
-                title="Arrival in Goa",
+                day=i,
+                title=f"Explore Goa — Day {i}",
                 morning="Arrive and check in",
                 afternoon="Visit beach",
                 evening="Sunset dinner",
                 estimated_daily_cost_inr=5000.0,
             )
+            for i in range(1, duration_days + 1)
         ],
         budget=_dummy_budget(),
         flight_suggestion="Recommended flight",

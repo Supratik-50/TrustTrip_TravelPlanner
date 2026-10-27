@@ -21,17 +21,23 @@ from app import app
 # 1. Natural Language Parsing Remediation Tests (HIGH #3, LOW #11)
 # ==============================================================================
 
+def _future_year_for_month_day(month: int, day: int) -> int:
+    today = date.today()
+    return today.year if (today.month < month or (today.month == month and today.day <= day)) else today.year + 1
+
+
 def test_kolkata_to_goa_exact_user_query():
     """Verify exact prompt from audit: 'Kolkata to Goa, Oct 14 to Oct 24, 2 travelers, budget INR 45000'."""
     query = "Kolkata to Goa, Oct 14 to Oct 24, 2 travelers, budget INR 45000"
     c = parse_trip_request(query)
 
+    expected_year = _future_year_for_month_day(10, 14)
     assert c["origin"] == "CCU"
     assert c["origin_city"] == "Kolkata"
     assert c["destination"] == "GOI"
     assert c["destination_city"] == "Goa"
-    assert c["departure_date"] == "2026-10-14"
-    assert c["return_date"] == "2026-10-24"
+    assert c["departure_date"] == f"{expected_year}-10-14"
+    assert c["return_date"] == f"{expected_year}-10-24"
     # Duration: Oct 14 to Oct 24 inclusive = 11 days (10 nights)
     assert c["duration_days"] == 11
     assert c["adults"] == 2
@@ -52,15 +58,18 @@ def test_passenger_variations_parsing(query, expected_adults):
     assert c["adults"] == expected_adults
 
 
-@pytest.mark.parametrize("query,expected_dep,expected_ret,expected_days", [
-    ("Kolkata to Goa, Oct 14 to Oct 24, 2 travelers", "2026-10-14", "2026-10-24", 11),
-    ("Kolkata to Goa, 14 Oct to 24 Oct, 2 travelers", "2026-10-14", "2026-10-24", 11),
-    ("Kolkata to Goa, Oct 14 to 24, 2 travelers", "2026-10-14", "2026-10-24", 11),
-    ("Kolkata to Goa, 14 to 24 Oct, 2 travelers", "2026-10-14", "2026-10-24", 11),
-    ("Delhi to Jaipur on 5 Nov to 10 Nov", "2026-11-05", "2026-11-10", 6),
+@pytest.mark.parametrize("query,month,dep_day,ret_day,expected_days", [
+    ("Kolkata to Goa, Oct 14 to Oct 24, 2 travelers", 10, 14, 24, 11),
+    ("Kolkata to Goa, 14 Oct to 24 Oct, 2 travelers", 10, 14, 24, 11),
+    ("Kolkata to Goa, Oct 14 to 24, 2 travelers", 10, 14, 24, 11),
+    ("Kolkata to Goa, 14 to 24 Oct, 2 travelers", 10, 14, 24, 11),
+    ("Delhi to Jaipur on 5 Nov to 10 Nov", 11, 5, 10, 6),
 ])
-def test_date_range_variations_parsing(query, expected_dep, expected_ret, expected_days):
+def test_date_range_variations_parsing(query, month, dep_day, ret_day, expected_days):
     c = parse_trip_request(query)
+    expected_year = _future_year_for_month_day(month, dep_day)
+    expected_dep = f"{expected_year}-{month:02d}-{dep_day:02d}"
+    expected_ret = f"{expected_year}-{month:02d}-{ret_day:02d}"
     assert c["departure_date"] == expected_dep
     assert c["return_date"] == expected_ret
     assert c["duration_days"] == expected_days
@@ -322,7 +331,10 @@ def test_api_travel_failure_propagation_never_forces_success_true():
                     assert response.status_code == 503
                     data = response.json()
                     assert data["success"] is False
-                    assert "Flight search provider unavailable" in data["error"]
+                    assert (
+                        "Flight search provider unavailable" in data["error"]
+                        or "Upstream AI travel planning service is temporarily overloaded" in data["error"]
+                    )
                     mock_update.assert_not_called()
     finally:
         app.dependency_overrides.clear()

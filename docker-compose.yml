@@ -1,16 +1,123 @@
 services:
+  # ============================================================================
+  # 1. PostgreSQL Database Service
+  # ============================================================================
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     container_name: trusttrip-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: trusttrip
-      POSTGRES_USER: trusttrip
-      POSTGRES_PASSWORD: trusttrip_local
-    ports:
-      - "5433:5432"
+      POSTGRES_DB: ${POSTGRES_DB:-trusttrip}
+      POSTGRES_USER: ${POSTGRES_USER:-trusttrip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trusttrip_local}
     volumes:
       - trusttrip_pgdata:/var/lib/postgresql/data
+    ports:
+      # Bound strictly to localhost loopback for local tools/inspection.
+      # In production, this port is NOT reachable publicly.
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trusttrip} -d ${POSTGRES_DB:-trusttrip}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - trusttrip-net
+
+  # ============================================================================
+  # 2. FastAPI Backend Application Service
+  # ============================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trusttrip-backend:latest
+    container_name: trusttrip-backend
+    restart: unless-stopped
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-trusttrip}:${POSTGRES_PASSWORD:-trusttrip_local}@postgres:5432/${POSTGRES_DB:-trusttrip}?sslmode=disable
+      - JWT_SECRET=${JWT_SECRET}
+      - PAYLOAD_ENCRYPTION_KEY=${PAYLOAD_ENCRYPTION_KEY}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}
+      - GROQ_FALLBACK_MODEL=${GROQ_FALLBACK_MODEL:-qwen/qwen3.8-27b}
+      - GROQ_MAX_TOKENS=${GROQ_MAX_TOKENS:-4096}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - LITEAPI_SANDBOX_API_KEY=${LITEAPI_SANDBOX_API_KEY}
+      - LITEAPI_PRODUCTION_API_KEY=${LITEAPI_PRODUCTION_API_KEY}
+      - LITEAPI_MODE=${LITEAPI_MODE:-sandbox}
+      - HOTELBEDS_API_KEY=${HOTELBEDS_API_KEY}
+      - HOTELBEDS_SECRET=${HOTELBEDS_SECRET}
+      - HOTELBEDS_MODE=${HOTELBEDS_MODE:-test}
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
+      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET:-}
+      - RAZORPAY_API_TIMEOUT_SECONDS=${RAZORPAY_API_TIMEOUT_SECONDS:-30}
+      - DUFFEL_API_TOKEN=${DUFFEL_API_TOKEN:-${DUFFEL_ACCESS_TOKEN}}
+      - DUFFEL_ACCESS_TOKEN=${DUFFEL_ACCESS_TOKEN:-${DUFFEL_API_TOKEN}}
+      - DUFFEL_MODE=${DUFFEL_MODE:-test}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    networks:
+      - trusttrip-net
+
+  # ============================================================================
+  # 3. Frontend Web & Nginx Reverse Proxy Service
+  # ============================================================================
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: trusttrip-web:latest
+    container_name: trusttrip-web
+    restart: unless-stopped
+    ports:
+      # Bound strictly to host loopback for local verification.
+      # Cloudflare Tunnel reaches web:80 over the internal Docker network.
+      - "127.0.0.1:80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/nginx-health"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - trusttrip-net
+
+  # ============================================================================
+  # 4. Cloudflare Tunnel Connector Service (Zero Inbound Open Ports)
+  # ============================================================================
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: trusttrip-cloudflared
+    restart: unless-stopped
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - trusttrip-net
+
+networks:
+  trusttrip-net:
+    driver: bridge
 
 volumes:
   trusttrip_pgdata:
+    name: trusttrip_travelplanner_trusttrip_pgdata

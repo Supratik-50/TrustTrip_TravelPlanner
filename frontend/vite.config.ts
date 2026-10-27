@@ -17,6 +17,11 @@ export default defineConfig(() => {
     },
     server: {
       port: 3000,
+      host: true, // Forces Vite to listen on local network interfaces
+      allowedHosts: [
+        'localhost',
+        '127.0.0.1'
+      ],
       proxy: {
         '/api': {
           target: 'http://127.0.0.1:8000',

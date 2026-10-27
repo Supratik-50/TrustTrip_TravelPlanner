@@ -876,3 +876,341 @@ def test_constraint_update_persists_budget_70k_and_planner_reads_it():
         or meta.get("budget_amount")
     )
     assert float(budget_val) == 70000.0
+
+
+def test_overbudget_approval_rejected_without_explicit_override():
+    """Verify that an over-budget revision cannot be approved without explicit confirm_budget_override."""
+    client, user_id = _auth_client("overbudget_user@example.com")
+    trip_store = TripStore()
+    ev_store = EvidenceRevisionStore()
+
+    trip_res = client.post(
+        "/api/trips",
+        json={"title": "Goa Trip", "destination": "Goa", "metadata": {"budget": 50000.0, "constraints": {"budget": 50000.0}}},
+    )
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Initial"}).json()
+    rev_id = r1["revision_id"]
+
+    # Attach over-budget plan
+    trip_store.attach_plan_to_revision(
+        trip_id=trip_id,
+        user_id=user_id,
+        revision_id=rev_id,
+        plan_json={
+            "budget": {
+                "target_budget_inr": 50000.0,
+                "estimated_total_inr": 66492.0,
+                "within_budget": False,
+                "pricing_note": "Exceeds target budget by 16,492",
+            }
+        },
+        raw_plan="Sample plan",
+    )
+
+    # 1. Calling approve without confirm_budget_override (default False) fails with 400
+    res_no_override = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
+    assert res_no_override.status_code == 400
+    detail = res_no_override.json()["detail"]
+    assert "exceeds target budget" in detail.lower()
+    assert "explicit budget override confirmation is required" in detail.lower()
+
+    # 2. Verify no approval record was created
+    assert ev_store.get_approval_for_revision(trip_id, rev_id) is None
+
+    # 3. Verify trip status remains awaiting_approval
+    trip = trip_store.get_trip(trip_id, user_id)
+    assert trip["status"] == "awaiting_approval"
+
+    # 4. Verify revision remains unapproved / PROPOSED in history
+    hist = client.get(f"/api/trips/{trip_id}/revisions").json()["revisions"]
+    assert hist[0]["is_approved"] is False
+
+
+def test_overbudget_approval_succeeds_with_explicit_override():
+    """Verify that an over-budget revision succeeds when confirm_budget_override=True and records audit metadata."""
+    client, user_id = _auth_client("overbudget_override_user@example.com")
+    trip_store = TripStore()
+    ev_store = EvidenceRevisionStore()
+
+    trip_res = client.post(
+        "/api/trips",
+        json={"title": "Goa Trip", "destination": "Goa", "metadata": {"budget": 50000.0, "constraints": {"budget": 50000.0}}},
+    )
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Initial"}).json()
+    rev_id = r1["revision_id"]
+
+    trip_store.attach_plan_to_revision(
+        trip_id=trip_id,
+        user_id=user_id,
+        revision_id=rev_id,
+        plan_json={
+            "budget": {
+                "target_budget_inr": 50000.0,
+                "estimated_total_inr": 66492.0,
+                "within_budget": False,
+                "pricing_note": "Exceeds target budget by 16,492",
+            }
+        },
+        raw_plan="Sample plan",
+    )
+
+    # Calling approve with confirm_budget_override=True succeeds
+    res_override = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={
+            "revision_id": rev_id,
+            "expected_revision_number": 1,
+            "confirm_budget_override": True,
+            "notes": "User authorized 16k overrun",
+        },
+    )
+    assert res_override.status_code == 200
+    data = res_override.json()
+    assert data["status"] == "approved"
+    assert data["budget_override_confirmed"] is True
+
+    # Verify approval record exists and audit metadata contains budget override details
+    approval = ev_store.get_approval_for_revision(trip_id, rev_id)
+    assert approval is not None
+    override_meta = approval.approval_metadata.get("budget_override")
+    assert override_meta is not None
+    assert override_meta["confirmed"] is True
+    assert override_meta["target_budget_inr"] == 50000.0
+    assert override_meta["estimated_total_inr"] == 66492.0
+    assert override_meta["overrun_inr"] == 16492.0
+    assert "confirmed_at" in override_meta
+
+    # Verify trip status transitioned to approved
+    trip = trip_store.get_trip(trip_id, user_id)
+    assert trip["status"] == "approved"
+    assert trip["metadata"]["budget_override"]["confirmed"] is True
+
+
+def test_within_budget_approval_succeeds_without_override():
+    """Verify that a within-budget revision approves seamlessly without requiring confirm_budget_override."""
+    client, user_id = _auth_client("within_budget_user@example.com")
+    trip_store = TripStore()
+
+    trip_res = client.post(
+        "/api/trips",
+        json={"title": "Goa Trip", "destination": "Goa", "metadata": {"budget": 70000.0, "constraints": {"budget": 70000.0}}},
+    )
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Initial"}).json()
+    rev_id = r1["revision_id"]
+
+    trip_store.attach_plan_to_revision(
+        trip_id=trip_id,
+        user_id=user_id,
+        revision_id=rev_id,
+        plan_json={
+            "budget": {
+                "target_budget_inr": 70000.0,
+                "estimated_total_inr": 66492.0,
+                "within_budget": True,
+            }
+        },
+        raw_plan="Sample plan",
+    )
+
+    # Calling approve with default body (confirm_budget_override=False) succeeds
+    res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev_id, "expected_revision_number": 1},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "approved"
+    assert data["budget_override_confirmed"] is False
+
+
+def test_client_supplied_budget_fields_cannot_override_authoritative_server_values():
+    """Verify that client cannot bypass over-budget rejection by injecting fake within_budget in approval request."""
+    client, user_id = _auth_client("spoof_budget_user@example.com")
+    trip_store = TripStore()
+
+    trip_res = client.post(
+        "/api/trips",
+        json={"title": "Goa Trip", "destination": "Goa", "metadata": {"budget": 50000.0, "constraints": {"budget": 50000.0}}},
+    )
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Initial"}).json()
+    rev_id = r1["revision_id"]
+
+    trip_store.attach_plan_to_revision(
+        trip_id=trip_id,
+        user_id=user_id,
+        revision_id=rev_id,
+        plan_json={
+            "budget": {
+                "target_budget_inr": 50000.0,
+                "estimated_total_inr": 66492.0,
+                "within_budget": False,
+            }
+        },
+        raw_plan="Sample plan",
+    )
+
+    # Client sends fake budget values trying to trick the approval endpoint
+    res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={
+            "revision_id": rev_id,
+            "expected_revision_number": 1,
+            "target_budget": 100000,
+            "within_budget": True,
+            "estimated_total": 40000,
+            "confirm_budget_override": False,
+        },
+    )
+    assert res.status_code == 400
+    assert "exceeds target budget" in res.json()["detail"].lower()
+
+
+def test_overbudget_override_preserves_stale_and_rejected_protections():
+    """Verify that setting confirm_budget_override=True cannot bypass stale revision, number mismatch, or rejection."""
+    client, user_id = _auth_client("overbudget_protections_user@example.com")
+    trip_store = TripStore()
+
+    trip_res = client.post(
+        "/api/trips",
+        json={"title": "Goa Trip", "destination": "Goa", "metadata": {"budget": 50000.0, "constraints": {"budget": 50000.0}}},
+    )
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Rev 1"}).json()
+    r1_id = r1["revision_id"]
+
+    trip_store.attach_plan_to_revision(
+        trip_id=trip_id,
+        user_id=user_id,
+        revision_id=r1_id,
+        plan_json={"budget": {"target_budget_inr": 50000.0, "estimated_total_inr": 66492.0, "within_budget": False}},
+        raw_plan="Sample plan",
+    )
+
+    r2 = client.post(
+        f"/api/trips/{trip_id}/revisions",
+        json={"feedback": "Rev 2", "expected_base_revision": 1, "expected_base_revision_id": r1_id},
+    ).json()
+    r2_id = r2["revision_id"]
+
+    # 1. Attempting to approve stale r1 with confirm_budget_override=True still fails 409
+    stale_res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": r1_id, "expected_revision_number": 1, "confirm_budget_override": True},
+    )
+    assert stale_res.status_code == 409
+    assert "not current revision" in stale_res.json()["detail"]
+
+    # 2. Reject current r2
+    client.post(
+        f"/api/trips/{trip_id}/revisions/{r2_id}/reject",
+        json={"expected_revision_number": 2, "reason": "Too expensive"},
+    )
+
+    # 3. Attempting to approve rejected r2 even with confirm_budget_override=True fails 409
+    rej_res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": r2_id, "expected_revision_number": 2, "confirm_budget_override": True},
+    )
+    assert rej_res.status_code == 409
+    assert "already rejected" in rej_res.json()["detail"]
+
+
+def test_rejection_no_booking_or_budget_override_side_effects():
+    """Verify rejection produces no booking authorization, no booking intent, and no budget override metadata."""
+    from services.authorization_store import AuthorizationStore
+    client, user_id = _auth_client("rej_side_effects@example.com")
+    trip_store = TripStore()
+    ev_store = EvidenceRevisionStore()
+    auth_store = AuthorizationStore()
+
+    trip_res = client.post(
+        "/api/trips",
+        json={"title": "Side Effects Guard", "destination": "Kyoto", "metadata": {"budget": 80000}},
+    )
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Initial Kyoto Draft"}).json()
+    rev1_id = r1["revision_id"]
+
+    # Reject Rev 1
+    rej_res = client.post(
+        f"/api/trips/{trip_id}/revisions/{rev1_id}/reject",
+        json={"expected_revision_number": 1, "reason": "Prefer different season"},
+    )
+    assert rej_res.status_code == 200
+    assert rej_res.json()["status"] == "REJECTED"
+    assert rej_res.json()["trip_status"] == "rejected"
+
+    # Verify canonical trip status is 'rejected' and untouched in budget
+    fresh_trip = trip_store.get_trip(trip_id, user_id)
+    assert fresh_trip["status"] == "rejected"
+    meta = fresh_trip.get("metadata") or {}
+    assert meta.get("budget") == 80000
+    assert fresh_trip.get("is_approved") is not True
+
+    # 1. Zero booking authorizations exist
+    assert auth_store.get_booking_authorization(trip_id, rev1_id) is None
+
+    # 2. Rejection metadata has NO budget_override block
+    rej_record = ev_store.get_rejection_for_revision(trip_id, rev1_id)
+    assert rej_record is not None
+    assert "budget_override" not in rej_record.rejection_metadata
+
+    # 3. Attempting to authorize booking on rejected revision fails closed with 409
+    auth_res = client.post(
+        f"/api/trips/{trip_id}/booking-approval",
+        json={"revision_id": rev1_id, "expected_revision_number": 1},
+    )
+    assert auth_res.status_code == 409
+    assert "rejected" in auth_res.json()["detail"].lower()
+
+    # 4. Attempting to approve rejected revision fails closed with 409
+    app_res = client.post(
+        f"/api/trips/{trip_id}/approve",
+        json={"revision_id": rev1_id, "expected_revision_number": 1},
+    )
+    assert app_res.status_code == 409
+    assert "already rejected" in app_res.json()["detail"].lower()
+
+
+def test_rejection_transaction_rollback_on_failure(monkeypatch):
+    """Verify that failure during rejection transaction rolls back without mutating trip status."""
+    client, user_id = _auth_client("rollback_rej@example.com")
+    trip_store = TripStore()
+    trip_res = client.post("/api/trips", json={"title": "Rejection Rollback", "destination": "Berlin"})
+    trip_id = trip_res.json()["trip"]["id"]
+
+    r1 = client.post(f"/api/trips/{trip_id}/revisions", json={"feedback": "Draft"}).json()
+    rev1_id = r1["revision_id"]
+
+    trip_before = trip_store.get_trip(trip_id, user_id)
+    initial_status = trip_before["status"]
+
+    # Monkeypatch reject_revision_transaction to simulate mid-transaction failure
+    def fake_reject(*args, **kwargs):
+        raise RuntimeError("Simulated DB connection failure during rejection")
+
+    monkeypatch.setattr(EvidenceRevisionStore, "reject_revision_transaction", fake_reject)
+
+    res = client.post(
+        f"/api/trips/{trip_id}/revisions/{rev1_id}/reject",
+        json={"expected_revision_number": 1, "reason": "Will fail"},
+    )
+    assert res.status_code == 500
+
+    # Verify trip status was NOT mutated to 'rejected'
+    trip_after = trip_store.get_trip(trip_id, user_id)
+    assert trip_after["status"] == initial_status
+

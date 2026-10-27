@@ -28,7 +28,7 @@ from langchain_core.messages import (
 from services.flight_service import FlightService
 from services.hotel.hotel_service import HotelService
 from services.travel_planner import parse_trip_request, candidate_dates, budget_from_live_data, _provider_text, _resolve_place
-from services.chat_planner import generate_travel_plan, plan_to_markdown, PlannerOutageError, TripDurationUnsupportedError
+from services.chat_planner import generate_travel_plan, plan_to_markdown, PlannerOutageError, TripDurationUnsupportedError, CanonicalInvariantViolation
 from domain.compat import build_trip_request, trip_request_to_legacy
 from domain.trip import TripRequest
 
@@ -324,7 +324,22 @@ def flight_agent(state: TravelState):
             "llm_calls": state.get("llm_calls", 0),
         }
 
-    service = FlightService()
+    try:
+        service = FlightService()
+    except Exception as exc:
+        logger.warning("Live flight service initialization failed: %s. Degrading gracefully.", exc)
+        msg = f"Live flight search is temporarily unavailable ({exc}). The planner can still build the destination itinerary without inventing flight offers."
+        return {
+            "flight_results": msg,
+            "live_flight_offers": [],
+            "flight_candidate_dates": [],
+            "recommended_flight": {},
+            "trip_constraints": constraints,
+            "messages": [AIMessage(content="Live flight search is unavailable.")],
+            "flight_search_status": "unavailable",
+            "flight_search_errors": [str(exc)],
+            "llm_calls": state.get("llm_calls", 0),
+        }
     offers: list[dict[str, Any]] = []
     errors: list[str] = []
     passenger_list = ([{"type": "adult"}] * int(constraints.get("adults", 1)))
@@ -848,6 +863,22 @@ def itinerary_agent(state: TravelState):
             "error": err_msg,
             "approval_request": "Itinerary synthesis is temporarily unavailable due to upstream LLM provider outage. Verified live evidence has been preserved.",
             "messages": [AIMessage(content=itinerary)],
+        }
+    except (CanonicalInvariantViolation, ValueError) as exc:
+        msg = f"Canonical trip constraint validation failed: {exc}"
+        print(f"ITINERARY PLANNER CONSTRAINT VIOLATION: {msg}", flush=True)
+        return {
+            "itinerary": msg,
+            "plan_json": {"status": "invalid", "planning_unavailable": True, "error": msg},
+            "llm_provider": "invalid",
+            "llm_calls": state.get("llm_calls", 0),
+            "planning_blocked": True,
+            "planning_feedback": [msg],
+            "outage_status_code": 400,
+            "retryable": False,
+            "error": msg,
+            "approval_request": msg,
+            "messages": [AIMessage(content=msg)],
         }
     except Exception as exc:
         print(f"ITINERARY PLANNER ERROR: {type(exc).__name__}: {exc}", flush=True)

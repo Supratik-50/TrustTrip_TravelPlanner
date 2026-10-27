@@ -485,8 +485,13 @@ export class ApiClient {
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
-    const token = storage.getToken();
     const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+    const baseUrl = this.getBaseUrl();
+    const isAbsoluteUrl = /^https?:\/\//i.test(endpoint);
+    const isExternalUrl = isAbsoluteUrl && (baseUrl ? !endpoint.startsWith(baseUrl) : true);
+    const url = isExternalUrl
+      ? endpoint
+      : `${baseUrl}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
 
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -499,21 +504,33 @@ export class ApiClient {
       delete headers['Content-Type'];
     }
 
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
+    // CSRF protection for cookie-authenticated state-changing requests to TrustTrip backend
+    const method = (options.method || 'GET').toUpperCase();
+    if (!isExternalUrl && !['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method)) {
+      if (!headers['X-Requested-With']) {
+        headers['X-Requested-With'] = 'XMLHttpRequest';
+      }
     }
 
-    const baseUrl = this.getBaseUrl();
-    const url = `${baseUrl}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+    // Include credentials (cookies) for TrustTrip backend requests; do not attach to arbitrary external URLs
+    const credentials = isExternalUrl
+      ? (options.credentials || 'same-origin')
+      : (options.credentials || 'include');
 
     try {
       const response = await fetch(url, {
         ...options,
+        credentials,
         headers,
       });
 
       if (response.status === 401) {
-        if (endpoint !== '/api/auth/login' && endpoint !== '/api/auth/signup') {
+        if (
+          endpoint !== '/api/auth/login' &&
+          endpoint !== '/api/auth/signup' &&
+          endpoint !== '/api/auth/me' &&
+          endpoint !== '/api/auth/logout'
+        ) {
           if (unauthorizedHandler) {
             unauthorizedHandler();
           }
@@ -946,6 +963,9 @@ export class ApiClient {
   async login(credentials: LoginCredentials): Promise<AuthResponse> {
     return await this.request<AuthResponse>('/api/auth/login', {
       method: 'POST',
+      headers: {
+        'X-Auth-Mode': 'cookie',
+      },
       body: JSON.stringify(credentials),
     });
   }
@@ -953,7 +973,16 @@ export class ApiClient {
   async signup(credentials: SignupCredentials): Promise<AuthResponse> {
     return await this.request<AuthResponse>('/api/auth/signup', {
       method: 'POST',
+      headers: {
+        'X-Auth-Mode': 'cookie',
+      },
       body: JSON.stringify(credentials),
+    });
+  }
+
+  async logout(): Promise<{ success: boolean; message: string }> {
+    return await this.request<{ success: boolean; message: string }>('/api/auth/logout', {
+      method: 'POST',
     });
   }
 
@@ -1729,7 +1758,12 @@ export class ApiClient {
   // --- Part 5B & Section 8: Trip Approval & Rejection Canonical Endpoints ---
   async approveTrip(
     tripId: string,
-    options: { revision_id: string; expected_revision_number: number; notes?: string }
+    options: {
+      revision_id: string;
+      expected_revision_number: number;
+      notes?: string;
+      confirm_budget_override?: boolean;
+    }
   ): Promise<{
     trip_id: string;
     status: 'approved';
@@ -1738,6 +1772,7 @@ export class ApiClient {
     approved_at: string;
     active_revision_number: number;
     is_approved: boolean;
+    budget_override_confirmed?: boolean;
   }> {
     try {
       return await this.request<{
@@ -1748,6 +1783,7 @@ export class ApiClient {
         approved_at: string;
         active_revision_number: number;
         is_approved: boolean;
+        budget_override_confirmed?: boolean;
       }>(`/api/trips/${tripId}/approve`, {
         method: 'POST',
         body: JSON.stringify(options),
@@ -2137,18 +2173,16 @@ export class ApiClient {
 
   // --- Wave 3C: Authoritative Binary Travel PDF Stream ---
   async downloadTravelPlanPdfBlob(tripId: string): Promise<Blob> {
-    const token = storage.getToken();
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       Accept: 'application/pdf, application/json',
+      'X-Requested-With': 'XMLHttpRequest',
     };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
     const baseUrl = this.getBaseUrl();
     const url = `${baseUrl}/api/travel/pdf`;
     const response = await fetch(url, {
       method: 'POST',
+      credentials: 'include',
       headers,
       body: JSON.stringify({ trip_id: tripId }),
     });
@@ -2171,17 +2205,14 @@ export class ApiClient {
 
   // --- Wave 3D-A: Authenticated Binary Flight Ticket PDF Stream ---
   async downloadTicketPdfBlob(transactionId: string): Promise<Blob> {
-    const token = storage.getToken();
     const headers: Record<string, string> = {
       Accept: 'application/pdf, application/json',
     };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
     const baseUrl = this.getBaseUrl();
     const url = `${baseUrl}/api/trips/${encodeURIComponent(transactionId)}/ticket.pdf`;
     const response = await fetch(url, {
       method: 'GET',
+      credentials: 'include',
       headers,
     });
     if (!response.ok) {
@@ -2199,17 +2230,14 @@ export class ApiClient {
 
   // --- Wave 3D-A: Authenticated Binary Hotel Voucher PDF Stream ---
   async downloadHotelVoucherPdfBlob(transactionId: string): Promise<Blob> {
-    const token = storage.getToken();
     const headers: Record<string, string> = {
       Accept: 'application/pdf, application/json',
     };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
     const baseUrl = this.getBaseUrl();
     const url = `${baseUrl}/api/trips/${encodeURIComponent(transactionId)}/hotel.pdf`;
     const response = await fetch(url, {
       method: 'GET',
+      credentials: 'include',
       headers,
     });
     if (!response.ok) {
@@ -2227,17 +2255,14 @@ export class ApiClient {
 
   // --- Authenticated Binary Payment Receipt PDF Stream ---
   async downloadPaymentReceiptPdfBlob(transactionId: string): Promise<Blob> {
-    const token = storage.getToken();
     const headers: Record<string, string> = {
       Accept: 'application/pdf, application/json',
     };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
     const baseUrl = this.getBaseUrl();
     const url = `${baseUrl}/api/trips/${encodeURIComponent(transactionId)}/receipt.pdf`;
     const response = await fetch(url, {
       method: 'GET',
+      credentials: 'include',
       headers,
     });
     if (!response.ok) {

@@ -64,8 +64,9 @@ export class TrustTripBookingService implements IBookingService {
   async approvePlan(
     tripId: string,
     expectedRevision: number,
-    revisionId: string
-  ): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number }> {
+    revisionId: string,
+    confirmBudgetOverride?: boolean
+  ): Promise<{ approved: boolean; approved_at: string; active_revision_number?: number; budget_override_confirmed?: boolean }> {
     // Local pre-flight validation — reject immediately, do NOT call backend
     if (!revisionId || typeof revisionId !== 'string' || revisionId.trim() === '') {
       throw Object.assign(
@@ -84,12 +85,14 @@ export class TrustTripBookingService implements IBookingService {
       revision_id: revisionId,
       expected_revision_number: expectedRevision,
       notes: 'Approved by traveler in review stage',
+      confirm_budget_override: Boolean(confirmBudgetOverride),
     });
 
     return {
       approved: res.is_approved,
       approved_at: res.approved_at,
       active_revision_number: res.active_revision_number,
+      budget_override_confirmed: res.budget_override_confirmed,
     };
   }
 

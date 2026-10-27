@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -10,6 +11,8 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
+logger = logging.getLogger("trusttrip.chat_planner")
+
 
 class CanonicalInvariantViolation(ValueError):
     """Raised when an LLM or untrusted source attempts to alter immutable canonical invariants."""
@@ -17,7 +20,7 @@ class CanonicalInvariantViolation(ValueError):
 
 
 class TripDurationUnsupportedError(ValueError):
-    """Raised when requested trip duration exceeds supported planner limits (1–7 days)."""
+    """Raised when requested trip duration exceeds supported planner limits."""
     pass
 
 
@@ -29,6 +32,7 @@ class DayPlan(BaseModel):
     evening: str
     estimated_daily_cost_inr: float = Field(ge=0)
     notes: list[str] = Field(default_factory=list)
+    date: str | None = None
 
 
 class BudgetPlan(BaseModel):
@@ -137,9 +141,13 @@ TOKEN EFFICIENCY & ULTRA-COMPACT RULES (MANDATORY FOR LONG ITINERARIES):
 
 
 def _get_system_prompt(duration_days: int = 5) -> str:
-    if duration_days >= 7:
-        return SYSTEM_PROMPT_BASE + "\n\n" + ULTRA_COMPACT_RULES
-    return SYSTEM_PROMPT_BASE + "\n\n" + COMPACT_RULES
+    rules = ULTRA_COMPACT_RULES if duration_days >= 7 else COMPACT_RULES
+    day_directive = (
+        f"MANDATORY ITINERARY LENGTH: You MUST generate exactly {duration_days} DayPlan items in daily_plan, "
+        f"numbered sequentially from day 1 to day {duration_days}. "
+        f"Do NOT omit any days. Do NOT stop before day {duration_days}."
+    )
+    return f"{SYSTEM_PROMPT_BASE}\n\n{rules}\n\n{day_directive}"
 
 
 SYSTEM_PROMPT = _get_system_prompt(5)
@@ -151,11 +159,18 @@ def _json(value: Any, limit: int = 6000) -> str:
 
 
 def _groq_model() -> str:
-    return os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+    return os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
+
+
+def _groq_fallback_model() -> str:
+    return os.getenv("GROQ_FALLBACK_MODEL", "qwen/qwen3.8-27b").strip()
 
 
 def _gemini_model() -> str:
-    return os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    m = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    if m == "gemini-3.8-flash":
+        return "gemini-2.5-flash"
+    return m or "gemini-2.5-flash"
 
 
 def _gemini_response_schema() -> dict[str, Any]:
@@ -203,7 +218,19 @@ def _compact_hotel(o: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compact_context(constraints, flight_results, live_flight_offers, hotel_results, live_hotel_offers, weather_results, budget, feedback, revision, research_advisory=None):
+def _compact_context(
+    constraints,
+    flight_results,
+    live_flight_offers,
+    hotel_results,
+    live_hotel_offers,
+    weather_results,
+    budget,
+    feedback,
+    revision,
+    research_advisory=None,
+    duration_days: int = 5,
+):
     # Deliberately keep the entire prompt small enough that input + requested
     # output stays comfortably below the project's ~5K TPM Groq target. The UI
     # still receives the complete provider objects separately.
@@ -212,12 +239,18 @@ def _compact_context(constraints, flight_results, live_flight_offers, hotel_resu
     weather = re.sub(r"\s+", " ", str(weather_results or "")).strip()[:700]
 
     # Phase 8 Remediation Blocker 1:
-    # Research advisory prose is completely removed from all prompt instruction channels
-    # (HumanMessage and SystemMessage). It exists purely as application-layer typed data.
+    dep = constraints.get("departure_date") or constraints.get("start_date")
+    ret = constraints.get("return_date") or constraints.get("end_date")
+    dates_line = ""
+    if dep:
+        dates_line = f"\nAUTHORITATIVE DATES (MANDATORY): Departure {str(dep)[:10]}" + (f", Return {str(ret)[:10]}" if ret else "") + f". Day 1 MUST start on {str(dep)[:10]}."
 
     return f"""
 USER REQUEST:
 {str(constraints.get('query') or '')[:700]}
+
+REQUIRED ITINERARY DURATION:
+Exactly {duration_days} days. daily_plan MUST contain exactly {duration_days} DayPlan entries (days 1 to {duration_days}).{dates_line}
 
 CONSTRAINTS:
 {_json(constraints, 1300)}
@@ -260,25 +293,42 @@ def _resolve_duration_days(constraints: dict[str, Any]) -> int:
             from datetime import date
             d1 = date.fromisoformat(str(dep)[:10])
             d2 = date.fromisoformat(str(ret)[:10])
-            return (d2 - d1).days + 1
+            calc = (d2 - d1).days + 1
+            if calc > 0:
+                return calc
         except Exception:
             pass
-    if constraints.get("duration_days") is not None:
-        try:
-            return int(constraints["duration_days"])
-        except (ValueError, TypeError):
-            pass
-    return 1
+    for k in ("duration_days", "duration", "days", "trip_duration_days"):
+        if constraints.get(k) is not None:
+            try:
+                v = int(constraints[k])
+                if v > 0:
+                    return v
+            except (ValueError, TypeError):
+                pass
+    return 5
 
 
-def _groq_plan(prompt: str, system_prompt: str = SYSTEM_PROMPT) -> TravelPlan:
+def _groq_plan(prompt: str, system_prompt: str = SYSTEM_PROMPT, model_name: str | None = None, duration_days: int = 5) -> TravelPlan:
     key = os.getenv("GROQ_API_KEY", "").strip().strip('"')
     if not key:
         raise RuntimeError("GROQ_API_KEY is not configured")
+    effective_model = (model_name or _groq_model()).strip()
+    configured = int(os.getenv("GROQ_MAX_TOKENS", "4096"))
+    base_toks = max(configured, 4096)
+    if duration_days > 5:
+        max_toks = min(base_toks + (duration_days - 5) * 350, 8192)
+    else:
+        max_toks = base_toks
+    extra_kwargs = {}
+    if "r1" in effective_model.lower() or "o1" in effective_model.lower():
+        extra_kwargs["reasoning_effort"] = "none"
     llm = ChatGroq(
-        model=_groq_model(), api_key=key, temperature=0.12,
-        # Bounded token budget to fit comfortably below the 1000 OTPM account limit.
-        max_tokens=980, reasoning_effort="none",
+        model=effective_model,
+        api_key=key,
+        temperature=0.12,
+        max_tokens=max_toks,
+        **extra_kwargs,
     )
     structured = llm.with_structured_output(TravelPlan, method="json_schema")
     return structured.invoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
@@ -291,15 +341,14 @@ def _gemini_plan(prompt: str, system_prompt: str = SYSTEM_PROMPT) -> TravelPlan:
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=key)
-    # Use the stateful Chat helper rather than Models.generate_content. This is
-    # the supported path for chat-style generation and avoids the AFC warning
-    # seen with direct model generation in recent google-genai SDKs.
     chat = client.chats.create(
         model=_gemini_model(),
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
-            temperature=0.12, max_output_tokens=1700,
-            response_mime_type="application/json", response_schema=_gemini_response_schema(),
+            temperature=0.12,
+            max_output_tokens=2500,
+            response_mime_type="application/json",
+            response_schema=_gemini_response_schema(),
         ),
     )
     response = chat.send_message(prompt)
@@ -760,12 +809,19 @@ def enforce_complete_canonical_invariants(
     if not canonical_flight:
         canonical_flight = ctx.get("selected_flight_id") or ctx.get("selected_flight_offer_id")
     if canonical_flight:
-        if plan.selected_flight_id is not None and plan.selected_flight_id != str(canonical_flight):
-            raise CanonicalInvariantViolation(
-                f"Selected flight offer tampering detected: expected '{canonical_flight}', got '{plan.selected_flight_id}'"
-            )
-        elif plan.selected_flight_id is None:
-            plan.selected_flight_id = str(canonical_flight)
+        canon_flt_str = str(canonical_flight)
+        plan_flt_str = str(plan.selected_flight_id) if plan.selected_flight_id is not None else None
+        if plan_flt_str is not None:
+            if plan_flt_str == canon_flt_str:
+                pass
+            elif len(plan_flt_str) >= 20 and (canon_flt_str.startswith(plan_flt_str) or plan_flt_str.startswith(canon_flt_str)):
+                plan.selected_flight_id = canon_flt_str
+            else:
+                raise CanonicalInvariantViolation(
+                    f"Selected flight offer tampering detected: expected '{canonical_flight}', got '{plan.selected_flight_id}'"
+                )
+        else:
+            plan.selected_flight_id = canon_flt_str
 
     canonical_hotel = None
     if selected_hotel:
@@ -773,12 +829,20 @@ def enforce_complete_canonical_invariants(
     if not canonical_hotel:
         canonical_hotel = ctx.get("selected_hotel_id") or ctx.get("selected_hotel_offer_id")
     if canonical_hotel:
-        if plan.selected_hotel_id is not None and plan.selected_hotel_id != str(canonical_hotel):
-            raise CanonicalInvariantViolation(
-                f"Selected hotel offer tampering detected: expected '{canonical_hotel}', got '{plan.selected_hotel_id}'"
-            )
-        elif plan.selected_hotel_id is None:
-            plan.selected_hotel_id = str(canonical_hotel)
+        canon_htl_str = str(canonical_hotel)
+        plan_htl_str = str(plan.selected_hotel_id) if plan.selected_hotel_id is not None else None
+        if plan_htl_str is not None:
+            if plan_htl_str == canon_htl_str:
+                pass
+            elif len(plan_htl_str) >= 30 and (canon_htl_str.startswith(plan_htl_str) or plan_htl_str.startswith(canon_htl_str)):
+                # Restore full canonical provider token when LLM output was truncated by token budget
+                plan.selected_hotel_id = canon_htl_str
+            else:
+                raise CanonicalInvariantViolation(
+                    f"Selected hotel offer tampering detected: expected '{canonical_hotel}', got '{plan.selected_hotel_id}'"
+                )
+        else:
+            plan.selected_hotel_id = canon_htl_str
 
     # 4. HARD REJECT: Budget Currency
     canonical_currency = ctx.get("currency") or "INR"
@@ -835,9 +899,15 @@ def enforce_complete_canonical_invariants(
         try:
             d1 = date.fromisoformat(str(dep)[:10])
             d2 = date.fromisoformat(str(ret)[:10])
+            if d2 < d1:
+                raise CanonicalInvariantViolation(
+                    f"Canonical return date ({ret}) cannot precede departure date ({dep})."
+                )
             calc_duration = (d2 - d1).days + 1
             if calc_duration > 0:
                 plan.duration_days = calc_duration
+        except CanonicalInvariantViolation:
+            raise
         except Exception:
             if ctx.get("duration_days"):
                 plan.duration_days = int(ctx["duration_days"])
@@ -847,6 +917,75 @@ def enforce_complete_canonical_invariants(
     target_b = ctx.get("budget_amount") if "budget_amount" in ctx else ctx.get("target_budget")
     if target_b is not None:
         plan.budget.target_budget_inr = float(target_b)
+
+    is_unavailable = getattr(plan, "planning_unavailable", False) or plan.status == "unavailable"
+
+    # Validate mandatory structured plan content when synthesis succeeded
+    if not is_unavailable:
+        if not plan.flight_suggestion or not str(plan.flight_suggestion).strip():
+            raise CanonicalInvariantViolation("Required field missing: flight_suggestion must not be empty.")
+        if not plan.accommodation_plan or not str(plan.accommodation_plan).strip():
+            raise CanonicalInvariantViolation("Required field missing: accommodation_plan must not be empty.")
+        if not plan.weather_guidance or not str(plan.weather_guidance).strip():
+            raise CanonicalInvariantViolation("Required field missing: weather_guidance must not be empty.")
+        if not plan.budget:
+            raise CanonicalInvariantViolation("Required field missing: budget must be present.")
+
+    # 7. HARD REJECT / VALIDATION: Complete Daily Plan Invariants
+    expected_duration = plan.duration_days
+    if not expected_duration or expected_duration <= 0:
+        expected_duration = _resolve_duration_days(ctx)
+        plan.duration_days = expected_duration
+
+    if not is_unavailable and plan.daily_plan:
+        # Validate day count matches expected duration
+        actual_count = len(plan.daily_plan)
+        if actual_count != expected_duration:
+            raise CanonicalInvariantViolation(
+                f"Incomplete daily plan: expected {expected_duration} days, got {actual_count}"
+            )
+
+        # Validate sequential day numbers (1 to expected_duration)
+        actual_days = [dp.day for dp in plan.daily_plan]
+        expected_days = list(range(1, expected_duration + 1))
+        if actual_days != expected_days:
+            seen = set()
+            duplicates = [d for d in actual_days if d in seen or seen.add(d)]
+            missing = [d for d in expected_days if d not in set(actual_days)]
+            out_of_range = [d for d in actual_days if d < 1 or d > expected_duration]
+            details = []
+            if duplicates:
+                details.append(f"duplicate days: {duplicates}")
+            if missing:
+                details.append(f"missing days: {missing}")
+            if out_of_range:
+                details.append(f"out of range days: {out_of_range}")
+            raise CanonicalInvariantViolation(
+                f"Daily plan has invalid day sequence ({', '.join(details) or 'non-sequential'}): "
+                f"expected {expected_days}, got {actual_days}"
+            )
+
+        # Validate sequential dates if departure_date is present
+        if dep:
+            base_d = None
+            try:
+                base_d = date.fromisoformat(str(dep)[:10])
+            except (ValueError, TypeError):
+                base_d = None
+
+            if base_d:
+                from datetime import timedelta
+                for idx, dp in enumerate(plan.daily_plan):
+                    expected_d_str = str(base_d + timedelta(days=idx))
+                    if dp.date:
+                        if str(dp.date)[:10] != expected_d_str:
+                            raise CanonicalInvariantViolation(
+                                f"Daily plan Day {dp.day} date mismatch: expected '{expected_d_str}', got '{dp.date}'"
+                            )
+                    else:
+                        dp.date = expected_d_str
+
+
 
     return plan
 
@@ -871,10 +1010,11 @@ def generate_travel_plan(
     raise_on_outage: bool = False,
 ) -> tuple[TravelPlan, str]:
     duration = _resolve_duration_days(constraints)
-    if duration > 7:
+    max_supported_days = int(os.getenv("MAX_TRIP_DURATION_DAYS", "30"))
+    if duration > max_supported_days:
         raise TripDurationUnsupportedError(
-            "Trips longer than 7 days are not currently supported by the planner. "
-            "Please choose a trip duration of 7 days or fewer."
+            f"Trips longer than {max_supported_days} days are not currently supported by the planner. "
+            f"Please choose a trip duration of {max_supported_days} days or fewer."
         )
 
     prompt = _compact_context(
@@ -888,6 +1028,7 @@ def generate_travel_plan(
         feedback,
         revision_number,
         research_advisory=research_advisory,
+        duration_days=duration,
     )
 
     def _attach_advisory(p: TravelPlan) -> TravelPlan:
@@ -906,24 +1047,57 @@ def generate_travel_plan(
     sys_prompt = _get_system_prompt(duration)
 
     errors: list[str] = []
+
+    # 1. Primary Model (Groq: default openai/gpt-oss-120b or user-configured GROQ_MODEL)
+    groq_primary = _groq_model()
     try:
-        raw_plan = _groq_plan(prompt, system_prompt=sys_prompt)
+        logger.info("itinerary_planner.dispatch provider=groq model=%s duration=%d", groq_primary, duration)
+        raw_plan = _groq_plan(prompt, system_prompt=sys_prompt, model_name=groq_primary, duration_days=duration)
         plan = enforce_complete_canonical_invariants(
             raw_plan, constraints,
             selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,
         )
+        if not getattr(plan, "planning_unavailable", False) and len(plan.daily_plan) == 0:
+            raise CanonicalInvariantViolation(f"Empty daily plan: expected {duration} days, got 0")
         return _attach_advisory(plan), "groq"
     except Exception as exc:
-        errors.append(f"groq: {type(exc).__name__}: {exc}")
-    try:
-        raw_plan = _gemini_plan(prompt, system_prompt=sys_prompt)
-        plan = enforce_complete_canonical_invariants(
-            raw_plan, constraints,
-            selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,
-        )
-        return _attach_advisory(plan), "gemini"
-    except Exception as exc:
-        errors.append(f"gemini: {type(exc).__name__}: {exc}")
+        err_str = f"groq-primary ({groq_primary}): {type(exc).__name__}: {exc}"
+        logger.warning("itinerary_planner.primary_failure %s", err_str)
+        errors.append(err_str)
+
+    # 2. Secondary Fallback Model (Groq: default qwen/qwen3.8-27b or user-configured GROQ_FALLBACK_MODEL)
+    groq_fallback = _groq_fallback_model()
+    if groq_fallback and groq_fallback != groq_primary:
+        try:
+            logger.info("itinerary_planner.dispatch provider=groq-fallback model=%s duration=%d", groq_fallback, duration)
+            raw_plan = _groq_plan(prompt, system_prompt=sys_prompt, model_name=groq_fallback, duration_days=duration)
+            plan = enforce_complete_canonical_invariants(
+                raw_plan, constraints,
+                selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,
+            )
+            if not getattr(plan, "planning_unavailable", False) and len(plan.daily_plan) == 0:
+                raise CanonicalInvariantViolation(f"Empty daily plan: expected {duration} days, got 0")
+            return _attach_advisory(plan), "groq"
+        except Exception as exc:
+            err_str = f"groq-fallback ({groq_fallback}): {type(exc).__name__}: {exc}"
+            logger.warning("itinerary_planner.fallback_failure %s", err_str)
+            errors.append(err_str)
+
+    # 3. Optional Tertiary Model (Gemini: only if explicitly enabled via ENABLE_GEMINI_FALLBACK)
+    if os.getenv("ENABLE_GEMINI_FALLBACK", "0").lower() in ("1", "true"):
+        gemini_model_name = _gemini_model()
+        try:
+            logger.info("itinerary_planner.dispatch provider=gemini model=%s duration=%d", gemini_model_name, duration)
+            raw_plan = _gemini_plan(prompt, system_prompt=sys_prompt)
+            plan = enforce_complete_canonical_invariants(
+                raw_plan, constraints,
+                selected_flight=sel_flight, selected_hotel=sel_hotel, revision=revision_number,
+            )
+            return _attach_advisory(plan), "gemini"
+        except Exception as exc:
+            err_str = f"gemini ({gemini_model_name}): {type(exc).__name__}: {exc}"
+            logger.warning("itinerary_planner.gemini_failure %s", err_str)
+            errors.append(err_str)
 
     # Production LLM/provider failure MUST NOT silently invoke a deterministic test/fallback planner.
     # Deterministic fallback is strictly restricted to explicit hermetic testing under verified test authorization.

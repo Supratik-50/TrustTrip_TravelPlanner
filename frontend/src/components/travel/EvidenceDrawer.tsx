@@ -56,8 +56,8 @@ export const EvidenceDrawer: React.FC<EvidenceDrawerProps> = ({
   const isDoc =
     citation.source_type === 'document' ||
     citation.source_type === 'rag' ||
-    citation.domain === 'local.document' ||
-    (Boolean(citation.canonical_url) && citation.canonical_url.startsWith('document://'));
+    Boolean(citation.canonical_url?.startsWith('document://'));
+
   const resolvedType = isDoc ? 'document' : (citation.source_type || 'web');
   const badge = getSourceTypeBadge(resolvedType);
 

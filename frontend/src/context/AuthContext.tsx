@@ -22,28 +22,36 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, setToken] = useState<string | null>(() => storage.getToken());
+  const token: string | null = null;
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [isDemoMode, setIsDemoMode] = useState<boolean>(() => api.getDemoModeState());
   const { notify } = useNotification();
 
-  const logout = useCallback(() => {
-    storage.clearAllAuth();
-    setToken(null);
-    setUser(null);
-    setError(null);
-    notify('Signed out successfully', 'info');
+  const logout = useCallback(async () => {
+    try {
+      await api.logout();
+    } catch {
+      // Clear in-memory user state and storage even if backend logout fails
+    } finally {
+      storage.clearAllAuth();
+      setUser(null);
+      setError(null);
+      notify('Signed out successfully', 'info');
+    }
   }, [notify]);
 
   // Set up 401 unauthorized listener
   useEffect(() => {
     setUnauthorizedHandler(() => {
       storage.clearAllAuth();
-      setToken(null);
-      setUser(null);
-      notify('Your session expired. Please sign in again.', 'warning', 'Session Expired');
+      setUser((currentUser) => {
+        if (currentUser) {
+          notify('Your session expired. Please sign in again.', 'warning', 'Session Expired');
+        }
+        return null;
+      });
     });
 
     return () => {
@@ -51,22 +59,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [notify]);
 
-  // Initial user fetch on load
+  // Initial user fetch on load via HttpOnly session cookie
   const refreshMe = useCallback(async () => {
-    const existingToken = storage.getToken();
-    if (!existingToken) {
-      setIsLoading(false);
-      return;
-    }
-
     try {
       setIsLoading(true);
       const fetchedUser = await api.getMe();
       setUser(fetchedUser);
       storage.setUser(fetchedUser);
-    } catch (err: any) {
+    } catch {
       storage.clearAllAuth();
-      setToken(null);
       setUser(null);
     } finally {
       setIsLoading(false);
@@ -83,16 +84,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setError(null);
       const res = await api.login(credentials);
       
-      if (res.access_token) {
-        storage.setToken(res.access_token);
-        setToken(res.access_token);
-      }
-      
       if (res.user) {
         storage.setUser(res.user);
         setUser(res.user);
       } else {
-        // Fetch user info
+        // Fetch user info via cookie session
         await refreshMe();
       }
 
@@ -113,11 +109,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setIsLoading(true);
       setError(null);
       const res = await api.signup(credentials);
-
-      if (res.access_token) {
-        storage.setToken(res.access_token);
-        setToken(res.access_token);
-      }
 
       if (res.user) {
         storage.setUser(res.user);
@@ -155,7 +146,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       value={{
         user,
         token,
-        isAuthenticated: !!token && !!user,
+        isAuthenticated: !!user,
         isLoading,
         error,
         login,

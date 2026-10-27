@@ -1,5 +1,7 @@
 import { FlightOffer, FlightSegment, BookingIntent } from '../types/flight';
 import { HotelOffer, HotelRoom } from '../types/hotel';
+import { ResearchHistoryItem } from '../types/research';
+
 
 // Clean curated image references for destinations and hotels
 const DESTINATION_HOTEL_IMAGES: Record<string, string[]> = {

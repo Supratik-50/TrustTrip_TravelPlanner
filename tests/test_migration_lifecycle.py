@@ -8,8 +8,10 @@ from uuid import uuid4
 import pytest
 
 from services.search_session_store import (
+    REQUIRED_SCHEMA_TABLES_BY_MIGRATION,
     REQUIRED_TRAVEL_INTELLIGENCE_TABLES,
     SearchSessionStore,
+    validate_database_schema,
     validate_travel_intelligence_schema,
 )
 
@@ -111,3 +113,62 @@ def test_migration_file_exists_and_contains_full_schema():
 
     for table in REQUIRED_TRAVEL_INTELLIGENCE_TABLES:
         assert f"CREATE TABLE IF NOT EXISTS {table}" in content
+
+
+def test_startup_schema_validation_checks_016_revoked_tokens_missing(monkeypatch):
+    """Verify validate_database_schema fails closed when migration 016 revoked_tokens is missing."""
+    monkeypatch.setenv("USE_IN_MEMORY_AUTH", "0")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost:5432/testdb")
+
+    all_except_revoked = []
+    for mig_file, tables in REQUIRED_SCHEMA_TABLES_BY_MIGRATION.items():
+        if "016" not in mig_file:
+            all_except_revoked.extend(tables)
+
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(t,) for t in all_except_revoked]
+
+    mock_conn = MagicMock()
+    mock_conn.__enter__.return_value = mock_conn
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    with patch("psycopg.connect", return_value=mock_conn):
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_database_schema()
+
+        err_msg = str(exc_info.value)
+        assert "revoked_tokens" in err_msg
+        assert "016_jwt_revocation.sql" in err_msg
+
+
+def test_startup_schema_validation_checks_016_revoked_tokens_present(monkeypatch):
+    """Verify validate_database_schema passes when all tables including revoked_tokens exist."""
+    monkeypatch.setenv("USE_IN_MEMORY_AUTH", "0")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost:5432/testdb")
+
+    all_tables = [table for tables in REQUIRED_SCHEMA_TABLES_BY_MIGRATION.values() for table in tables]
+
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(t,) for t in all_tables]
+
+    mock_conn = MagicMock()
+    mock_conn.__enter__.return_value = mock_conn
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    with patch("psycopg.connect", return_value=mock_conn):
+        validate_database_schema()
+
+
+def test_migration_016_file_exists_and_contains_full_schema():
+    """Verify 016_jwt_revocation.sql exists and contains required DDL for revoked_tokens."""
+    migration_file = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "migrations", "016_jwt_revocation.sql"
+    )
+    assert os.path.exists(migration_file), "016_jwt_revocation.sql must exist"
+
+    with open(migration_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "CREATE TABLE IF NOT EXISTS revoked_tokens" in content
+    assert "idx_revoked_tokens_expires_at" in content
+    assert "idx_revoked_tokens_token_hash" in content

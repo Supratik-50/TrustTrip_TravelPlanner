@@ -226,9 +226,8 @@ class PlannerService:
                 revision=rev_num,
             )
 
-            # Active canonical trip anchors existing_trip if not yet initialized
-            if not existing_trip or str(getattr(existing_trip, "trip_id", "")) != str(canonical_trip_record["id"]):
-                existing_trip = authoritative_canonical_trip
+            # Authoritative canonical trip record ALWAYS anchors existing_trip over stale checkpoint state
+            existing_trip = authoritative_canonical_trip
 
         # 3. Intent Routing
         decision: IntentDecision = self.intent_router.classify_intent(

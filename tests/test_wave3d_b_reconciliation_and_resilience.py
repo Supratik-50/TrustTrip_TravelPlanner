@@ -489,8 +489,9 @@ def test_w3d07_api_travel_returns_429_not_503():
     assert "rate limit" in data["error"].lower() or "quota" in data["error"].lower()
 
 
-def test_w3d07_duration_guard_returns_http_400():
-    """W3D-07: Trips longer than 7 days deterministically return HTTP 400 without invoking LLM providers."""
+def test_w3d07_duration_guard_returns_http_400(monkeypatch):
+    """W3D-07: Trips longer than configured limit deterministically return HTTP 400 without invoking LLM providers."""
+    monkeypatch.setenv("MAX_TRIP_DURATION_DAYS", "7")
     client, user = _auth_user("duration_guard_test@trusttrip.com")
     trip_store = TripStore()
     trip = trip_store.create_trip(
@@ -543,8 +544,9 @@ def test_w3d07_unexpected_exception_returns_http_500():
     assert data.get("retryable") is not True
 
 
-def test_w3d07_same_thread_stale_state_safety():
+def test_w3d07_same_thread_stale_state_safety(monkeypatch):
     """W3D-07: Subsequent request on the same thread does NOT inherit previous turn's 503 outage state."""
+    monkeypatch.setenv("MAX_TRIP_DURATION_DAYS", "7")
     client, user = _auth_user("stale_state_test@trusttrip.com")
     trip_store = TripStore()
     trip = trip_store.create_trip(
